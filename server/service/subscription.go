@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1208,7 +1209,12 @@ func syncSubscriptionTasks(sub *model.Subscription, emit PullCallback) {
 				emit(fmt.Sprintf("[自动添加任务失败] %s (cron: %s) command=%s err=%v",
 					candidate.Name, candidate.CronExpression, candidate.Command, err))
 			} else {
-				GetSchedulerV2().AddJob(&task)
+				// 与 handler/task_mutate.go 的 Create 同口径：注册调度失败要留痕，
+				// 否则订阅日志里显示「自动添加任务」成功，任务却从此不会被 cron 触发。
+				// 文案里的「失败」会被 panel_log.go 的 detectPanelLogLevel 判成 ERROR 级。
+				if err := GetSchedulerV2().AddJob(&task); err != nil {
+					log.Printf("任务 %d 注册调度失败（它不会自动触发）: %v", task.ID, err)
+				}
 				managedByCommand[command] = &task
 				created++
 				emit(fmt.Sprintf("[自动添加任务] %s (cron: %s)", candidate.Name, candidate.CronExpression))

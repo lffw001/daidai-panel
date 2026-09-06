@@ -365,7 +365,14 @@ func (s *SchedulerV2) executeTask(req *ExecutionRequest) {
 		// 最大并发数现在靠 worker 阻塞实现，只会让请求排队、不会丢弃；
 		// 走到这里的唯一原因是「不允许多实例」。日志必须说清是哪条规则，
 		// 否则用户会误以为是并发数把任务吃掉了。
-		log.Printf("task %d: previous run still in progress and multiple instances are disabled, skipping this trigger", req.TaskID)
+		log.Printf("任务 %d 本次触发被跳过：%s", req.TaskID, SkipReasonSingleInstance)
+		// 这条分支是整个调度链路上唯一一处「返回正常、却既不执行也不留任何痕迹」的地方，
+		// 用户看到的就是「点了运行提示已启动 / 到点了却什么都没发生」+ 日志一片空白。
+		// 所以必须留一条看得见的记录，否则只能靠翻面板日志才知道原因。
+		recordSkippedTrigger(req, SkipReasonSingleInstance)
+		// 本次触发已经在生产端被置成「排队中」，这里不执行就必须放回去，
+		// 否则任务会一直停在排队中假象上。
+		releaseQueuedTaskStatus(req)
 		return
 	}
 	defer s.removeRunningTask(req.TaskID, goid)
@@ -466,7 +473,7 @@ func (s *SchedulerV2) EnqueueDelayed(delay time.Duration, reqFunc func() *Execut
 			return
 		}
 		if err := s.Enqueue(req); err != nil {
-			log.Printf("task %d delayed enqueue failed: %v", req.TaskID, err)
+			log.Printf("任务 %d 随机延迟结束后重新入队失败（本次不会执行）: %v", req.TaskID, err)
 			// 生产端在首次入队成功时已经把任务置为「排队中」。
 			// 延迟到期后重新入队失败意味着这次触发不会再被执行，
 			// 必须把状态放回去，否则任务会一直停在 queued 假象上。
@@ -489,6 +496,33 @@ func releaseQueuedTaskStatus(req *ExecutionRequest) {
 	}
 }
 
+// SkipReasonSingleInstance 是「上一次还在跑、本次触发被多实例闸门拦下」的原因文案。
+// 面板列表、任务详情和文档都引用这句话，改动时要一起改。
+const SkipReasonSingleInstance = "上一次执行仍在进行中，且该任务未开启「允许多实例」，本次触发没有执行"
+
+// recordSkippedTrigger 把「到点了但这次没执行」的原因记在任务行上。
+//
+// 刻意**不**建 task_logs 行，尽管那样在日志页里更显眼：
+//   - 跳过意味着压根没执行，建成日志会一并混进仪表板的「已终止」统计与耗时统计；
+//   - 跳过记录的时间比它所阻塞的那次执行更晚，会顶掉「最近一次日志」，
+//     用户点开日志看到的是「本次触发被跳过」，而不是真正的执行输出；
+//   - 每分钟触发一次的任务撞上长跑任务，一次阻塞期能被拦几百次，还得额外做去重。
+//
+// 记成任务上的两个字段就没有这些问题：天然幂等（同一个任务反复写同一行）、
+// 不需要去重、不进任何统计，列表与任务详情直接展示。
+func recordSkippedTrigger(req *ExecutionRequest, reason string) {
+	if req == nil || req.TaskID == 0 || database.DB == nil {
+		return
+	}
+
+	if err := database.DB.Model(&model.Task{}).Where("id = ?", req.TaskID).Updates(map[string]interface{}{
+		"last_skip_at":     time.Now(),
+		"last_skip_reason": reason,
+	}).Error; err != nil {
+		log.Printf("任务 %d 记录跳过原因失败: %v", req.TaskID, err)
+	}
+}
+
 func (s *SchedulerV2) AddJob(task *model.Task) error {
 	s.entryLock.Lock()
 	defer s.entryLock.Unlock()
@@ -502,7 +536,20 @@ func (s *SchedulerV2) AddJob(task *model.Task) error {
 		delete(s.entryMap, task.ID)
 	}
 
-	if task.Status != model.TaskStatusEnabled {
+	// 只有「真正被禁用」才不再注册。
+	// 刻意不写成 `!= TaskStatusEnabled`：排队中(0.5) 与 运行中(2) 是启用态任务的瞬时状态，
+	// 而上面已经无条件把旧 entry 摘掉了 —— 一旦在这两个瞬间走到这里就直接 return，
+	// 这个任务从此再也不会被 cron 触发，而且列表里依然显示「已启用 + 有下次运行时间」，
+	// 用户完全无从察觉。编辑任务保存（handler/task_mutate.go 重载真实状态后调 UpdateJob）、
+	// 订阅同步、备份恢复的 ReloadAllJobs 都可能正好撞上这两个瞬间。
+	// 更坏的是复合后果：entry 没了 -> HasJob 为 false -> 本次跑完时 ResolveTaskInactiveStatus
+	// 会把「运行中 + 没有 job」判成已禁用，等于编辑一次正在跑的任务就把它静默关掉了。
+	//
+	// 「运行中被禁用、等这次跑完再生效」的任务同样不能挂回去：它的 status 还停在运行中，
+	// 但用户的意图已经是禁用。漏掉这一条的话，只要中途有任何一次 AddJob（编辑保存、订阅同步、
+	// 备份恢复的全量重载）把条目加回来，这个任务就会带着活着的 cron 条目落成「已禁用」，
+	// 之后一直按点被触发执行 —— 比原来的缺陷更糟。
+	if task.Status == model.TaskStatusDisabled || hasPendingDisable(task) {
 		return nil
 	}
 	if !task.UsesCronSchedule() {
@@ -536,7 +583,7 @@ func (s *SchedulerV2) AddJob(task *model.Task) error {
 				RetryIndex:  0,
 			}
 			if err := s.Enqueue(req); err != nil {
-				log.Printf("task %d enqueue failed: %v", taskID, err)
+				log.Printf("任务 %d 定时触发入队失败（本次不会执行）: %v", taskID, err)
 				return
 			}
 			database.DB.Model(&model.Task{}).Where("id = ? AND status != ?", taskID, model.TaskStatusRunning).Update("status", model.TaskStatusQueued)
@@ -661,6 +708,26 @@ func (s *SchedulerV2) HasJob(taskID uint) bool {
 	return exists
 }
 
+// ScheduledEntryCount 返回该任务当前在 cron 里真正挂了几个触发条目。
+// 和 HasJob 的区别很关键：非 cron 类型的任务也会在 entryMap 里留一个空切片（见 AddJob），
+// HasJob 对它返回 true，但它一个 cron entry 都没有、永远不会自动触发。
+// 任务列表用这个数来判断「显示着下次运行时间、实际却不会跑」的静默失联状态。
+// 返回 -1 表示这个任务压根不在调度器里（从未注册或已被 RemoveJob 摘掉）。
+func (s *SchedulerV2) ScheduledEntryCount(taskID uint) int {
+	if s == nil {
+		return -1
+	}
+
+	s.entryLock.RLock()
+	defer s.entryLock.RUnlock()
+
+	entryIDs, exists := s.entryMap[taskID]
+	if !exists {
+		return -1
+	}
+	return len(entryIDs)
+}
+
 func (s *SchedulerV2) RunNow(taskID uint) error {
 	var task model.Task
 	if err := database.DB.First(&task, taskID).Error; err != nil {
@@ -725,7 +792,7 @@ func (s *SchedulerV2) EnqueueStartupTasks() int {
 			RetryIndex:  0,
 		}
 		if err := s.Enqueue(req); err != nil {
-			log.Printf("startup task %d enqueue failed: %v", task.ID, err)
+			log.Printf("开机任务 %d 入队失败（本次不会执行）: %v", task.ID, err)
 			continue
 		}
 
@@ -745,27 +812,37 @@ func (s *SchedulerV2) EnqueueStartupTasks() int {
 }
 
 func (s *SchedulerV2) ReloadAllJobs() {
-	s.entryLock.Lock()
-	for taskID, entryIDs := range s.entryMap {
-		for _, entryID := range entryIDs {
-			if entryID != 0 {
-				s.cron.Remove(entryID)
-			}
-		}
-		delete(s.entryMap, taskID)
-	}
-	s.entryLock.Unlock()
-
 	var tasks []model.Task
-	database.DB.Where("status = ?", model.TaskStatusEnabled).Find(&tasks)
+	// 与 AddJob 的早退条件保持同一口径：排队中/运行中的任务也要重新注册，
+	// 否则备份恢复恰好撞上有任务在跑时，那条任务会连 entry 一起丢掉。
+	database.DB.Where("status <> ?", model.TaskStatusDisabled).Find(&tasks)
 
+	// 刻意不先清空 entryMap 再逐条重建：AddJob 本来就会先摘掉这个任务的旧条目再挂新的，
+	// 提前清空只会多出一个「所有任务都查不到条目」的空窗口 ——
+	// 恰好在这期间刷新任务列表，整屏都会误报「未注册到调度器」。
+	// 改成先逐条重建、最后再摘掉这次没出现的（已删除 / 已禁用），中间任何一刻都不会出现空窗。
+	reloaded := make(map[uint]struct{}, len(tasks))
 	for i := range tasks {
+		reloaded[tasks[i].ID] = struct{}{}
 		if err := s.AddJob(&tasks[i]); err != nil {
-			log.Printf("reload job failed for task %d: %v", tasks[i].ID, err)
+			log.Printf("任务 %d 重新注册调度失败: %v", tasks[i].ID, err)
 		}
 	}
 
-	log.Printf("scheduler reloaded: %d jobs", len(tasks))
+	s.entryLock.RLock()
+	stale := make([]uint, 0, len(s.entryMap))
+	for taskID := range s.entryMap {
+		if _, ok := reloaded[taskID]; !ok {
+			stale = append(stale, taskID)
+		}
+	}
+	s.entryLock.RUnlock()
+
+	for _, taskID := range stale {
+		s.RemoveJob(taskID)
+	}
+
+	log.Printf("scheduler reloaded: %d jobs, %d stale removed", len(tasks), len(stale))
 }
 
 func getGoroutineID() int64 {

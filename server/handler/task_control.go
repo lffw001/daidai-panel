@@ -27,6 +27,10 @@ func validateAndEnableTask(task *model.Task) error {
 		}
 	}
 
+	// 之前如果在运行中禁用过、禁用还没落地，这次重新启用要把那笔意图撤掉，
+	// 否则本次执行结束时仍会按「待禁用」结算，用户看到的就是「刚点了启用，跑完又变回禁用」。
+	service.ClearPendingDisable(task.ID)
+
 	task.Status = model.TaskStatusEnabled
 	if err := database.DB.Save(task).Error; err != nil {
 		return err
@@ -51,6 +55,9 @@ func disableTaskAndRemoveSchedule(task *model.Task) string {
 	}
 
 	if task.Status == model.TaskStatusRunning {
+		// 运行中不能直接把 status 写成禁用（列表会立刻变成禁用、停止按钮消失，可进程还在跑），
+		// 所以先记一笔意图，等本次执行结算时由 ResolveTaskInactiveStatus 落成禁用。
+		service.MarkPendingDisable(task.ID)
 		return "已设置为禁用，当前执行结束后生效"
 	}
 

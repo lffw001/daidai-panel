@@ -473,7 +473,7 @@ panel.add_or_update_env(
         method: 'GET',
         path: '/api/tasks',
         title: '获取任务列表',
-        description: '获取所有定时任务，支持关键字搜索和分页',
+        description: '获取所有定时任务，支持关键字搜索和分页。每行可能多带一个 schedule_hint（string）：它只在「这条任务其实不会自动触发」时才出现，正常任务上这个 key 完全不存在。取值只有两种：「该任务类型不会自动触发，只能手动运行」（手动运行/开机运行类型）、「未注册到调度器，重新保存一次任务即可恢复」（cron 任务但调度器里没有它的触发条目）。已禁用的任务一律不带；面板没起调度器时不下发第二种',
         auth: 'jwt',
         queryParams: [
           { name: 'keyword', type: 'string', description: '搜索关键字' },

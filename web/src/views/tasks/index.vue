@@ -5,12 +5,15 @@ import { taskApi } from '@/api/task'
 import { depsApi, type PythonRuntimeInfo } from '@/api/deps'
 import { useAuthStore } from '@/stores/auth'
 import { ElMessage, ElMessageBox } from 'element-plus'
+// 全局注册的图标里没有 WarningFilled / InfoFilled，这里按仓库既有做法（settings/SystemHealthCard.vue 同款）局部引入
+import { InfoFilled, WarningFilled } from '@element-plus/icons-vue'
 import TaskForm from './components/TaskForm.vue'
 import LogViewer from './components/LogViewer.vue'
 import TaskDetail from './components/TaskDetail.vue'
 import LogFileBrowser from './components/LogFileBrowser.vue'
 import ViewManager from './components/ViewManager.vue'
 import TaskCronList from './components/TaskCronList.vue'
+import { DEFAULT_CRON_DAILY_MIDNIGHT } from './components/CronInput.vue'
 import BatchAddLabelDialog from './components/BatchAddLabelDialog.vue'
 import DdSplitButton from '@/components/ui/DdSplitButton.vue'
 import type { SplitButtonItem } from '@/components/ui/DdSplitButton.vue'
@@ -191,6 +194,13 @@ function getCronExpressions(task: any) {
     .split(/\r?\n/)
     .map((item: string) => item.trim())
     .filter(Boolean)
+}
+
+// schedule_hint 有两种严重程度：定时任务没注册进调度器是真故障，
+// 「手动运行 / 开机运行不会按定时触发」只是在陈述任务类型，本来就该如此。
+// 后者用警示色天天挂着，等于喊狼来了，真出故障时反而没人看。
+function isScheduleFault(task: any) {
+  return (task?.task_type || 'cron') === 'cron'
 }
 
 const hasRunningTasks = computed(() => tasks.value.some(t => t.status === 2))
@@ -671,9 +681,11 @@ async function handleRouteQueryAction() {
         return
       }
       editingTask.value = null
-      // 6 段（秒 分 时 日 月 周），与 CronInput / TaskForm 的默认值统一 —— 语义仍是「每天 00:00」。
-      // 第一段是【秒】，从 5 段升 6 段要在最前面补 0，绝不能在末尾补 *（那会把「分」当成「秒」整体位移一格）。
-      prefillData.value = { name, command, cron_expression: '0 0 0 * * *', task_type: 'cron' }
+      // 脚本页「添加到定时任务」的预填值，取值口径见 CronInput.vue 顶部那两个导出常量。
+      // ⚠️ 它是「每天 00:00」，意味着任务建好后最长 24 小时都不会自己跑一次——
+      // 这正是 issue #115 里「加了定时任务不执行、日志抽屉说没有日志记录」的真实处境，
+      // 所以 handleFormSubmit 在创建成功后会把下次运行时间直接说出来（见那里的注释）。
+      prefillData.value = { name, command, cron_expression: DEFAULT_CRON_DAILY_MIDNIGHT, task_type: 'cron' }
       formVisible.value = true
       await clearTaskRouteQuery()
     }
@@ -854,13 +866,22 @@ async function handleFormSubmit(data: any) {
   if (!ensureCanOperate()) return
   // 权限这道早退分支过了才置位，否则没权限的用户会把按钮永久转圈
   formSubmitting.value = true
+  // 新建成功后还要弹一次「下次运行时间 + 立即运行一次」，那一步要等用户点。
+  // 它不能压在 try 里：finally 会被 await 挡住，创建按钮会一直转圈。
+  // 所以这里只把创建结果接出来，出了 try/finally 再提示。
+  let createdTask: any = null
   try {
     if (editingTask.value) {
       await taskApi.update(editingTask.value.id, data)
       ElMessage.success('任务更新成功')
     } else {
-      await taskApi.create(data)
+      const res = await taskApi.create(data)
       ElMessage.success('任务创建成功')
+      // create 返回体的 data 是完整 task（含 id / task_type / cron_expression / next_run_at）。
+      // 没拿到 id 就没法「立即运行一次」，那就退回只提示创建成功，与改造前一致。
+      if (res?.data?.id) {
+        createdTask = res.data
+      }
     }
     formVisible.value = false
     loadTasks()
@@ -869,12 +890,85 @@ async function handleFormSubmit(data: any) {
   } finally {
     formSubmitting.value = false
   }
+
+  if (createdTask) {
+    await promptRunAfterCreate(createdTask)
+  }
 }
 
-async function handleRun(task: any) {
-  if (!ensureCanOperate('当前账号没有运行任务权限')) return
+/**
+ * 算出新建任务的「下次运行时间」文案，算不出来返回空串。
+ *
+ * 走的是 POST /tasks/cron/parse，也就是 CronInput 里「下次执行」预览用的同一个接口，
+ * 多条规则各解析一次取最早的那条。刻意不为此引入任何前端 cron 解析库。
+ *
+ * 开头那个 next_run_at 分支是为「以后 create 接口也下发它」留的：
+ * 现在 create 返回的是 model.Task.ToDict()，里面没有这个字段（它只在任务列表接口里按 cron 现算），
+ * 所以今天一定走下面的解析分支。绝大多数任务只有一条定时规则，也就是多发一个请求。
+ */
+async function resolveNextRunText(task: any): Promise<string> {
+  if (task?.next_run_at) {
+    return formatTime(task.next_run_at)
+  }
+
+  let earliest = ''
+  for (const expression of getCronExpressions(task)) {
+    try {
+      const parsed = await taskApi.cronParse(expression)
+      const next = parsed?.next_run_times?.[0]
+      if (!next) continue
+      if (!earliest || new Date(next).getTime() < new Date(earliest).getTime()) {
+        earliest = next
+      }
+    } catch {
+      // 单条解析失败不影响其它规则；全都失败就返回空串，由调用方换一套说法
+    }
+  }
+  return earliest ? formatTime(earliest) : ''
+}
+
+/**
+ * 新建任务成功后，把「下次什么时候跑」直接说出来，并给一个「立即运行一次」的入口。
+ *
+ * issue #115 的真实处境：用户在脚本页看完调试运行的完整输出，转手点「添加到定时任务」，
+ * 预填的是每天 00:00，于是接下来最长 24 小时什么都不会发生、日志抽屉如实显示
+ * 「该任务还没有日志记录」，用户就以为面板坏了。只弹一句「任务创建成功」是不够的。
+ */
+async function promptRunAfterCreate(task: any) {
+  const taskType = task?.task_type || 'cron'
+  let message = ''
+  if (taskType === 'manual') {
+    // 手动运行 / 开机运行本来就不按 cron 触发，算不出「下次」，直接把这件事说清楚
+    message = '任务已创建。「手动运行」的任务不会自动触发，只能手动点运行。要现在先跑一次吗？'
+  } else if (taskType === 'startup') {
+    message = '任务已创建。「开机运行」的任务只在面板每天首次启动时自动执行一次，不会按定时触发。要现在先跑一次吗？'
+  } else {
+    const nextRunText = await resolveNextRunText(task)
+    message = nextRunText
+      ? `任务已创建，下次运行时间：${nextRunText}。要现在先跑一次吗？`
+      : '任务已创建，但暂时算不出下次运行时间。要现在先跑一次吗？'
+  }
+
   try {
-    await ElMessageBox.confirm(`确认运行定时任务「${task.name}」吗？`, '运行确认', { type: 'info' })
+    await ElMessageBox.confirm(message, '任务已创建', {
+      confirmButtonText: '立即运行一次',
+      cancelButtonText: '知道了',
+      type: 'info'
+    })
+  } catch {
+    // 点了「知道了」或按了 ESC：只关掉弹窗，任务已经建好了
+    return
+  }
+  // 这里已经确认过一次，不要再走 handleRun 的二次确认，否则用户要连点两个「确认运行」
+  await runTaskNow(task)
+}
+
+/**
+ * 真正发起运行。二次确认由各调用点自己做：
+ * 列表里的运行按钮走 handleRun（带确认），新建后的「立即运行一次」已经确认过，直接调这里。
+ */
+async function runTaskNow(task: any) {
+  try {
     await taskApi.run(task.id)
     ElMessage.success('任务已启动，正在打开实时日志')
     task.status = 2
@@ -882,9 +976,19 @@ async function handleRun(task: any) {
     syncStatusPolling()
     void loadTasks()
   } catch (err: any) {
-    if (err === 'cancel' || err?.toString?.() === 'cancel') return
     ElMessage.error(err?.response?.data?.error || '启动失败')
   }
+}
+
+async function handleRun(task: any) {
+  if (!ensureCanOperate('当前账号没有运行任务权限')) return
+  try {
+    await ElMessageBox.confirm(`确认运行定时任务「${task.name}」吗？`, '运行确认', { type: 'info' })
+  } catch {
+    // 取消 / ESC
+    return
+  }
+  await runTaskNow(task)
 }
 
 async function handleStop(task: any) {
@@ -1478,7 +1582,16 @@ async function handleImport(event: Event) {
             </div>
             <div class="dd-mobile-card__field">
               <span class="dd-mobile-card__label">下次运行</span>
-              <span class="dd-mobile-card__value time-text">{{ row.next_run_at ? formatTime(row.next_run_at) : '-' }}</span>
+              <div class="dd-mobile-card__value next-run-cell">
+                <span class="time-text">{{ row.next_run_at ? formatTime(row.next_run_at) : '-' }}</span>
+                <!-- 与桌面表格同一套图标与分级，说明见那边的注释 -->
+                <el-tooltip v-if="row.schedule_hint" :content="row.schedule_hint" placement="top">
+                  <el-icon :class="['schedule-hint-icon', isScheduleFault(row) ? 'schedule-hint-icon--fault' : 'schedule-hint-icon--info']">
+                    <WarningFilled v-if="isScheduleFault(row)" />
+                    <InfoFilled v-else />
+                  </el-icon>
+                </el-tooltip>
+              </div>
             </div>
             <div class="dd-mobile-card__field">
               <span class="dd-mobile-card__label">耗时</span>
@@ -1672,8 +1785,21 @@ async function handleImport(event: Event) {
           sortable="custom"
         >
           <template #default="{ row }">
-            <span v-if="row.next_run_at" class="time-text">{{ formatTime(row.next_run_at) }}</span>
-            <span v-else class="text-muted">-</span>
+            <div class="next-run-cell">
+              <span v-if="row.next_run_at" class="time-text">{{ formatTime(row.next_run_at) }}</span>
+              <span v-else class="text-muted">-</span>
+              <!-- schedule_hint 由后端下发，正常时是空串。它专治 issue #115 那种「看着一切正常、实际不会触发」：
+                   任务显示已启用、下次运行也有时间，但调度器里根本没有它（或者它压根不是 cron 类型）。
+                   不做成 el-tag 是因为这一列只有 160px，塞不下一枚标签；图标 + tooltip 是这里唯一装得下的形态。
+                   分两种严重程度：定时任务没注册上是真故障（橙色警示），
+                   手动 / 开机运行只是在陈述任务类型（灰色信息），后者用警示色就是天天喊狼来了。 -->
+              <el-tooltip v-if="row.schedule_hint" :content="row.schedule_hint" placement="top">
+                <el-icon :class="['schedule-hint-icon', isScheduleFault(row) ? 'schedule-hint-icon--fault' : 'schedule-hint-icon--info']">
+                  <WarningFilled v-if="isScheduleFault(row)" />
+                  <InfoFilled v-else />
+                </el-icon>
+              </el-tooltip>
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="上次结果" :width="isNarrowDesktop ? 84 : 100" align="center">
@@ -2151,6 +2277,37 @@ async function handleImport(event: Event) {
 }
 
 .text-muted {
+  color: var(--el-text-color-placeholder);
+}
+
+// 「下次运行」格：时间 + 可能存在的 schedule_hint 警示图标并排一行。
+// 桌面表格那一列是 align="center"，所以整块也居中。
+.next-run-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+// 移动端卡片里这一格是靠左排的字段值，不能跟着居中。
+// 用「两个类同时命中」而不是媒体查询：卡片布局由 isMobile 决定渲染哪一套 DOM，不由视口宽度决定样式。
+.dd-mobile-card__value.next-run-cell {
+  justify-content: flex-start;
+}
+
+.schedule-hint-icon {
+  font-size: 14px;
+  // 它只是提示、点了没有动作，光标用 help 而不是 pointer，免得看着像能点开什么
+  cursor: help;
+}
+
+// 定时任务没注册上 = 真故障，用警示色
+.schedule-hint-icon--fault {
+  color: var(--el-color-warning);
+}
+
+// 手动 / 开机运行只是在陈述任务类型，本来就不该自动跑，用中性色，别喊狼来了
+.schedule-hint-icon--info {
   color: var(--el-text-color-placeholder);
 }
 

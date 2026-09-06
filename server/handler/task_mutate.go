@@ -2,6 +2,7 @@ package handler
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 
@@ -172,8 +173,18 @@ func (h *TaskHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// 注册调度失败必须留痕：此前这里把 error 整个丢掉，然后无条件回「创建成功」，
+	// 用户看到的是一个「已启用」的任务，实际上 cron 里一个触发条目都没有，永远不会自动跑。
+	// 今天这条 error 出口恰好不可达（上面的 panelcron.ValidateExpressions 与 AddJob 里的
+	// panelcron.ParseSchedule 共用同一个 parser，判定必然一致），但这纯靠两处代码同源维持，
+	// 没有任何测试钉住，一旦哪天分叉就会重新变成静默失败。
+	// 刻意不改成返回 500：任务已经落库，报错回滚对用户更难解释；用户侧的可见性由任务详情的
+	// schedule_hint 承担，这里只负责让运维在面板日志页看得见。
+	// 文案里的「失败」会被 service/panel_log.go 的 detectPanelLogLevel 判成 ERROR 级。
 	if scheduler := service.GetSchedulerV2(); scheduler != nil {
-		scheduler.AddJob(&task)
+		if err := scheduler.AddJob(&task); err != nil {
+			log.Printf("任务 %d 注册调度失败（它不会自动触发）: %v", task.ID, err)
+		}
 	}
 
 	response.Created(c, gin.H{

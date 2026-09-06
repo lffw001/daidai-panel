@@ -373,6 +373,12 @@ func (e *TaskExecutor) runTask(req *ExecutionRequest, taskLog *model.TaskLog, ti
 		})
 
 		inactiveStatus := ResolveTaskInactiveStatus(task)
+		if inactiveStatus == model.TaskStatusDisabled {
+			// 「运行中被禁用、等这次跑完再生效」的意图到这里就落地了（status 已经写成禁用），
+			// 标记用完即清：它只活在内存里，留着的话万一这个任务 id 被删除后复用，
+			// 新任务会平白继承一个禁用意图。
+			ClearPendingDisable(task.ID)
+		}
 		database.DB.Model(task).Updates(map[string]interface{}{
 			"status":            inactiveStatus,
 			"last_run_status":   runStatus,

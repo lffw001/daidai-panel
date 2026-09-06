@@ -1,3 +1,36 @@
+<script lang="ts">
+/**
+ * 定时规则默认表达式的单一来源。
+ *
+ * 为什么放在这个组件文件里（而不是新起一个 utils 模块）：这两个值只服务于「定时规则」这一件事，
+ * 而 CronInput 就是它的编辑器，任务表单与任务列表本来也都已经依赖本组件；
+ * 再抽一层常量模块属于「为通用性多套一层」，本仓约定是不做（见 AGENTS.md 写代码的风格）。
+ *
+ * 两个值都写成 6 段（秒 分 时 日 月 周），与随机生成器、后端 21 条出厂预设同一形态。
+ * ⚠️ 5 段补 6 段永远是在【开头补 0】，末尾补 `*` 会把「每分钟」变成「每秒」。
+ *
+ * 这次收敛之前，同一个面板里散着四处字面量（脚本入口、表单手动新建、切换定时类型的兜底、
+ * 本组件新增规则行），改一处忘一处的风险一直在。现在全部指向下面这两个常量，
+ * **每一处的取值都与改动前逐字节一致**，只是不再各写各的。
+ */
+
+/**
+ * 「每天 00:00:00」，与 5 段的 `0 0 * * *` 语义相同。用在两处：
+ * 1. 脚本页点「添加到定时任务」跳到任务页时的预填值；
+ * 2. 本组件里新增一条规则行、或外部传进来是空值时的兜底。
+ */
+export const DEFAULT_CRON_DAILY_MIDNIGHT = '0 0 0 * * *'
+
+/**
+ * 「每分钟一次」。注意秒段固定为 0，`* * * * * *` 那种才是每秒。
+ * 只用在任务表单里手动新建任务这一个入口。
+ *
+ * 与上面那个值不一样是【既有行为】：要不要把两个入口统一成同一个频率是产品决定，
+ * 不该顺手夹在这次收敛里改掉。
+ */
+export const DEFAULT_CRON_EVERY_MINUTE = '0 * * * * *'
+</script>
+
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -37,8 +70,6 @@ const CRON_FAVORITES_STORAGE_KEY = 'dd:tasks:cron_favorites'
 const MAX_CRON_FAVORITES = 30
 /** 输入解析的防抖时长。原来每敲一个字符就打一次 POST /tasks/cron/parse */
 const PARSE_DEBOUNCE = 300
-/** 新增规则时的默认表达式：6 段的「每天 00:00:00」，与 5 段的 `0 0 * * *` 语义相同 */
-const DEFAULT_EXPRESSION = '0 0 0 * * *'
 
 /**
  * 读取收藏。
@@ -142,7 +173,7 @@ function syncRulesFromModel(value: string) {
   const expressions = splitExpressions(value)
   rules.value = expressions.length > 0
     ? expressions.map(expression => createRule(expression))
-    : [createRule(DEFAULT_EXPRESSION)]
+    : [createRule(DEFAULT_CRON_DAILY_MIDNIGHT)]
 
   // forEach 是在 rules.value（reactive 数组代理）上遍历的，回调拿到的每一项都已被 get 陷阱
   // 包成代理，所以这里写 parseResult 会正常触发重渲染，不需要再按下标取一次
@@ -221,7 +252,7 @@ function handleRuleInput(rule: CronRuleState) {
 function addRule(afterIndex = rules.value.length - 1) {
   // 钳制插入下标：splice 允许越界（自动落到首/末尾），越界时按 afterIndex + 1 取回来的会是 undefined
   const insertIndex = Math.min(Math.max(afterIndex + 1, 0), rules.value.length)
-  rules.value.splice(insertIndex, 0, createRule(DEFAULT_EXPRESSION))
+  rules.value.splice(insertIndex, 0, createRule(DEFAULT_CRON_DAILY_MIDNIGHT))
   emitRules()
   // 必须从 rules.value 把这条取回来再解析：createRule 返回的是裸对象，splice 存进去时
   // 并不会给它套上 reactive 代理（只有读 rules.value[i] 时才由 get 陷阱包一层）。

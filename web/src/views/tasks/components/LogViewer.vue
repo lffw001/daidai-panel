@@ -67,6 +67,17 @@ const logRevision = ref(0)
 const done = ref(false)
 const error = ref<string | null>(null)
 const emptyMessage = ref<string | null>(null)
+// 「日志还没出现，但任务确实在排队/运行中」这一态。issue #115：这段时间 task_logs 里一行都没有，
+// 直接报「该任务还没有日志记录」是谎报，要用等待文案 + 继续轮询，见 keepWaitingForPendingTask。
+const waitingForLog = ref(false)
+// 空态下 emptyMessage 底下那行小字。以前它是写死的「任务执行一次后就会出现日志」，
+// 于是「日志已过期，文件已被清理」「日志已按保留策略清理」这些明明跑过的情况，
+// 底下也跟着说「执行一次后就会出现」——同一块区域里两句话自相矛盾。
+// 现在跟着 emptyMessage 一起设，语义对不上就留空。
+const emptyHint = ref('')
+// 「从来没跑过」时的那句引导，也是后端 latest-log 在这种情况下回的原话（server/handler/task_logs.go）。
+const NEVER_RAN_MESSAGE = '该任务还没有日志记录'
+const NEVER_RAN_HINT = '任务执行一次后就会出现日志'
 const loading = ref(false)
 const logContainerRef = ref<HTMLElement>()
 const autoScroll = ref(readStoredAutoScroll())
@@ -109,6 +120,18 @@ const LATEST_LOG_PREFETCH_TTL = 1200
 let reconnectAttempts = 0
 const MAX_RECONNECT_ATTEMPTS = 5
 
+// 任务状态取值，与后端 model.TaskStatus* 对齐：0=已禁用 / 0.5=排队中 / 1=已启用 / 2=运行中
+const TASK_STATUS_QUEUED = 0.5
+const TASK_STATUS_RUNNING = 2
+// 「等日志出现」的轮询上限：1s 一次、最多 60 次（约 1 分钟）。
+// 随机延迟会走延迟入队、并发数被占满时任务也会一直停在「排队中」，这段窗口必须留够；
+// 但任务可能长期卡在排队中，所以要有这个兜底，不能无限轮询。
+const WAITING_POLL_LIMIT = 60
+let waitingPollCount = 0
+// 组件卸载标记：等待轮询中间夹着一次 await（查任务状态），
+// 卸载/关闭正好落在这一拍时，后面绝不能再把新的定时器挂上去。
+let disposed = false
+
 // 下面这批 computed 都要跟着行缓冲走，读一下 logRevision 建立依赖即可
 const activeRenderWindow = computed(() => renderWindowExpanded.value ? 0 : RENDER_WINDOW_CHUNKS)
 
@@ -147,6 +170,16 @@ const byteLabel = computed(() => {
 })
 
 const fontSizeClass = computed(() => `log-font-${fontSize.value}`)
+
+// 头部状态灯、头部徽标、底部状态栏共用这一个状态口径，避免三处各写一串条件后彼此打架。
+// waiting 是本轮新增的一态（issue #115）：日志还没落库，但任务确实在排队/运行中，不能显示成「无日志」。
+// error 只会在 done 之后被写入（见 fetchLatestLog），所以把它排在 running 前面不改变原有观感。
+const headerState = computed<'error' | 'waiting' | 'empty' | 'done' | 'running'>(() => {
+  if (error.value) return 'error'
+  if (waitingForLog.value) return 'waiting'
+  if (emptyMessage.value) return 'empty'
+  return done.value ? 'done' : 'running'
+})
 
 function expandRenderWindow() {
   const container = logContainerRef.value
@@ -202,11 +235,15 @@ async function startStream(isReconnect = false) {
   done.value = false
   error.value = null
   emptyMessage.value = null
+  emptyHint.value = ''
+  waitingForLog.value = false
   loading.value = !isReconnect
   pendingScrollRestore = isReconnect && savedScrollTop !== null ? savedScrollTop : null
   if (!isReconnect) {
     // 用户主动打开/切换任务重新起流：清零重连计数，确保熔断只针对一次会话内的连续空重连。
     reconnectAttempts = 0
+    // 等日志的轮询次数同理，只在一次会话内累计
+    waitingPollCount = 0
     // 这里刻意不再重置 autoScroll —— 跟随开关已经是持久化偏好，重开弹窗/刷新页面都要沿用上次的选择。
     // 初始视口方向随之二选一：以前无条件滚顶的前提是「打开一定是暂停态、从头看」，
     // 恢复成跟随后仍滚顶会出现「开关显示跟随、内容却停在顶部」的割裂。
@@ -323,6 +360,9 @@ async function loadLatestOnly() {
   done.value = true
   error.value = null
   emptyMessage.value = null
+  emptyHint.value = ''
+  waitingForLog.value = false
+  waitingPollCount = 0
   loading.value = true
   // latest 是一次性拉取的「最近结果」，后面没有 SSE 续流，跟随开关点了也没有实质作用，
   // 所以这一支仍然强制暂停 + 从头看；持久化的跟随偏好只在 live 模式恢复（见 startStream）。
@@ -371,15 +411,78 @@ async function takeLatestLog(): Promise<any> {
   return taskApi.latestLog(props.taskId!)
 }
 
+// 「日志还没出现」时的统一判断：任务如果还在排队中/运行中，就继续等，别急着收口成静态文案。
+// issue #115 的那一屏就出在这里 —— 随机延迟走的是延迟重新入队、并发数被别的任务占满时也一样，
+// 任务会长时间停在「排队中」，这段时间 task_logs 里一行都没有，
+// 老逻辑重试 5 次（2.5s）就把「该任务还没有日志记录」定死，而且之后再也不会自己纠正。
+//
+// 返回 true = 已经接管（安排了下一次轮询，或者写好了「等到上限」的说明），调用方直接 return；
+// 返回 false = 可以按调用方原本的文案收口。
+async function keepWaitingForPendingTask(retryCount: number, scrollMode: 'top' | 'bottom' | 'preserve') {
+  const taskId = props.taskId
+  if (!disposed && props.visible && taskId) {
+    // 顺带查一次任务状态：LiveLogs 的返回体里带着 status（0=已禁用 / 0.5=排队中 / 1=已启用 / 2=运行中）
+    let status: number | null = null
+    try {
+      const live = await taskApi.liveLogs(taskId)
+      status = typeof live?.status === 'number' ? live.status : null
+    } catch {
+      // 状态查不到就不猜，直接按调用方原来的文案收口
+    }
+    const pending = status === TASK_STATUS_QUEUED || status === TASK_STATUS_RUNNING
+    // await 这一拍里用户可能已经关掉弹窗、切了任务、或者组件被卸载，这些情况下不能再挂新的定时器
+    if (pending && !disposed && props.visible && props.taskId === taskId) {
+      if (waitingPollCount < WAITING_POLL_LIMIT) {
+        waitingPollCount++
+        waitingForLog.value = true
+        emptyMessage.value = status === TASK_STATUS_QUEUED
+          ? '任务排队中，开始执行后会出现日志…'
+          : '任务已开始，正在等待第一条日志…'
+        emptyHint.value = '正在等待日志写入，出现后会自动显示，不用手动重开'
+        // 同一时刻只留一个等待定时器：切后台再回来时 handleVisibilityChange 会另起一条链，
+        // 不掐掉旧的就会变成两条链同时轮询。
+        if (reconnectTimer !== null) {
+          clearTimeout(reconnectTimer)
+        }
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null
+          void fetchLatestLog(retryCount, scrollMode)
+        }, 1000)
+        return true
+      }
+      // 到达兜底上限：停止轮询。这里退出等待态，头部徽标会显示「无日志」——
+      // 这句话是对着日志说的（确实一条都没有），所以正文也要写成「还没有产生日志」的口吻，
+      // 任务卡在哪一步放进括号里补充，避免出现「正文说还在跑、徽标说无日志」那种看着矛盾的组合。
+      waitingForLog.value = false
+      emptyMessage.value = status === TASK_STATUS_QUEUED
+        ? '还没有产生日志（任务一直停在排队中）'
+        : '还没有产生日志（任务仍在运行，但还没输出第一行）'
+      emptyHint.value = '已停止自动刷新，重新打开这个窗口可以继续等'
+      return true
+    }
+  }
+  waitingForLog.value = false
+  return false
+}
+
 async function fetchLatestLog(retryCount = 0, scrollMode: 'top' | 'bottom' | 'preserve' = 'top') {
   const previousScrollTop = logContainerRef.value?.scrollTop ?? 0
   try {
     const res = await takeLatestLog() as any
     if (!res) {
-      emptyMessage.value = '该任务还没有日志记录'
+      // 连记录都没返回：也可能只是任务还在排队/运行中，先按状态决定要不要继续等
+      if (await keepWaitingForPendingTask(retryCount, scrollMode)) {
+        return
+      }
+      emptyMessage.value = NEVER_RAN_MESSAGE
+      emptyHint.value = NEVER_RAN_HINT
       return
     }
     if (res.content) {
+      // 拿到正文：等待态要一并收掉，否则头部徽标会一直停在「等待中」
+      emptyMessage.value = null
+      emptyHint.value = ''
+      waitingForLog.value = false
       resetLogOutput()
       appendLogChunk(String(res.content))
       if (scrollMode === 'bottom') {
@@ -394,19 +497,42 @@ async function fetchLatestLog(retryCount = 0, scrollMode: 'top' | 'bottom' | 'pr
         scheduleScrollToTop()
       }
     } else {
+      // 有记录却没有内容有两种可能：日志文件被保留策略清掉了，
+      // 或者这次运行刚建好记录、还没写出第一行（记录是在执行开始时就落库的）。
+      // 后者不能报「已过期」，同样交给状态判断，两条文案的语义由此保持互斥。
+      if (await keepWaitingForPendingTask(retryCount, scrollMode)) {
+        return
+      }
       emptyMessage.value = '日志已过期，文件已被清理'
+      // 这条记录确实跑过，只是正文没了，不能再配「执行一次后就会出现日志」那句引导
+      emptyHint.value = ''
     }
   } catch (err: any) {
     if (err?.response?.status === 404) {
       if (retryCount < 5 && props.visible) {
+        // 同一时刻只留一个定时器：快速重试和下面的等待轮询共用 reconnectTimer，
+        // 切后台再回来时 handleVisibilityChange 会另起一条链，不掐掉旧的就会叠出多条并行轮询。
+        if (reconnectTimer !== null) {
+          clearTimeout(reconnectTimer)
+        }
         reconnectTimer = setTimeout(() => {
           reconnectTimer = null
           void fetchLatestLog(retryCount + 1, scrollMode)
         }, 500)
         return
       }
-      emptyMessage.value = '该任务还没有日志记录'
+      // 快速重试用完仍是 404，不等于「从来没跑过」，先看任务是不是还在排队/运行中
+      if (await keepWaitingForPendingTask(retryCount, scrollMode)) {
+        return
+      }
+      // 后端 404 的说明比前端这句通用文案更准（例如区分「从来没跑过」和「日志已按保留策略清理」），
+      // 统一的错误结构是 { error: string }（server/pkg/response），取不到再退回原文案
+      emptyMessage.value = err?.response?.data?.error || NEVER_RAN_MESSAGE
+      // 只有「从来没跑过」才配得上那句引导：后端换成「日志已按保留策略清理」时再说
+      // 「执行一次后就会出现日志」，就和它自己上一句自相矛盾了
+      emptyHint.value = emptyMessage.value === NEVER_RAN_MESSAGE ? NEVER_RAN_HINT : ''
     } else {
+      waitingForLog.value = false
       error.value = '获取日志失败'
     }
   }
@@ -608,6 +734,8 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  // 先置标记再 cleanup：等待轮询里那次 await 如果正好在飞，回来后要靠它拦住「再挂一个定时器」
+  disposed = true
   document.removeEventListener('visibilitychange', handleVisibilityChange)
   cleanup()
 })
@@ -635,14 +763,20 @@ function handleClose() {
         <div class="viewer-hero-main">
           <div class="viewer-hero-title-row">
             <transition name="status-switch" mode="out-in">
-              <span v-if="!done" key="running" class="status-orb status-orb--running" aria-label="运行中">
+              <!-- 等待日志（任务排队中/运行中但还没日志）复用「运行中」这颗呼吸灯，不另造一套 UI -->
+              <span
+                v-if="headerState === 'running' || headerState === 'waiting'"
+                key="running"
+                class="status-orb status-orb--running"
+                :aria-label="headerState === 'waiting' ? '等待日志' : '运行中'"
+              >
                 <span class="status-orb-core"></span>
                 <span class="status-orb-ripple"></span>
               </span>
-              <span v-else-if="error" key="error" class="status-orb status-orb--error" aria-label="错误">
+              <span v-else-if="headerState === 'error'" key="error" class="status-orb status-orb--error" aria-label="错误">
                 <el-icon :size="12"><Warning /></el-icon>
               </span>
-              <span v-else-if="emptyMessage" key="empty" class="status-orb status-orb--empty" aria-label="无日志">
+              <span v-else-if="headerState === 'empty'" key="empty" class="status-orb status-orb--empty" aria-label="无日志">
                 <el-icon :size="12"><InfoFilled /></el-icon>
               </span>
               <span v-else key="done" class="status-orb status-orb--done" aria-label="已完成">
@@ -654,13 +788,13 @@ function handleClose() {
             <span
               class="viewer-hero-status"
               :class="{
-                'viewer-hero-status--running': !done && !error && !emptyMessage,
-                'viewer-hero-status--done': done && !error && !emptyMessage,
-                'viewer-hero-status--empty': !!emptyMessage && !error,
-                'viewer-hero-status--error': !!error
+                'viewer-hero-status--running': headerState === 'running' || headerState === 'waiting',
+                'viewer-hero-status--done': headerState === 'done',
+                'viewer-hero-status--empty': headerState === 'empty',
+                'viewer-hero-status--error': headerState === 'error'
               }"
             >
-              {{ error ? '异常' : emptyMessage ? '无日志' : done ? '已完成' : '运行中' }}
+              {{ headerState === 'error' ? '异常' : headerState === 'waiting' ? '等待中' : headerState === 'empty' ? '无日志' : headerState === 'done' ? '已完成' : '运行中' }}
             </span>
           </div>
           <div class="viewer-hero-meta">
@@ -717,9 +851,12 @@ function handleClose() {
           <span>{{ error }}</span>
         </div>
         <div v-else-if="emptyMessage && !hasLogs" class="viewer-message viewer-message--empty">
-          <el-icon :size="22"><InfoFilled /></el-icon>
+          <el-icon :size="22">
+            <Loading v-if="headerState === 'waiting'" />
+            <InfoFilled v-else />
+          </el-icon>
           <span>{{ emptyMessage }}</span>
-          <span class="viewer-message-hint">任务执行一次后就会出现日志</span>
+          <span v-if="emptyHint" class="viewer-message-hint">{{ emptyHint }}</span>
         </div>
         <div v-else-if="!hasLogs && !loading" class="viewer-message">
           <el-icon :size="22"><Loading /></el-icon>
@@ -745,7 +882,9 @@ function handleClose() {
           <span class="viewer-statusbar-item">Wrap {{ wrap ? 'ON' : 'OFF' }}</span>
         </div>
         <div class="viewer-statusbar-group">
-          <span v-if="props.mode === 'latest' && !error && !emptyMessage" class="viewer-statusbar-item">最近结果</span>
+          <!-- 等日志期间沿用「实时采集中」那颗跳动的点，表示这里还在自动刷新，不是死在「暂无日志」上 -->
+          <span v-if="headerState === 'waiting'" class="viewer-statusbar-item viewer-statusbar-item--live">等待日志中</span>
+          <span v-else-if="props.mode === 'latest' && !error && !emptyMessage" class="viewer-statusbar-item">最近结果</span>
           <span v-else-if="!done && !error && !emptyMessage" class="viewer-statusbar-item viewer-statusbar-item--live">实时采集中</span>
           <span v-else-if="error" class="viewer-statusbar-item viewer-statusbar-item--error">{{ error }}</span>
           <span v-else-if="emptyMessage" class="viewer-statusbar-item viewer-statusbar-item--empty">暂无日志</span>

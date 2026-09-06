@@ -1139,3 +1139,232 @@ func TestTaskListKeepsCustomAndSubscriptionLabelsWhenNamesCollide(t *testing.T) 
 		t.Fatalf("expected subscription_labels [娱乐], got %v", subscriptionLabels)
 	}
 }
+
+// 读任务列表里的 schedule_hint。handler 只在「有话要说」时才下发这个字段，
+// 正常任务上它压根不存在，所以缺省一律当空串处理，不能直接断言类型。
+func taskListScheduleHint(t *testing.T, item map[string]interface{}) string {
+	t.Helper()
+
+	raw, exists := item["schedule_hint"]
+	if !exists || raw == nil {
+		return ""
+	}
+	hint, ok := raw.(string)
+	if !ok {
+		t.Fatalf("expected schedule_hint to be string, got %#v", raw)
+	}
+	return hint
+}
+
+// 数据库里「已启用 + 有 cron 表达式」不代表任务真的会被触发：
+// 只要调度器里没有它的 cron 条目，它就永远不会跑，列表却照样显示下次运行时间，
+// 用户只能看到「任务不执行、也没有任何日志」（issue #115）。
+// schedule_hint 就是把这种静默失联翻出来给用户看，且不能动 next_run_at 的既有行为。
+func TestTaskListExposesScheduleHintForSilentlyUnscheduledTasks(t *testing.T) {
+	testutil.SetupTestEnv(t)
+	service.ShutdownSchedulerV2()
+	service.InitSchedulerV2()
+	t.Cleanup(service.ShutdownSchedulerV2)
+
+	engine := newProtectedRouter()
+	user := testutil.MustCreateUser(t, "schedule-hint-operator", "operator")
+	accessToken := testutil.MustCreateAccessToken(t, user.Username, user.Role)
+
+	// 三条任务都在调度器起来之后才创建，所以默认谁都没被装载进去；
+	// 下面只对 registered 那条显式调用 AddJob，构造出「注册上了」与「没注册上」的对照。
+	manualTask := &model.Task{
+		Name:     "manual hint task",
+		Command:  "echo manual",
+		TaskType: model.TaskTypeManual,
+		Status:   model.TaskStatusEnabled,
+	}
+	unregisteredTask := &model.Task{
+		Name:           "unregistered cron task",
+		Command:        "echo lost",
+		CronExpression: "0 0 * * *",
+		TaskType:       model.TaskTypeCron,
+		Status:         model.TaskStatusEnabled,
+	}
+	registeredTask := &model.Task{
+		Name:           "registered cron task",
+		Command:        "echo ok",
+		CronExpression: "0 0 * * *",
+		TaskType:       model.TaskTypeCron,
+		Status:         model.TaskStatusEnabled,
+	}
+	for _, task := range []*model.Task{manualTask, unregisteredTask, registeredTask} {
+		if err := database.DB.Create(task).Error; err != nil {
+			t.Fatalf("create task %q: %v", task.Name, err)
+		}
+	}
+
+	scheduler := service.GetSchedulerV2()
+	if scheduler == nil {
+		t.Fatal("expected scheduler to be initialized")
+	}
+	if err := scheduler.AddJob(registeredTask); err != nil {
+		t.Fatalf("add job for %q: %v", registeredTask.Name, err)
+	}
+
+	rec := performRequest(engine, http.MethodGet, "/api/v1/tasks", map[string]string{
+		"Authorization": "Bearer " + accessToken,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSONMap(t, rec)
+
+	manualItem := findTaskListItem(t, payload, manualTask.Name)
+	if got := taskListScheduleHint(t, manualItem); got != "该任务类型不会自动触发，只能手动运行" {
+		t.Fatalf("expected manual task schedule_hint, got %q", got)
+	}
+	// next_run_at 的既有行为一个字节都不能变：手动任务从来就不下发它。
+	if value, exists := manualItem["next_run_at"]; exists {
+		t.Fatalf("did not expect next_run_at for manual task, got %#v", value)
+	}
+
+	unregisteredItem := findTaskListItem(t, payload, unregisteredTask.Name)
+	if got := taskListScheduleHint(t, unregisteredItem); got != "未注册到调度器，重新保存一次任务即可恢复" {
+		t.Fatalf("expected unregistered cron task schedule_hint, got %q", got)
+	}
+	// 关键对照：它看着完全正常 —— 有下次运行时间，只是永远不会跑。
+	if _, exists := unregisteredItem["next_run_at"]; !exists {
+		t.Fatalf("expected next_run_at to stay present for unregistered cron task, got %#v", unregisteredItem)
+	}
+
+	registeredItem := findTaskListItem(t, payload, registeredTask.Name)
+	if got := taskListScheduleHint(t, registeredItem); got != "" {
+		t.Fatalf("expected no schedule_hint for registered cron task, got %q", got)
+	}
+	if _, exists := registeredItem["next_run_at"]; !exists {
+		t.Fatalf("expected next_run_at for registered cron task, got %#v", registeredItem)
+	}
+}
+
+// 两条提示的判据不一样，所以对「调度器没起来」的反应也不一样：
+//   - 「该任务类型不会自动触发」纯看任务类型，不问调度器，任何时候都该下发；
+//   - 「未注册到调度器」必须有调度器才判得准，没有调度器时每条任务都查不到 cron 条目，
+//     下发就是全量误报，比不报更糟，所以一条都不能发。
+//
+// 另外已禁用的任务整段跳过：它本来就不会自动触发，状态列已经写着「已禁用」，再挂提示只是噪音。
+func TestTaskListScheduleHintWithoutSchedulerAndForDisabledTasks(t *testing.T) {
+	testutil.SetupTestEnv(t)
+	service.ShutdownSchedulerV2()
+
+	engine := newProtectedRouter()
+	user := testutil.MustCreateUser(t, "no-scheduler-operator", "operator")
+	accessToken := testutil.MustCreateAccessToken(t, user.Username, user.Role)
+
+	manualTask := &model.Task{
+		Name:     "manual task without scheduler",
+		Command:  "echo manual",
+		TaskType: model.TaskTypeManual,
+		Status:   model.TaskStatusEnabled,
+	}
+	cronTask := &model.Task{
+		Name:           "cron task without scheduler",
+		Command:        "echo cron",
+		CronExpression: "0 0 * * *",
+		TaskType:       model.TaskTypeCron,
+		Status:         model.TaskStatusEnabled,
+	}
+	startupTask := &model.Task{
+		Name:     "startup task without scheduler",
+		Command:  "echo startup",
+		TaskType: model.TaskTypeStartup,
+		Status:   model.TaskStatusEnabled,
+	}
+	disabledManualTask := &model.Task{
+		Name:     "disabled manual task",
+		Command:  "echo disabled",
+		TaskType: model.TaskTypeManual,
+		Status:   model.TaskStatusDisabled,
+	}
+	disabledCronTask := &model.Task{
+		Name:           "disabled cron task",
+		Command:        "echo disabled cron",
+		CronExpression: "0 0 * * *",
+		TaskType:       model.TaskTypeCron,
+		Status:         model.TaskStatusDisabled,
+	}
+	for _, task := range []*model.Task{manualTask, cronTask, startupTask, disabledManualTask, disabledCronTask} {
+		if err := database.DB.Create(task).Error; err != nil {
+			t.Fatalf("create task %q: %v", task.Name, err)
+		}
+	}
+
+	if service.GetSchedulerV2() != nil {
+		t.Fatal("expected no scheduler for this case")
+	}
+
+	rec := performRequest(engine, http.MethodGet, "/api/v1/tasks", map[string]string{
+		"Authorization": "Bearer " + accessToken,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSONMap(t, rec)
+
+	manualItem := findTaskListItem(t, payload, manualTask.Name)
+	if got := taskListScheduleHint(t, manualItem); got != "该任务类型不会自动触发，只能手动运行" {
+		t.Fatalf("expected manual task schedule_hint even without scheduler, got %q", got)
+	}
+
+	// 开机运行**会**自动跑，只是按面板启动、不按时间，不能跟手动任务共用「只能手动运行」那句话。
+	startupItem := findTaskListItem(t, payload, startupTask.Name)
+	if got := taskListScheduleHint(t, startupItem); got != "该任务只在面板启动时自动执行一次，不按定时规则触发" {
+		t.Fatalf("expected startup task to get its own schedule_hint, got %q", got)
+	}
+
+	for _, name := range []string{cronTask.Name, disabledManualTask.Name, disabledCronTask.Name} {
+		item := findTaskListItem(t, payload, name)
+		if got := taskListScheduleHint(t, item); got != "" {
+			t.Fatalf("expected no schedule_hint for %q, got %q", name, got)
+		}
+	}
+}
+
+// 「运行中点了禁用、等这次跑完再生效」的任务，cron 条目确实已经被摘掉了，
+// 但那正是用户要的，不是故障 —— 这时候提示「未注册到调度器，重新保存一次任务即可恢复」，
+// 等于在教用户把自己刚关掉的任务重新打开。
+func TestTaskListOmitsScheduleHintForTasksPendingDisable(t *testing.T) {
+	testutil.SetupTestEnv(t)
+	service.ShutdownSchedulerV2()
+	service.InitSchedulerV2()
+	t.Cleanup(service.ShutdownSchedulerV2)
+
+	engine := newProtectedRouter()
+	user := testutil.MustCreateUser(t, "pending-disable-operator", "operator")
+	accessToken := testutil.MustCreateAccessToken(t, user.Username, user.Role)
+
+	task := &model.Task{
+		Name:           "running task pending disable",
+		Command:        "echo hi",
+		CronExpression: "0 0 * * *",
+		TaskType:       model.TaskTypeCron,
+		Status:         model.TaskStatusRunning,
+	}
+	if err := database.DB.Create(task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	// 没打标记时，它就是一条「显示正常、实际没注册」的任务，应当提示。
+	rec := performRequest(engine, http.MethodGet, "/api/v1/tasks", map[string]string{
+		"Authorization": "Bearer " + accessToken,
+	})
+	item := findTaskListItem(t, decodeJSONMap(t, rec), task.Name)
+	if got := taskListScheduleHint(t, item); got != "未注册到调度器，重新保存一次任务即可恢复" {
+		t.Fatalf("前置条件不成立：未注册的运行中任务本该提示，实际 %q", got)
+	}
+
+	service.MarkPendingDisable(task.ID)
+	t.Cleanup(func() { service.ClearPendingDisable(task.ID) })
+
+	rec = performRequest(engine, http.MethodGet, "/api/v1/tasks", map[string]string{
+		"Authorization": "Bearer " + accessToken,
+	})
+	item = findTaskListItem(t, decodeJSONMap(t, rec), task.Name)
+	if got := taskListScheduleHint(t, item); got != "" {
+		t.Fatalf("已经点过禁用的任务不该再提示「重新保存一次即可恢复」，实际 %q", got)
+	}
+}

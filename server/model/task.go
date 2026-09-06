@@ -59,6 +59,12 @@ type Task struct {
 	// 置真后订阅同步不再覆盖 name/cron，也不会在候选集缺失时自动删除它。
 	// 刻意不叫 cron_locked：名称与定时是同一把锁，避免重蹈 force_overwrite「名字与作用域不符」的覆辙。
 	SubscriptionLocked     bool      `gorm:"default:0" json:"subscription_locked"`
+	// LastSkipAt / LastSkipReason 记录「到点了但这次没执行」的最近一次原因。
+	// 目前只有一种成因：上一次执行还没结束、且任务没开「允许多实例」。
+	// 刻意不为这种情况建 task_logs 行 —— 它压根没执行，建成日志会混进「已终止」与耗时统计，
+	// 还会因为时间更晚顶掉「最近一次日志」，让用户看不到真正的执行输出。
+	LastSkipAt             *time.Time `json:"last_skip_at"`
+	LastSkipReason         string     `gorm:"type:text;default:''" json:"last_skip_reason"`
 	PID                    *int      `gorm:"column:pid" json:"pid"`
 	LogPath                *string   `gorm:"size:256" json:"log_path"`
 	LastRunningTime        *float64  `json:"last_running_time"`
@@ -108,6 +114,8 @@ func (t *Task) ToDict() map[string]interface{} {
 		"is_pinned":                t.IsPinned,
 		"subscription_locked":      t.SubscriptionLocked,
 		"pid":                      t.PID,
+		"last_skip_at":             t.LastSkipAt,
+		"last_skip_reason":         t.LastSkipReason,
 		"log_path":                 t.LogPath,
 		"last_running_time":        t.LastRunningTime,
 		"task_before":              t.TaskBefore,

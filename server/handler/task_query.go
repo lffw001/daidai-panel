@@ -197,6 +197,38 @@ func prepareTaskListItems(tasks []model.Task, subscriptionNames map[uint]string,
 			}
 		}
 
+		// schedule_hint 回答的是「这条任务看着会自动跑、实际到底跑不跑」。
+		// 上面那段 next_run_at 只认数据库的三个字段（状态 / 任务类型 / cron 表达式），
+		// 三个字段都对就现算一个时间下发，从不回头问调度器这条任务有没有真正注册上 ——
+		// 可任务能不能被触发的唯一判据，是它在 SchedulerV2 的 entryMap 里有没有 cron 条目。
+		// 「编辑保存正好撞上排队中/运行中」「AddJob 解析 cron 报错」「面板启动时装载失败」
+		// 这些路径都会让 entry 丢掉或压根没建起来，数据库那三个字段却纹丝不动，
+		// 于是列表里它和正常任务长得一模一样：已启用、有下次运行时间、永远不触发、连一条日志都没有。
+		// 所以这里必须再拿调度器的真实状态兜一层，把静默失联翻译成用户看得见的一句话。
+		// 只是 entryMap 的一次内存查找（读锁），列表逐行调用也不会引入任何 DB 查询。
+		//
+		// 已禁用的任务整段跳过：它本来就不该在调度器里，状态列也已经写着「已禁用」，
+		// 再挂一个警示图标只是噪音。
+		if task.Status != model.TaskStatusDisabled {
+			switch {
+			case task.GetTaskType() == model.TaskTypeManual:
+				// 手动 / 开机运行本来就不进 cron，AddJob 只给它们留一个空条目列表，
+				// 数量恒为 0，不能和下面「注册丢了」共用一句文案。
+				// 这两条纯看任务类型，不依赖调度器，所以调度器没起来时照样下发。
+				item["schedule_hint"] = "该任务类型不会自动触发，只能手动运行"
+			case task.GetTaskType() == model.TaskTypeStartup:
+				// 开机运行**会**自动跑，只是按面板启动、不按时间，不能跟手动任务共用一句话。
+				item["schedule_hint"] = "该任务只在面板启动时自动执行一次，不按定时规则触发"
+			case service.HasPendingDisable(&task):
+				// 「运行中被禁用、等这次跑完再生效」：条目确实已经被摘掉了，但那正是用户要的，
+				// 这时候提示「未注册到调度器，重新保存一次即可恢复」是在教用户把自己刚关掉的任务打开。
+			case service.GetSchedulerV2() != nil && service.GetSchedulerV2().ScheduledEntryCount(task.ID) <= 0:
+				// 这一条必须有调度器才判得准。调度器为 nil（单元测试、只读演示站等根本没起
+				// 调度器的场景）时一律不下发：那种情况下每一条任务都查不到条目，全量误报比不报更糟。
+				item["schedule_hint"] = "未注册到调度器，重新保存一次任务即可恢复"
+			}
+		}
+
 		prepared = append(prepared, preparedTaskListItem{
 			task:               task,
 			item:               item,

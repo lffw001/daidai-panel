@@ -62,11 +62,13 @@ func InitSchedulerV2() {
 	globalScheduler.Start()
 
 	var tasks []model.Task
-	database.DB.Where("status = ?", model.TaskStatusEnabled).Find(&tasks)
+	// 与 AddJob / ReloadAllJobs 的口径对齐：上面 RecoverAbandonedActiveTasks 已经把残留的
+	// 排队中/运行中拉回启用态，这里再放宽一次是防御性的，避免三处条件各写各的以后漂移。
+	database.DB.Where("status <> ?", model.TaskStatusDisabled).Find(&tasks)
 
 	for _, task := range tasks {
 		if err := globalScheduler.AddJob(&task); err != nil {
-			log.Printf("failed to add task %d: %v", task.ID, err)
+			log.Printf("任务 %d 启动时注册调度失败（它不会自动触发）: %v", task.ID, err)
 		}
 	}
 

@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+// 全局注册的图标里没有 WarningFilled，按仓库既有做法局部引入
+import { WarningFilled } from '@element-plus/icons-vue'
 import { getDisplayTaskLabels, isSubscriptionTask } from '../taskLabels'
 import { useResponsive } from '@/composables/useResponsive'
 import { formatDuration } from '@/utils/duration'
@@ -169,7 +171,24 @@ function handleRestoreSubscriptionDefault() {
         <span v-else style="color: var(--el-text-color-placeholder)">全部默认推送渠道</span>
       </el-descriptions-item>
       <el-descriptions-item label="下次运行时间" :span="2">
-        {{ formatTime(task.next_run_at) }}
+        <div class="next-run-row">
+          <span>{{ formatTime(task.next_run_at) }}</span>
+          <!-- schedule_hint 由后端下发，正常时为空串。它专治「任务显示已启用、下次运行也有时间，
+               实际却永远不会被调度器触发」这种静默状态（issue #115）。
+               列表那边地方只够放一个带 tooltip 的图标，详情弹窗地方够，直接把整句话摊开写。 -->
+          <span v-if="task.schedule_hint" class="schedule-hint">
+            <el-icon><WarningFilled /></el-icon>
+            {{ task.schedule_hint }}
+          </span>
+        </div>
+      </el-descriptions-item>
+      <!-- 「到点了但这次没执行」的原因。它记在任务行上、不建日志记录（跳过意味着压根没执行，
+           建成日志会混进「已终止」和耗时统计，还会顶掉「最近一次日志」），所以只能在这里展示。 -->
+      <el-descriptions-item v-if="task.last_skip_reason" label="最近一次被跳过" :span="2">
+        <div class="skip-reason">
+          <el-icon><WarningFilled /></el-icon>
+          <span>{{ formatTime(task.last_skip_at) }}　{{ task.last_skip_reason }}</span>
+        </div>
       </el-descriptions-item>
       <el-descriptions-item label="创建时间">{{ formatTime(task.created_at) }}</el-descriptions-item>
       <el-descriptions-item label="更新时间">{{ formatTime(task.updated_at) }}</el-descriptions-item>
@@ -192,5 +211,29 @@ function handleRestoreSubscriptionDefault() {
 .subscription-lock-tip {
   color: var(--el-text-color-secondary);
   font-size: 12px;
+}
+
+.next-run-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.schedule-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--el-color-warning);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.skip-reason {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  color: var(--el-color-warning);
+  line-height: 1.6;
 }
 </style>

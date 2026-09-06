@@ -278,6 +278,11 @@ func EnsureColumns() {
 		// 全 0 时等价于这一层比较不存在 —— 升级后列表顺序逐字节不变。
 		// SQLite 的 ADD COLUMN 写 NOT NULL 必须同时给 DEFAULT，否则整条 ALTER 会失败。
 		{"list_order", "INTEGER NOT NULL DEFAULT 0"},
+		// 「本次触发被跳过」的最近一次记录。刻意记在任务行上、不建 task_logs 行：
+		// 跳过是「压根没执行」，建成日志行会一并混进「已终止」统计、耗时统计，
+		// 还会因为时间更晚而顶掉「最近一次日志」，让用户看不到真正的执行输出。
+		{"last_skip_at", "DATETIME"},
+		{"last_skip_reason", "TEXT DEFAULT ''"},
 	})
 	migrateLegacyTaskPIDColumn()
 	unlockNonSubscriptionTasks()
