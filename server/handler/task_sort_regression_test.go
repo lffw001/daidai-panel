@@ -37,6 +37,32 @@ func taskListNamesInOrder(t *testing.T, rec *httptest.ResponseRecorder) []string
 	return names
 }
 
+// 取任务列表响应里每条的 status。按状态列排序的用例要断言的是【状态值序列本身单调】，
+// 只比任务名的话，「标着升序、读出来数值不递增」这个现象在用例里根本看不出来。
+func taskListStatusesInOrder(t *testing.T, rec *httptest.ResponseRecorder) []float64 {
+	t.Helper()
+
+	payload := decodeJSONMap(t, rec)
+	items, ok := payload["data"].([]interface{})
+	if !ok {
+		t.Fatalf("expected data array, got %#v", payload["data"])
+	}
+
+	statuses := make([]float64, 0, len(items))
+	for _, raw := range items {
+		item, ok := raw.(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected task object, got %#v", raw)
+		}
+		status, ok := item["status"].(float64)
+		if !ok {
+			t.Fatalf("expected numeric status, got %#v", item["status"])
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses
+}
+
 // 取任务列表响应里每条的 next_run_at。没有这个键（禁用 / 非 cron 任务）时放一个 nil，
 // 用来断言「算不出下次运行的任务恒排最后」。
 func taskListNextRunTimesInOrder(t *testing.T, rec *httptest.ResponseRecorder) []*time.Time {
@@ -523,6 +549,320 @@ func TestTaskListSortsByNextRunAtWithNoScheduleLast(t *testing.T) {
 		}
 		if direction == "desc" && gotTimes[1].After(*gotTimes[0]) {
 			t.Fatalf("desc：next_run_at 应当由晚到早，got %v / %v", gotTimes[0], gotTimes[1])
+		}
+	}
+}
+
+// 按「最后运行」列排序时，禁用任务必须整体沉到所有启用任务之后（issue #117）。
+// 这条用例在修复前必然失败：sortPreparedTaskListItems 的比较器当时只按 sort_rules 排，
+// 状态分区埋在 defaultTaskListLess 里、只有所有规则都打平才轮得到，
+// 于是禁用任务只要有 last_run_at 就会和启用任务完全混排 ——
+// desc 方向下「刚被禁用、恰好留着最新 last_run_at」的那条直接冒到第一行，正是用户报的现象。
+func TestTaskListKeepsDisabledTasksLastWhenSortingByLastRunAt(t *testing.T) {
+	testutil.SetupTestEnv(t)
+
+	engine := newProtectedRouter()
+	user := testutil.MustCreateUser(t, "task-disabled-last-operator", "operator")
+	accessToken := testutil.MustCreateAccessToken(t, user.Username, user.Role)
+
+	newest := time.Now().Add(-10 * time.Minute)
+	newer := time.Now().Add(-1 * time.Hour)
+	older := time.Now().Add(-2 * time.Hour)
+	tasks := []*model.Task{
+		// 禁用 + 全场最新的 last_run_at：修复前 desc 方向它会排在第一行。
+		{Name: "disabled-newest", Command: "task a.py", CronExpression: "0 0 * * *", Status: model.TaskStatusDisabled, LastRunAt: &newest},
+		{Name: "enabled-newer", Command: "task b.py", CronExpression: "0 0 * * *", Status: model.TaskStatusEnabled, LastRunAt: &newer},
+		{Name: "enabled-older", Command: "task c.py", CronExpression: "0 0 * * *", Status: model.TaskStatusEnabled, LastRunAt: &older},
+		// 启用但从未运行过：修复前 asc 方向它排在最后，禁用任务会挤在它前面。
+		{Name: "enabled-never", Command: "task d.py", CronExpression: "0 0 * * *", Status: model.TaskStatusEnabled},
+		{Name: "disabled-never", Command: "task e.py", CronExpression: "0 0 * * *", Status: model.TaskStatusDisabled},
+	}
+	for _, task := range tasks {
+		if err := database.DB.Create(task).Error; err != nil {
+			t.Fatalf("create task %q: %v", task.Name, err)
+		}
+	}
+
+	enabledNames := map[string]bool{"enabled-newer": true, "enabled-older": true, "enabled-never": true}
+
+	// 升降序都要断言：分区是骨架，不跟随 direction 翻转。
+	for _, direction := range []string{"asc", "desc"} {
+		sortJSON := fmt.Sprintf(`[{"field":"last_run_at","direction":"%s"}]`, direction)
+		rec := performRequest(engine, http.MethodGet, "/api/v1/tasks?sort_rules="+url.QueryEscape(sortJSON), map[string]string{
+			"Authorization": "Bearer " + accessToken,
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s：expected status 200, got %d: %s", direction, rec.Code, rec.Body.String())
+		}
+
+		gotNames := taskListNamesInOrder(t, rec)
+		if len(gotNames) != 5 {
+			t.Fatalf("%s：expected 5 tasks, got %v", direction, gotNames)
+		}
+		for i := 0; i < 3; i++ {
+			if !enabledNames[gotNames[i]] {
+				t.Fatalf("%s：前三条应当全是启用任务，实际顺序 %v", direction, gotNames)
+			}
+		}
+		for i := 3; i < 5; i++ {
+			if enabledNames[gotNames[i]] {
+				t.Fatalf("%s：禁用任务必须沉到所有启用任务之后，实际顺序 %v", direction, gotNames)
+			}
+		}
+	}
+}
+
+// 置顶优先级高于状态分区：置顶任务哪怕 last_run_at 是全场最旧的、哪怕它本身已被禁用，
+// 按列排序时仍然留在最前面的置顶区。口径必须和默认排序完全一致
+// （见 task_query_regression_test.go 的 TestTaskListKeepsPinnedDisabledTasksInPinnedArea），
+// 否则会出现「默认排序时置顶的禁用任务在最上、点一下最后运行它掉到最下」的自相矛盾。
+func TestTaskListKeepsPinnedTasksFirstWhenSortingByLastRunAt(t *testing.T) {
+	testutil.SetupTestEnv(t)
+
+	engine := newProtectedRouter()
+	user := testutil.MustCreateUser(t, "task-pinned-first-operator", "operator")
+	accessToken := testutil.MustCreateAccessToken(t, user.Username, user.Role)
+
+	ancient := time.Now().Add(-72 * time.Hour)
+	stale := time.Now().Add(-48 * time.Hour)
+	fresh := time.Now().Add(-5 * time.Minute)
+	tasks := []*model.Task{
+		{Name: "pinned-enabled", Command: "task a.py", CronExpression: "0 0 * * *", Status: model.TaskStatusEnabled, IsPinned: true, LastRunAt: &stale},
+		{Name: "pinned-disabled", Command: "task b.py", CronExpression: "0 0 * * *", Status: model.TaskStatusDisabled, IsPinned: true, LastRunAt: &ancient},
+		{Name: "normal-enabled", Command: "task c.py", CronExpression: "0 0 * * *", Status: model.TaskStatusEnabled, LastRunAt: &fresh},
+		{Name: "normal-disabled", Command: "task d.py", CronExpression: "0 0 * * *", Status: model.TaskStatusDisabled, LastRunAt: &fresh},
+	}
+	for _, task := range tasks {
+		if err := database.DB.Create(task).Error; err != nil {
+			t.Fatalf("create task %q: %v", task.Name, err)
+		}
+	}
+
+	// 四个分区（置顶启用 / 置顶禁用 / 普通启用 / 普通禁用）各只有一条，
+	// 所以区内排序规则不参与，asc / desc 的期望顺序完全相同。
+	wantNames := []string{"pinned-enabled", "pinned-disabled", "normal-enabled", "normal-disabled"}
+	for _, direction := range []string{"asc", "desc"} {
+		sortJSON := fmt.Sprintf(`[{"field":"last_run_at","direction":"%s"}]`, direction)
+		rec := performRequest(engine, http.MethodGet, "/api/v1/tasks?sort_rules="+url.QueryEscape(sortJSON), map[string]string{
+			"Authorization": "Bearer " + accessToken,
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s：expected status 200, got %d: %s", direction, rec.Code, rec.Body.String())
+		}
+
+		gotNames := taskListNamesInOrder(t, rec)
+		if len(gotNames) != len(wantNames) {
+			t.Fatalf("%s：expected %d tasks, got %v", direction, len(wantNames), gotNames)
+		}
+		for i, want := range wantNames {
+			if gotNames[i] != want {
+				t.Fatalf("%s：expected order %v, got %v", direction, wantNames, gotNames)
+			}
+		}
+	}
+}
+
+// 分区不能把原有排序语义吃掉：启用任务组【内部】仍按规则升降序排，
+// 而「从未运行过」的空值仍然沉到本组末尾且不跟随方向翻转。
+// 禁用组同理：组内有值的在前、无值的在后。
+func TestTaskListSortsWithinStatusGroupWhenSortingByLastRunAt(t *testing.T) {
+	testutil.SetupTestEnv(t)
+
+	engine := newProtectedRouter()
+	user := testutil.MustCreateUser(t, "task-group-inner-operator", "operator")
+	accessToken := testutil.MustCreateAccessToken(t, user.Username, user.Role)
+
+	newest := time.Now().Add(-10 * time.Minute)
+	newer := time.Now().Add(-1 * time.Hour)
+	older := time.Now().Add(-2 * time.Hour)
+	tasks := []*model.Task{
+		{Name: "enabled-newer", Command: "task a.py", CronExpression: "0 0 * * *", Status: model.TaskStatusEnabled, LastRunAt: &newer},
+		{Name: "enabled-older", Command: "task b.py", CronExpression: "0 0 * * *", Status: model.TaskStatusEnabled, LastRunAt: &older},
+		{Name: "enabled-never", Command: "task c.py", CronExpression: "0 0 * * *", Status: model.TaskStatusEnabled},
+		{Name: "disabled-newest", Command: "task d.py", CronExpression: "0 0 * * *", Status: model.TaskStatusDisabled, LastRunAt: &newest},
+		{Name: "disabled-never", Command: "task e.py", CronExpression: "0 0 * * *", Status: model.TaskStatusDisabled},
+	}
+	for _, task := range tasks {
+		if err := database.DB.Create(task).Error; err != nil {
+			t.Fatalf("create task %q: %v", task.Name, err)
+		}
+	}
+
+	cases := []struct {
+		direction string
+		want      []string
+	}{
+		// 启用组内按时间由早到晚，空值垫底；禁用组整体在后，组内同样是有值在前、空值垫底。
+		{direction: "asc", want: []string{"enabled-older", "enabled-newer", "enabled-never", "disabled-newest", "disabled-never"}},
+		// 翻成倒序只翻转「组内有值的那几条」，空值与分区都纹丝不动。
+		{direction: "desc", want: []string{"enabled-newer", "enabled-older", "enabled-never", "disabled-newest", "disabled-never"}},
+	}
+	for _, tc := range cases {
+		sortJSON := fmt.Sprintf(`[{"field":"last_run_at","direction":"%s"}]`, tc.direction)
+		rec := performRequest(engine, http.MethodGet, "/api/v1/tasks?sort_rules="+url.QueryEscape(sortJSON), map[string]string{
+			"Authorization": "Bearer " + accessToken,
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s：expected status 200, got %d: %s", tc.direction, rec.Code, rec.Body.String())
+		}
+
+		gotNames := taskListNamesInOrder(t, rec)
+		if len(gotNames) != len(tc.want) {
+			t.Fatalf("%s：expected %d tasks, got %v", tc.direction, len(tc.want), gotNames)
+		}
+		for i, want := range tc.want {
+			if gotNames[i] != want {
+				t.Fatalf("%s：expected order %v, got %v", tc.direction, tc.want, gotNames)
+			}
+		}
+	}
+}
+
+// 「状态」列排序必须是纯粹按状态值排：升序 0(禁用) → 0.5(排队) → 1(空闲) → 2(运行)，降序反过来。
+//
+// 状态分区（taskSortGroup）会把 {0.5,1,2} 归一组、{0} 归另一组，
+// 无条件跑在 sort_rules 之前的话，「状态 + 升序」读出来是 0.5 → 1 → 2 → 0：
+// 一个标着「升序」的排序，状态值序列并不递增；改成降序又是 2 → 1 → 0.5 → 0，
+// 禁用任务照样垫底 —— 对禁用任务而言 asc/desc 这个开关完全失效。
+// 存量视图会静默变样，用户还查不出原因，所以这里断言的是【数值序列】而不只是任务名。
+func TestTaskListSortsByStatusWithoutStatusGrouping(t *testing.T) {
+	testutil.SetupTestEnv(t)
+
+	engine := newProtectedRouter()
+	user := testutil.MustCreateUser(t, "task-status-sort-operator", "operator")
+	accessToken := testutil.MustCreateAccessToken(t, user.Username, user.Role)
+
+	tasks := []*model.Task{
+		{Name: "st-idle", Command: "task a.py", CronExpression: "0 0 * * *", Status: model.TaskStatusEnabled},
+		{Name: "st-disabled", Command: "task b.py", CronExpression: "0 0 * * *", Status: model.TaskStatusDisabled},
+		{Name: "st-running", Command: "task c.py", CronExpression: "0 0 * * *", Status: model.TaskStatusRunning},
+		{Name: "st-queued", Command: "task d.py", CronExpression: "0 0 * * *", Status: model.TaskStatusQueued},
+	}
+	for _, task := range tasks {
+		if err := database.DB.Create(task).Error; err != nil {
+			t.Fatalf("create task %q: %v", task.Name, err)
+		}
+	}
+
+	cases := []struct {
+		direction string
+		want      []float64
+	}{
+		{direction: "asc", want: []float64{0, 0.5, 1, 2}},
+		{direction: "desc", want: []float64{2, 1, 0.5, 0}},
+	}
+	for _, tc := range cases {
+		sortJSON := fmt.Sprintf(`[{"field":"status","direction":"%s"}]`, tc.direction)
+		rec := performRequest(engine, http.MethodGet, "/api/v1/tasks?sort_rules="+url.QueryEscape(sortJSON), map[string]string{
+			"Authorization": "Bearer " + accessToken,
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s：expected status 200, got %d: %s", tc.direction, rec.Code, rec.Body.String())
+		}
+
+		gotStatuses := taskListStatusesInOrder(t, rec)
+		if len(gotStatuses) != len(tc.want) {
+			t.Fatalf("%s：expected %d tasks, got %v", tc.direction, len(tc.want), gotStatuses)
+		}
+		for i, want := range tc.want {
+			if gotStatuses[i] != want {
+				t.Fatalf("%s：expected status order %v, got %v（任务顺序 %v）",
+					tc.direction, tc.want, gotStatuses, taskListNamesInOrder(t, rec))
+			}
+		}
+	}
+}
+
+// 豁免的判据是「**第一条**规则是 status」，不是「任意一条规则里有 status」。
+// status 当次级 tie-break 时（先按 cron 表达式、表达式相同再按状态），
+// 先分区、再在区内 tie-break 才是对的：这时禁用任务仍然要整体沉到最后。
+// 三条任务的 cron 完全相同，所以第一条规则一定打平、必然落到 status 这条 ——
+// 判据要是写成「任意一条含 status」，这里就会变成全局按状态升序、禁用任务冒到第一行。
+func TestTaskListKeepsStatusGroupingWhenStatusIsSecondaryRule(t *testing.T) {
+	testutil.SetupTestEnv(t)
+
+	engine := newProtectedRouter()
+	user := testutil.MustCreateUser(t, "task-status-secondary-operator", "operator")
+	accessToken := testutil.MustCreateAccessToken(t, user.Username, user.Role)
+
+	tasks := []*model.Task{
+		{Name: "alpha-disabled", Command: "task a.py", CronExpression: "0 0 * * *", Status: model.TaskStatusDisabled},
+		{Name: "beta-idle", Command: "task b.py", CronExpression: "0 0 * * *", Status: model.TaskStatusEnabled},
+		{Name: "gamma-running", Command: "task c.py", CronExpression: "0 0 * * *", Status: model.TaskStatusRunning},
+	}
+	for _, task := range tasks {
+		if err := database.DB.Create(task).Error; err != nil {
+			t.Fatalf("create task %q: %v", task.Name, err)
+		}
+	}
+
+	sortJSON := `[{"field":"cron_expression","direction":"asc"},{"field":"status","direction":"asc"}]`
+	rec := performRequest(engine, http.MethodGet, "/api/v1/tasks?sort_rules="+url.QueryEscape(sortJSON), map[string]string{
+		"Authorization": "Bearer " + accessToken,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 启用区（空闲 → 运行，按次级规则升序）在前，禁用任务整体在后。
+	wantNames := []string{"beta-idle", "gamma-running", "alpha-disabled"}
+	gotNames := taskListNamesInOrder(t, rec)
+	if len(gotNames) != len(wantNames) {
+		t.Fatalf("expected %d tasks, got %v", len(wantNames), gotNames)
+	}
+	for i, want := range wantNames {
+		if gotNames[i] != want {
+			t.Fatalf("status 作为次级规则时状态分区仍须生效，expected %v, got %v", wantNames, gotNames)
+		}
+	}
+}
+
+// 豁免的只是状态分区，置顶分区照旧：按状态排序时置顶任务仍然全部排在最前面。
+// 同时这条也钉住了「豁免之后 asc/desc 对禁用任务真的生效了」——
+// 置顶区内部 asc 是 禁用(0) → 运行(2)，desc 是 运行(2) → 禁用(0)，两者必须不同。
+func TestTaskListKeepsPinnedTasksFirstWhenSortingByStatus(t *testing.T) {
+	testutil.SetupTestEnv(t)
+
+	engine := newProtectedRouter()
+	user := testutil.MustCreateUser(t, "task-status-pinned-operator", "operator")
+	accessToken := testutil.MustCreateAccessToken(t, user.Username, user.Role)
+
+	tasks := []*model.Task{
+		{Name: "pinned-disabled", Command: "task a.py", CronExpression: "0 0 * * *", Status: model.TaskStatusDisabled, IsPinned: true},
+		{Name: "pinned-running", Command: "task b.py", CronExpression: "0 0 * * *", Status: model.TaskStatusRunning, IsPinned: true},
+		{Name: "normal-disabled", Command: "task c.py", CronExpression: "0 0 * * *", Status: model.TaskStatusDisabled},
+		{Name: "normal-idle", Command: "task d.py", CronExpression: "0 0 * * *", Status: model.TaskStatusEnabled},
+	}
+	for _, task := range tasks {
+		if err := database.DB.Create(task).Error; err != nil {
+			t.Fatalf("create task %q: %v", task.Name, err)
+		}
+	}
+
+	cases := []struct {
+		direction string
+		want      []string
+	}{
+		{direction: "asc", want: []string{"pinned-disabled", "pinned-running", "normal-disabled", "normal-idle"}},
+		{direction: "desc", want: []string{"pinned-running", "pinned-disabled", "normal-idle", "normal-disabled"}},
+	}
+	for _, tc := range cases {
+		sortJSON := fmt.Sprintf(`[{"field":"status","direction":"%s"}]`, tc.direction)
+		rec := performRequest(engine, http.MethodGet, "/api/v1/tasks?sort_rules="+url.QueryEscape(sortJSON), map[string]string{
+			"Authorization": "Bearer " + accessToken,
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s：expected status 200, got %d: %s", tc.direction, rec.Code, rec.Body.String())
+		}
+
+		gotNames := taskListNamesInOrder(t, rec)
+		if len(gotNames) != len(tc.want) {
+			t.Fatalf("%s：expected %d tasks, got %v", tc.direction, len(tc.want), gotNames)
+		}
+		for i, want := range tc.want {
+			if gotNames[i] != want {
+				t.Fatalf("%s：expected order %v, got %v", tc.direction, tc.want, gotNames)
+			}
 		}
 	}
 }

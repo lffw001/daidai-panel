@@ -37,10 +37,11 @@ import {
 } from "@codemirror/autocomplete";
 import {
   buildCodeEditorTheme,
+  detectIndentWidth,
   resolveCodeEditorLanguage,
 } from "@/utils/codeEditor";
-import { codeMinimap } from "@/utils/codeMinimap";
 import { indentGuides } from "@/utils/indentGuides";
+import { selectionWhitespace } from "@/utils/selectionWhitespace";
 import { PANEL_APPEARANCE_CHANGE_EVENT } from "@/utils/panelAppearance";
 
 /**
@@ -79,22 +80,51 @@ const props = withDefaults(
      */
     wordWrap?: "on" | "off";
     /**
-     * 右侧代码缩略图。默认 false。
-     * ⚠️ 下面三个新 prop 的默认值一律等于「加这些功能之前的行为」，
-     * 所以不传它们的调用点（调试弹窗 / 代码运行器）一个像素都不会变。
-     * 脚本页与配置文件页会显式传各自记住的偏好。
+     * 右侧代码缩略图 —— 🔴 **本组件不支持，这个 prop 是刻意的 no-op**（v3.2.4 / issue #116-2）。
+     *
+     * 缩略图只剩 Monaco 一侧（它原生就画，白送）。CodeMirror 侧那份是自己写的
+     * utils/codeMinimap.ts，为了不碰 contentDOM、不碰原生选区，几何、拖动、明暗全得自己维护，
+     * 收益却只是「右边多一条 64px 的形状图」，本版整个删掉了。
+     *
+     * 那为什么 prop 声明还留着？两个候选做法：
+     *   A. 分发层改成 v-bind 一个「只有 monaco 分支才含 minimap」的对象；
+     *   B. 这里留一个空声明，把分发层透传下来的值吃掉。
+     * 选 B，理由是两条失效模式的**响度**不一样：
+     *   - 走 A 的话，分发层就不再是「一个个显式 :xxx 往下传」了，vue-tsc 逐个查类型的能力
+     *     在这个 prop 上当场消失（spec 里「刻意不写 v-bind="props"」写的就是这件事），
+     *     将来再加 Monaco 专属选项时漏进那个对象是**静默**的。
+     *   - 走 B 的话，spec 那条「三层 props 逐字相同」仍然字面成立，后人不用先学一个例外；
+     *     真有人把这个声明删了，表现是 CodeMirror 根节点上多一个 `minimap="false"` 脏属性
+     *     （Vue 会把不认识的 prop 当 attr 落到根上），一眼能看见，不会静默丢功能。
+     * 所以：**别把这个声明删掉**，也别在这里「顺手实现一下缩略图」。
      */
     minimap?: boolean;
-    /** 缩进参考线。默认 false（同上，偏好本身的默认值是开，由页面侧决定） */
+    /**
+     * 缩进参考线。默认 false。
+     * ⚠️ 下面这几个 prop 的默认值一律等于「加这些功能之前的行为」，
+     * 所以不传它们的调用点（调试弹窗 / 代码运行器）一个像素都不会变
+     * （注意它**不等于**偏好本身的默认值：参考线偏好默认是开的，由页面侧读出来再传进来）。
+     */
     indentGuides?: boolean;
-    /** 显示空白符：空格画灰点、Tab 画箭头、行尾空白标底色。默认 false */
-    showWhitespace?: boolean;
+    /**
+     * 显示空白符三态（issue #116-4）。默认 'none'。
+     *   - 'all'：一直画（空格灰点、Tab 箭头，另外给行尾空白标底色）
+     *   - 'selection'：只画选中范围内的（见 utils/selectionWhitespace.ts）
+     *   - 'none'：不画
+     */
+    whitespace?: "none" | "selection" | "all";
+    /**
+     * 缩进宽度（issue #116-1/3）。默认 2，与改造前写死的 indentUnit("  ") + tabSize(2) 一致。
+     * 'auto' 表示按文档内容检测（detectIndentWidth），页面侧的偏好默认就是 'auto'。
+     */
+    indentWidth?: "auto" | number;
   }>(),
   {
     wordWrap: "on",
     minimap: false,
     indentGuides: false,
-    showWhitespace: false,
+    whitespace: "none",
+    indentWidth: 2,
   },
 );
 
@@ -114,9 +144,9 @@ const languageCompartment = new Compartment();
 const readonlyCompartment = new Compartment();
 const wordWrapCompartment = new Compartment();
 const themeCompartment = new Compartment();
-const minimapCompartment = new Compartment();
 const indentGuidesCompartment = new Compartment();
 const whitespaceCompartment = new Compartment();
+const indentWidthCompartment = new Compartment();
 
 // 只读必须两条一起给：
 // EditorState.readOnly 挡住事务写入，EditorView.editable 关掉 contenteditable。
@@ -192,22 +222,54 @@ function buildWordWrapExtension(wordWrap: "on" | "off") {
     : [revealCaretOnPointerSelect];
 }
 
-function buildMinimapExtension(enabled: boolean) {
-  return enabled ? codeMinimap() : [];
-}
-
 function buildIndentGuidesExtension(enabled: boolean) {
   return enabled ? indentGuides() : [];
 }
 
-// highlightWhitespace 是 Decoration.mark：只往真实空格外面套一层 <span class="cm-highlightSpace">，
+// 三档都是 Decoration.mark：只往真实空格外面套一层 <span class="cm-highlightSpace">，
 // 灰点是这个 span 的 background-image，不是 ::before content、不是 widget、不替换任何字符。
 // 所以复制粘贴拿到的还是真空格，原生 Selection 完全不受影响。
 // 与已启用的 highlightSpecialChars() 也不冲突：后者的默认字符集是「U+0000~U+0008」与
 // 「U+000A~U+001F」两段（中间正好跳过 U+0009 也就是 Tab），也不含 U+0020 空格 ——
 // 两边各管各的，同一个字符不会被两套装饰同时套上。
-function buildWhitespaceExtension(enabled: boolean) {
-  return enabled ? [highlightWhitespace(), highlightTrailingWhitespace()] : [];
+// 'selection' 档必须自己写：官方的 highlightWhitespace() 无参、只有「一直显示」这一档，
+// 没有 Monaco renderWhitespace: 'selection' 的对应物（见 utils/selectionWhitespace.ts）。
+// 行尾空白底色只挂在 'all' 上：它标的是「这里有多余空白」，与选区无关，跟着选区闪反而干扰。
+function buildWhitespaceExtension(mode: "none" | "selection" | "all") {
+  if (mode === "all") {
+    return [highlightWhitespace(), highlightTrailingWhitespace()];
+  }
+  if (mode === "selection") {
+    return [selectionWhitespace()];
+  }
+  return [];
+}
+
+/**
+ * 缩进宽度 → 两条扩展（issue #116-1/3）。
+ *
+ * 改造前这两条是**写死**在 EditorState.create 的 extensions 里的（indentUnit.of("  ") +
+ * EditorState.tabSize.of(2)），现在挂进 Compartment 才能运行期改。
+ * indentUnit 管「按 Tab / 回车缩进时插入多少空格」，tabSize 管「已有的 \t 显示多宽」，
+ * 两条都要给同一个值，只给一条的表现是「按出来的缩进和看到的对不上」。
+ */
+function buildIndentExtension(width: number) {
+  return [indentUnit.of(" ".repeat(width)), EditorState.tabSize.of(width)];
+}
+
+/**
+ * 解析出本次要用的缩进宽度。
+ * 'auto' 走内容检测；数字直接用。
+ * 页面只会传 2/4/6/8，但 prop 类型是 number，这里兜一下非法值 ——
+ * " ".repeat(-1) 会直接抛 RangeError，把整个编辑器创建过程炸掉。
+ */
+function resolveIndentWidth(doc: string) {
+  if (props.indentWidth === "auto") {
+    return detectIndentWidth(doc);
+  }
+  return Number.isInteger(props.indentWidth) && props.indentWidth > 0
+    ? props.indentWidth
+    : 2;
 }
 
 // 明暗切换、以及用户在系统设置里改编辑器底色，都会走 PANEL_APPEARANCE_CHANGE_EVENT
@@ -222,8 +284,20 @@ function syncEditorTheme() {
 function replaceDoc(value: string) {
   if (!view) return;
   if (view.state.doc.toString() === value) return;
+  // 外部整体换文档（脚本页切文件、拉到内容后首次灌入、setValue）时，
+  // 「自动」档必须按新内容重新检测一次缩进宽度 —— 这是 issue #116-1 的关键一环：
+  // 编辑器是先挂载、后 await 拉内容的，create 那一刻文档还是空串，测不出任何缩进。
+  // 用户自己打字触发的那次会在上面那条判等提前 return，走不到这里，这正是想要的：
+  // 边打字边重测既没意义，又会在每次输入时白重配一遍 state。
+  const effects =
+    props.indentWidth === "auto"
+      ? indentWidthCompartment.reconfigure(
+          buildIndentExtension(detectIndentWidth(value)),
+        )
+      : undefined;
   view.dispatch({
     changes: { from: 0, to: view.state.doc.length, insert: value },
+    effects,
   });
 }
 
@@ -255,10 +329,6 @@ onMounted(() => {
         foldGutter(),
         closeBrackets(),
         autocompletion(),
-        // 缩进 2 空格，与改造前 Monaco 的 tabSize: 2 对齐。
-        // indentUnit 管「命令插入多少」，tabSize 管「已有的 \t 显示多宽」，两条都要。
-        indentUnit.of("  "),
-        EditorState.tabSize.of(2),
         search({ top: true }),
         highlightSelectionMatches(),
         keymap.of([
@@ -299,9 +369,11 @@ onMounted(() => {
         languageCompartment.of(resolveCodeEditorLanguage(props.language)),
         readonlyCompartment.of(buildReadonlyExtension(props.readonly || false)),
         wordWrapCompartment.of(buildWordWrapExtension(props.wordWrap)),
-        minimapCompartment.of(buildMinimapExtension(props.minimap)),
         indentGuidesCompartment.of(buildIndentGuidesExtension(props.indentGuides)),
-        whitespaceCompartment.of(buildWhitespaceExtension(props.showWhitespace)),
+        whitespaceCompartment.of(buildWhitespaceExtension(props.whitespace)),
+        indentWidthCompartment.of(
+          buildIndentExtension(resolveIndentWidth(props.modelValue)),
+        ),
         themeCompartment.of(buildCodeEditorTheme()),
       ],
     }),
@@ -351,16 +423,8 @@ watch(
   },
 );
 
-// 下面三条同理：新增可配项必须「create + Compartment + watch」三处齐全，缺一条就是静默失效
-watch(
-  () => props.minimap,
-  (enabled) => {
-    view?.dispatch({
-      effects: minimapCompartment.reconfigure(buildMinimapExtension(enabled)),
-    });
-  },
-);
-
+// 下面几条同理：新增可配项必须「create 的 extensions + Compartment.of + watch 里 reconfigure」
+// 三处齐全，缺一条就是静默失效（点了开关没反应、不报错、构建与 vue-tsc 全绿）
 watch(
   () => props.indentGuides,
   (enabled) => {
@@ -373,11 +437,25 @@ watch(
 );
 
 watch(
-  () => props.showWhitespace,
-  (enabled) => {
+  () => props.whitespace,
+  (mode) => {
     view?.dispatch({
-      effects: whitespaceCompartment.reconfigure(
-        buildWhitespaceExtension(enabled),
+      effects: whitespaceCompartment.reconfigure(buildWhitespaceExtension(mode)),
+    });
+  },
+);
+
+// 缩进宽度有**三个**重算时机，这是其中之二：① 建 state 时（见上面 create 的 extensions）、
+// ② 用户在菜单里改了这一项（本 watch）。③ 是外部整体换文档，在 replaceDoc 里。
+// 注意这里读的是 view 里当下的文档而不是 props.modelValue：两者在同一帧里可能还没同步，
+// 而「自动」档要按编辑器**真正显示着的**内容来测。
+watch(
+  () => props.indentWidth,
+  () => {
+    if (!view) return;
+    view.dispatch({
+      effects: indentWidthCompartment.reconfigure(
+        buildIndentExtension(resolveIndentWidth(view.state.doc.toString())),
       ),
     });
   },

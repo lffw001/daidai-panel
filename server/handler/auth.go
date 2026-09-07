@@ -504,6 +504,10 @@ func (h *AuthHandler) RegisterRoutes(r *gin.RouterGroup) {
 		auth.GET("/user", middleware.JWTAuth(), h.GetUser)
 		auth.PUT("/password", middleware.JWTAuth(), h.ChangePassword)
 		auth.PUT("/username", middleware.JWTAuth(), h.ChangeUsername)
+		// 编辑器偏好是 per-user 的，只要登录就能读写自己那份，刻意不加 RequireAdmin：
+		// 脚本页 operator 就能打开编辑器，不能要求管理员权限才允许改自己的开关。
+		auth.GET("/preferences", middleware.JWTAuth(), h.GetPreferences)
+		auth.PUT("/preferences", middleware.JWTAuth(), h.UpdatePreferences)
 		auth.GET("/captcha-config", h.CaptchaConfig)
 		auth.POST("/avatar", middleware.JWTAuth(), h.UploadAvatar)
 		auth.DELETE("/avatar", middleware.JWTAuth(), h.DeleteAvatar)

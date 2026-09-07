@@ -146,19 +146,28 @@ function buildGuides(view: EditorView): DecorationSet {
 class IndentGuidePlugin implements PluginValue {
   decorations: DecorationSet
   private unit: number
+  private tabSize: number
 
   constructor(view: EditorView) {
     this.unit = getIndentUnit(view.state)
+    this.tabSize = view.state.tabSize
     this.decorations = buildGuides(view)
   }
 
   update(update: ViewUpdate) {
     const unit = getIndentUnit(update.state)
-    const unitChanged = unit !== this.unit
+    const tabSize = update.state.tabSize
+    // ⚠️ tabSize 必须和 unit 一起纳入判据：buildGuides 里 leadingColumns() 是按 tabSize
+    // 把 \t 补齐成列数的，只盯 unit 的话，「缩进宽度」改了而 unit 恰好没变的那一路
+    // （比如文档换了、自动检测出同一个 unit 但 tabSize 被重配）参考线会停在旧格子上。
+    // 本项目里这两条永远是一起 reconfigure 的（见 CodeMirrorEditor.vue 的 buildIndentExtension），
+    // 但少一条判据就是一个等着被踩的静默失效。
+    const metricsChanged = unit !== this.unit || tabSize !== this.tabSize
     this.unit = unit
-    // 只在这三件事上重算：改文档、滚动换视口、缩进单位被 reconfigure。
+    this.tabSize = tabSize
+    // 只在这三件事上重算：改文档、滚动换视口、缩进度量被 reconfigure。
     // **光标移动不重算** —— 手机上每敲一下都全量重算会明显掉帧。
-    if (update.docChanged || update.viewportChanged || unitChanged) {
+    if (update.docChanged || update.viewportChanged || metricsChanged) {
       this.decorations = buildGuides(update.view)
     }
   }

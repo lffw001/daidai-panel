@@ -1,5 +1,13 @@
 <script setup lang="ts">
-import { computed, nextTick, onActivated, ref, watch } from "vue";
+import {
+  computed,
+  nextTick,
+  onActivated,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  watch,
+} from "vue";
 import {
   ArrowLeft,
   ArrowRight,
@@ -18,19 +26,28 @@ import {
   Switch,
   VideoPlay,
 } from "@element-plus/icons-vue";
-import CodeEditor, {
-  persistEditorViewOption,
-  persistEditorWordWrap,
-  readStoredEditorViewOption,
-  readStoredEditorWordWrap,
-} from "@/components/CodeEditor.vue";
-import type { EditorViewOption } from "@/components/CodeEditor.vue";
+import CodeEditor from "@/components/CodeEditor.vue";
+import {
+  EDITOR_INDENT_WIDTH_OPTIONS,
+  EDITOR_PREFERENCES_CHANGE_EVENT,
+  EDITOR_WHITESPACE_MODES,
+  cycleEditorOption,
+  editorIndentWidthLabel,
+  editorWhitespaceLabel,
+  ensureEditorPreferencesLoaded,
+  readEditorPreferences,
+  setEditorPreference,
+} from "@/utils/editorPreferences";
+import type { EditorPreferences } from "@/utils/editorPreferences";
 import {
   persistEditorEngine,
   readStoredEditorEngine,
   resolveEditorEngine,
 } from "@/utils/editorEngine";
-import type { EditorEngine } from "@/utils/editorEngine";
+import type {
+  EditorEngine,
+  ResolvedEditorEngine,
+} from "@/utils/editorEngine";
 
 const fileContent = defineModel<string>("fileContent", { required: true });
 const isEditing = defineModel<boolean>("isEditing", { required: true });
@@ -113,35 +130,59 @@ function startEdit() {
   isEditing.value = true;
 }
 
-// 自动换行开关与配置文件页共享同一份记忆（dd:editor:word_wrap），
-// 读写统一走 CodeEditor 导出的那两个函数，两页不各写一遍。
-const wordWrap = ref(readStoredEditorWordWrap());
+// 五项编辑器偏好（自动换行 / 缩略图 / 缩进参考线 / 空白符 / 缩进宽度）统一收在一个 ref 里，
+// 不写成五组逐字雷同的 ref + toggle。
+// v3.2.4 起它们不再只是 localStorage：utils/editorPreferences.ts 会把每次改动同步到
+// /api/auth/preferences，换设备、换 IP 登进来还是这一份（issue #116）。
+// 默认值全在那个模块里定，页面只管「读到什么用什么」，两页才不会各写一份默认值然后慢慢漂移。
+const prefs = ref<EditorPreferences>(readEditorPreferences());
 
 function toggleWordWrap() {
-  wordWrap.value = wordWrap.value === "on" ? "off" : "on";
-  persistEditorWordWrap(wordWrap.value);
+  const next = prefs.value.word_wrap === "on" ? "off" : "on";
+  prefs.value.word_wrap = next;
+  setEditorPreference("word_wrap", next);
 }
 
-// 三个视图开关（缩略图 / 缩进参考线 / 空白符）与自动换行同一套语义：每浏览器一份、两页共享。
-// 但它们**没有**写成三组 ref + 三个 toggle —— 那是三段逐字雷同的代码，
-// 收成「一个对象 + 一个按名字读写的 toggle」后，以后再加一项只需要在对象里补一行。
-// 默认值不在这里定（minimap/whitespace 关、indent_guides 开），全部由 CodeEditor 那两个函数负责，
-// 页面这边只管读到什么用什么，两页才不会各写一份默认值然后慢慢漂移。
-const viewOptions = ref({
-  minimap: readStoredEditorViewOption("minimap"),
-  indent_guides: readStoredEditorViewOption("indent_guides"),
-  whitespace: readStoredEditorViewOption("whitespace"),
-});
-
-function toggleViewOption(name: EditorViewOption) {
-  const next = !viewOptions.value[name];
-  viewOptions.value[name] = next;
-  persistEditorViewOption(name, next);
+// 两个布尔开关按名字读写。空白符曾经也在这里（v3.2.2 时它是二态），
+// 现在它是三档循环，语义变了，所以拆去下面单独一个函数，不再挤在这个布尔通道里。
+function toggleViewOption(name: "minimap" | "indent_guides") {
+  const next = !prefs.value[name];
+  prefs.value[name] = next;
+  setEditorPreference(name, next);
 }
 
-// 引擎偏好（auto / codemirror / monaco）：和上面几个开关一样是「每浏览器一份、两页共享」，
+// 缩进宽度与空白符是「点一下换下一档」的循环项，档位顺序与取下一档的算法都由
+// utils/editorPreferences.ts 定，页面不复制一份（复制一份的表现是两页循环顺序不一致，而且构建全绿）。
+function cycleIndentWidth() {
+  const next = cycleEditorOption(
+    EDITOR_INDENT_WIDTH_OPTIONS,
+    prefs.value.indent_width,
+  );
+  prefs.value.indent_width = next;
+  setEditorPreference("indent_width", next);
+}
+
+function cycleWhitespace() {
+  const next = cycleEditorOption(
+    EDITOR_WHITESPACE_MODES,
+    prefs.value.whitespace,
+  );
+  prefs.value.whitespace = next;
+  setEditorPreference("whitespace", next);
+}
+
+// 「在配置文件页改了一项」「刚从服务端拉回来了一份」都靠这个事件同步到本页。
+// 刻意从存储重读、而不是从事件里取值：偏好可能是在另一个组件里改的，存储才是唯一真源
+// （范式对齐 CodeEditor.vue 里的 syncEngine）。
+function syncPreferences() {
+  prefs.value = readEditorPreferences();
+}
+
+// 引擎偏好（auto / codemirror / monaco）：和上面几项一样是「两页共享」，
 // 但它**不是**同一档设置，所以在菜单里被 divided 分成了独立一组 ——
-// 上面三项是「同一个编辑器怎么显示」，改一下只是重配一个 Compartment；
+// 上面四项是「同一个编辑器怎么显示」，改一下只是重配一个 Compartment；
+// 而且它**刻意不同步到服务端**（理由见 utils/editorPreferences.ts 文件头：
+// 引擎跟设备走，偏好跟人走），所以它仍然只读写 localStorage。
 // 引擎是「换一个编辑器」，切一次要把实例整块拆掉重建，撤销历史、光标、滚动位置全丢
 // （正文本身不丢，它活在这里的 fileContent 里，重建后会重新灌进去）。
 const editorEngine = ref(readStoredEditorEngine());
@@ -154,32 +195,69 @@ const autoEngineLabel = computed(() =>
   resolveEditorEngine("auto") === "monaco" ? "Monaco" : "CodeMirror",
 );
 
-// 底部状态条读的是**解析后**的引擎而不是偏好值：用户关心的是「现在跑的是哪个」，
+// 解析后的实际引擎。两处要用：底部状态条的引擎读数，以及齿轮菜单里「代码缩略图」渲不渲染
+// —— 那一项只有 Monaco 认（CodeMirror 侧的缩略图在 v3.2.4 被删掉了），
+// 在 CodeMirror 下留着它就是一个点了没反应的开关。
+//
+// 🔴 这里**不能**写成 computed(() => resolveEditorEngine(editorEngine.value))。
+// resolveEditorEngine 在 auto 档下读的是 matchMedia('(pointer: coarse)') 和 window.innerWidth，
+// 两者都不是响应式依赖，那个 computed 只会在 editorEngine 变时重算一次；
+// 而真正决定「现在跑的是哪个引擎」的 CodeEditor 是**每次挂载时按当下窗口宽度重新解析**的，
+// 本页的编辑器又挂在 v-if 上（isBinary 那条分支一进一出就整块重建）。
+// 于是「宽窗口打开页面（菜单里有代码缩略图）→ 把窗口贴靠成半屏 → 切一个二进制文件再切回来」
+// 之后编辑器已经是 CodeMirror，菜单里「代码缩略图」还在，点它开关翻 ON、正文毫无变化。
+// 所以真源改成 CodeEditor 每次解析完 emit 上来的 engine-resolved（挂载时 + 引擎偏好变更后各一次）。
+const resolvedEngine = ref<ResolvedEditorEngine>(
+  // 初值只是兜底：编辑器还没挂载（二进制文件 / 还没选文件）时，齿轮菜单也要能渲染。
+  // 编辑器一挂上来，第一次 engine-resolved 就会把它覆盖成真值。
+  resolveEditorEngine(readStoredEditorEngine()),
+);
+
+function onEngineResolved(engine: ResolvedEditorEngine) {
+  resolvedEngine.value = engine;
+}
+
+// 状态条读的是**解析后**的引擎而不是偏好值：用户关心的是「现在跑的是哪个」，
 // 选了 auto 的人看到「auto」等于什么都没告诉他。
 const activeEngineLabel = computed(() =>
-  resolveEditorEngine(editorEngine.value) === "monaco" ? "Monaco" : "CM",
+  resolvedEngine.value === "monaco" ? "Monaco" : "CM",
 );
 
 function selectEditorEngine(next: EditorEngine) {
   if (editorEngine.value === next) return;
   editorEngine.value = next;
+  // 顺手把 resolvedEngine 也推一次：编辑器没挂载（二进制文件）时不会有 engine-resolved 回来，
+  // 少了这一行菜单里的「代码缩略图」会停在旧引擎上。编辑器挂着的话，下一拍 CodeEditor 会用
+  // 同一份存储值 + 同一个窗口再解析一遍并 emit，结论必然相同，两者不会打架。
+  // ⚠️ 只在这里补，不要在 onActivated 里也补一次：那时窗口宽度可能已经和编辑器挂载时不同，
+  // 重解析出来的值会和实际跑着的实例对不上，正是上面注释里那个 bug 的翻版。
+  resolvedEngine.value = resolveEditorEngine(next);
   persistEditorEngine(next); // 内部会派发 EDITOR_ENGINE_CHANGE_EVENT，已挂载的编辑器跟着换
 }
 
+onMounted(() => {
+  window.addEventListener(EDITOR_PREFERENCES_CHANGE_EVENT, syncPreferences);
+  // 服务端那份偏好在这里拉一次（函数自己记忆化，重复调用不会重复发请求），
+  // 拉回来之后它会派发变更事件，由上面的监听把新值刷进来。
+  // 刻意不放进 main.ts 的启动流程：编辑器不在首屏，没必要给每一次打开面板都多加一个请求。
+  void ensureEditorPreferencesLoaded();
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener(EDITOR_PREFERENCES_CHANGE_EVENT, syncPreferences);
+});
+
 // 脚本页被 keep-alive 缓存，第二次进来只触发 onActivated 不触发 onMounted。
-// 不在这里补读一次的话，「在配置文件页改了开关、切回脚本页却没变」——共享就名存实亡了。
-// 三个视图开关同理，漏掉任何一个就是那一项单独失去共享（而且构建和类型检查都发现不了）。
+// 上面那个变更事件监听在缓存期间是不摘的（keep-alive 只 deactivate 不 unmount），
+// 所以「切走时别的页面改了偏好」其实已经同步过了；这里仍然同步补读一次，
+// 兜的是「事件没派发」那条路径 —— 比如另一个标签页改的偏好、或者存储被外部清掉。
 onActivated(() => {
-  wordWrap.value = readStoredEditorWordWrap();
-  viewOptions.value = {
-    minimap: readStoredEditorViewOption("minimap"),
-    indent_guides: readStoredEditorViewOption("indent_guides"),
-    whitespace: readStoredEditorViewOption("whitespace"),
-  };
-  // 引擎偏好同样两页共享，漏掉这一行的表现是「在配置文件页切了引擎、切回脚本页菜单里还是旧的」——
-  // 编辑器实例其实已经被 EDITOR_ENGINE_CHANGE_EVENT 换掉了，只有菜单勾选和状态条读数在骗人，
-  // 比单纯不生效更难查。
+  prefs.value = readEditorPreferences();
+  // 引擎偏好没有走服务端同步，全靠这一行两页共享。漏掉它的表现是
+  // 「在配置文件页切了引擎、切回脚本页菜单里还是旧的」——编辑器实例其实已经被
+  // EDITOR_ENGINE_CHANGE_EVENT 换掉了，只有菜单勾选和状态条读数在骗人，比单纯不生效更难查。
   editorEngine.value = readStoredEditorEngine();
+  void ensureEditorPreferencesLoaded();
 });
 
 // CodeEditor 由 Vite 直接打包、同步 import，没有运行期加载链路，
@@ -372,26 +450,27 @@ watch(
                窄屏收成纯图标，与同排按钮同一套 `<span v-if="!isMobile">` 收缩写法；
                状态另在底部状态条镜像成 `Wrap ON/OFF`，图标态下也看得出开关。 -->
           <el-tooltip
-            :content="wordWrap === 'on' ? '关闭自动换行' : '开启自动换行'"
+            :content="prefs.word_wrap === 'on' ? '关闭自动换行' : '开启自动换行'"
             placement="bottom"
           >
             <el-button
               class="action-btn"
               :size="isMobile ? 'small' : 'default'"
-              :type="wordWrap === 'on' ? 'primary' : 'default'"
-              :plain="wordWrap === 'on'"
+              :type="prefs.word_wrap === 'on' ? 'primary' : 'default'"
+              :plain="prefs.word_wrap === 'on'"
               @click="toggleWordWrap"
             >
               <el-icon><Switch /></el-icon><span v-if="!isMobile" class="wrap-btn-label">Wrap</span>
             </el-button>
           </el-tooltip>
 
-          <!-- 三个视图开关（缩略图 / 缩进参考线 / 空白符）收在齿轮下拉里，不并排加按钮。
+          <!-- 四个视图选项（缩略图 / 缩进参考线 / 缩进宽度 / 空白符）收在齿轮下拉里，不并排加按钮。
                .hero-actions 是 flex-shrink: 0 且祖先 .scripts-editor 带 overflow: hidden，
                桌面端装不下不会换行、也不会出滚动条，而是从右边缘被静默裁掉；
                1025~1280 这一档本来就已经在收 Wrap 的文字腾宽度（见下面那条 media query），
-               再并排塞 3 个按钮必然裁掉最右侧的「更多」。齿轮本身是纯图标，只多占一个按钮的宽。
-               :hide-on-click="false" 是必须的：这三项经常连着切，点一下就收菜单会逼用户反复重开。 -->
+               再并排塞 4 个按钮必然裁掉最右侧的「更多」。齿轮本身是纯图标，只多占一个按钮的宽。
+               :hide-on-click="false" 是必须的：这几项经常连着切（缩进宽度和空白符还要连点好几下
+               才能转到想要的档），点一下就收菜单会逼用户反复重开。 -->
           <el-dropdown
             trigger="click"
             placement="bottom-end"
@@ -406,14 +485,20 @@ watch(
             </el-button>
             <template #dropdown>
               <el-dropdown-menu>
-                <el-dropdown-item @click="toggleViewOption('minimap')">
+                <!-- 「代码缩略图」只在解析后的引擎是 Monaco 时渲染。
+                     v3.2.4 删掉了 CodeMirror 侧的缩略图实现（它硬占正文右侧 64px，
+                     手机 360px 宽下就是 18% 的正文没了；而桌面 auto 档本来就走 Monaco），
+                     所以在 CodeMirror 下这一项已经没有任何东西可开。
+                     宁可整项不渲染也不留一个「点了没反应、按钮还高亮、构建全绿」的开关。 -->
+                <el-dropdown-item
+                  v-if="resolvedEngine === 'monaco'"
+                  @click="toggleViewOption('minimap')"
+                >
                   <span class="opt-row">
                     <span>代码缩略图</span>
-                    <span
-                      class="opt-state"
-                      :class="{ 'is-on': viewOptions.minimap }"
-                      >{{ viewOptions.minimap ? "ON" : "OFF" }}</span
-                    >
+                    <span class="opt-state" :class="{ 'is-on': prefs.minimap }">{{
+                      prefs.minimap ? "ON" : "OFF"
+                    }}</span>
                   </span>
                 </el-dropdown-item>
                 <el-dropdown-item @click="toggleViewOption('indent_guides')">
@@ -421,24 +506,45 @@ watch(
                     <span>缩进参考线</span>
                     <span
                       class="opt-state"
-                      :class="{ 'is-on': viewOptions.indent_guides }"
-                      >{{ viewOptions.indent_guides ? "ON" : "OFF" }}</span
-                    >
-                  </span>
-                </el-dropdown-item>
-                <el-dropdown-item @click="toggleViewOption('whitespace')">
-                  <span class="opt-row">
-                    <span>显示空白符</span>
-                    <span
-                      class="opt-state"
-                      :class="{ 'is-on': viewOptions.whitespace }"
-                      >{{ viewOptions.whitespace ? "ON" : "OFF" }}</span
+                      :class="{ 'is-on': prefs.indent_guides }"
+                      >{{ prefs.indent_guides ? "ON" : "OFF" }}</span
                     >
                   </span>
                 </el-dropdown-item>
 
-                <!-- 引擎切换：用 divided 单独起一组，不和上面三项混排。
-                     上面三项是「同一个编辑器怎么显示」，切一下只是重配一个 Compartment，代价为零；
+                <!-- 下面两项不是开关而是「点一下换下一档」的循环项，
+                     光看一枚状态标读不出「还能点」，所以标题后面跟一句常驻的「点击切换」。
+                     不用 el-tooltip：这是下拉浮层里的菜单项，再套一层 popper 只会在
+                     悬停与层级上添乱，而这句提示本来就该常驻可见。
+
+                     状态标的配色规则在这四项里是统一的一条：**这一项此刻有没有在改变正文的样子**。
+                     缩略图 / 参考线关着是灰的；空白符「关闭」也是灰的；
+                     而缩进宽度没有「关」这一档（自动也是一种生效的档位），所以恒为主色。 -->
+                <el-dropdown-item @click="cycleIndentWidth">
+                  <span class="opt-row">
+                    <span class="opt-label"
+                      >缩进宽度<span class="opt-hint">点击切换</span></span
+                    >
+                    <span class="opt-state is-on">{{
+                      editorIndentWidthLabel(prefs.indent_width)
+                    }}</span>
+                  </span>
+                </el-dropdown-item>
+                <el-dropdown-item @click="cycleWhitespace">
+                  <span class="opt-row">
+                    <span class="opt-label"
+                      >显示空白符<span class="opt-hint">点击切换</span></span
+                    >
+                    <span
+                      class="opt-state"
+                      :class="{ 'is-on': prefs.whitespace !== 'none' }"
+                      >{{ editorWhitespaceLabel(prefs.whitespace) }}</span
+                    >
+                  </span>
+                </el-dropdown-item>
+
+                <!-- 引擎切换：用 divided 单独起一组，不和上面四项混排。
+                     上面四项是「同一个编辑器怎么显示」，切一下只是重配一个 Compartment，代价为零；
                      引擎是「换一个编辑器」，切一次整块重建实例，撤销历史 / 光标 / 滚动位置全丢
                      （正文本身不丢，它活在本组件的 fileContent 里）。两者不是同一档，
                      并排放会让人以为引擎也是个随手可以来回拨的显示开关。
@@ -540,11 +646,13 @@ watch(
           v-model="fileContent"
           :language="editorLanguage"
           :readonly="!isEditing"
-          :word-wrap="wordWrap"
-          :minimap="viewOptions.minimap"
-          :indent-guides="viewOptions.indent_guides"
-          :show-whitespace="viewOptions.whitespace"
+          :word-wrap="prefs.word_wrap"
+          :minimap="prefs.minimap"
+          :indent-guides="prefs.indent_guides"
+          :whitespace="prefs.whitespace"
+          :indent-width="prefs.indent_width"
           class="code-editor"
+          @engine-resolved="onEngineResolved"
         />
       </div>
 
@@ -561,7 +669,15 @@ watch(
             fileSizeLabel
           }}</span>
         </div>
-        <div class="status-group">
+        <!-- ⚠️ 这一组是 overflow: hidden + white-space: nowrap：装不下不会换行、也不会出滚动条，
+             而是从**右边缘**静默裁掉。往这里加标之前先想清楚谁会被挤掉。
+             v3.2.4 就栽在这上面：往这组尾部加了 Tab / Space 两枚常驻标（空白符默认值同时
+             从「关」改成「仅选中」，Space 也跟着常驻），内容宽度从约 229px 涨到约 331px，
+             把当时排在最右的「编辑中 / 只读」整个挤出了可视区 —— 414px 下裁掉约 61px，
+             那一项一个字都不剩，而它是这条状态条上唯一告诉用户「现在能不能改」的读数。
+             现在那一项已经提到 footer 直属项上（见本组下方），这组里只剩「挤掉了也能从别处
+             读到」的镜像读数，被裁的代价才是可接受的。 -->
+        <div class="status-group status-group--right">
           <span class="status-item">UTF-8</span>
           <span class="status-item">LF</span>
           <!-- 当前引擎读数。和下面那几个视图开关不同，它是**常驻**的：
@@ -571,30 +687,55 @@ watch(
 
                位置取舍：排在 UTF-8 / LF 之后、Wrap 与开关镜像之前。
                .status-group 带 overflow: hidden，装不下是从右边缘直接裁掉、不换行也不滚动，
-               而最右侧的「编辑中/只读」是这条状态条上最要紧的一项 —— 任何常驻项都会挤它。
-               所以这里按语义就近排（UTF-8 / LF / 引擎都是「这份文件正被什么处理」的静态事实，
-               后面几个才是开关镜像），并把默认引擎的标签压到最短的 CM：
+               所以越靠前越不容易被裁 —— 这里按语义就近排（UTF-8 / LF / 引擎都是
+               「这份文件正被什么处理」的静态事实，后面几个才是开关镜像），
+               并把默认引擎的标签压到最短的 CM：
                默认档是 CodeMirror，常态下只多两个字符加一个间隙，
                只有主动切到 Monaco 的桌面用户才会多付那 4 个字符的宽度。 -->
           <span class="status-item">{{ activeEngineLabel }}</span>
           <!-- 镜像 hero 上那个 Wrap 按钮的状态：窄屏按钮收成纯图标后，这里是唯一能读出开关的地方 -->
-          <span class="status-item">Wrap {{ wordWrap === "on" ? "ON" : "OFF" }}</span>
-          <!-- 三个视图开关藏在齿轮下拉里，菜单一收起同样看不出开关状态，所以这里也镜像一份。
-               但和 Wrap 的写法不同：**只在开启时**渲染一个短标记，关闭时整段不渲染。
-               状态条本来就是一根窄条（.status-group 带 overflow: hidden，装不下是直接裁掉不是换行），
-               并排常驻 `Map OFF / Guide ON / Space OFF` 三段会把右边的「编辑中/只读」顶出去 ——
-               那可是这条状态条上最要紧的一项。开启才显示的代价是「关闭态读不到」，
-               但关闭态本来就是默认态（三项里两项默认关），常态下这里一个字都不多。 -->
-          <span v-if="viewOptions.minimap" class="status-item">Map</span>
-          <span v-if="viewOptions.indent_guides" class="status-item">Guide</span>
-          <span v-if="viewOptions.whitespace" class="status-item">Space</span>
-          <span
-            class="status-item"
-            :class="{ 'status-item--accent': isEditing }"
+          <span class="status-item">Wrap {{ prefs.word_wrap === "on" ? "ON" : "OFF" }}</span>
+          <!-- 四个视图选项藏在齿轮下拉里，菜单一收起就看不出档位，所以这里镜像一份。
+               排序按「菜单外还有没有第二处读数」来定，不按菜单里的顺序抄：
+               Tab / Space 是循环档位（自动·2·4·6·8 / 仅选中·始终·关闭），排在前面；
+               Map / Guide 是布尔，开着才渲染，排在后面。
+
+               四枚**全部**带 status-item--optional，在 ≤1280px 一起收掉（见样式里那条 media query）。
+               v3.2.4 时 Tab / Space 是不收的，理由写着「菜单外没有第二处读数」——
+               但那一版正是因此把「编辑中 / 只读」挤没了：宁可少两枚在齿轮菜单里
+               一眼就能读到的镜像标，也不能让唯一读不到第二处的那一项被裁。
+
+               Space 沿用「关闭态不渲染」的老写法（whitespace === 'none' 时整段不出），
+               Map 还多一个条件：CodeMirror 下这一项根本不存在，开着也不该在状态条上出现。 -->
+          <span class="status-item status-item--optional"
+            >Tab {{ editorIndentWidthLabel(prefs.indent_width) }}</span
           >
-            {{ isEditing ? "编辑中" : "只读" }}
-          </span>
+          <span
+            v-if="prefs.whitespace !== 'none'"
+            class="status-item status-item--optional"
+            >Space {{ editorWhitespaceLabel(prefs.whitespace) }}</span
+          >
+          <span
+            v-if="resolvedEngine === 'monaco' && prefs.minimap"
+            class="status-item status-item--optional"
+            >Map</span
+          >
+          <span
+            v-if="prefs.indent_guides"
+            class="status-item status-item--optional"
+            >Guide</span
+          >
         </div>
+        <!-- 「现在能不能改」是这条状态条上唯一没有第二处读数的一项：hero 上那排按钮写的是
+             「编辑 / 保存」这类动作名，读不出当前处在哪一态。所以它**不进**上面那个会被裁切的组，
+             而是 footer 的直属项 + flex-shrink: 0 —— 任何视口宽度下都完整可见，
+             宽度不够时挤掉的永远是它左边那些镜像读数。 -->
+        <span
+          class="status-item status-item--mode"
+          :class="{ 'status-item--accent': isEditing }"
+        >
+          {{ isEditing ? "编辑中" : "只读" }}
+        </span>
       </footer>
     </template>
   </section>
@@ -909,9 +1050,9 @@ watch(
   }
 }
 
-/* 齿轮下拉里的视图开关项：左侧标题、右侧一枚 ON/OFF 状态标。
+/* 齿轮下拉里的视图选项：左侧标题、右侧一枚状态标。
    下拉菜单项没有 EP 现成的选中态可用，只画一个对勾的话「没对勾」既可能是关、
-   也可能是没渲染上，读不出确定状态，所以两种状态都出字。
+   也可能是没渲染上，读不出确定状态，所以所有状态都出字。
    配置文件页（views/config-file/index.vue）有一份长相相同的规则：两边都是 scoped 样式、
    隔着组件边界互相够不到，只能各写一份，数值要改就两边一起改。 */
 .opt-row {
@@ -921,6 +1062,25 @@ watch(
   justify-content: space-between;
   gap: 16px;
   width: 100%;
+}
+
+/* 循环档位那两项（缩进宽度 / 显示空白符）的标题：正文后面跟一句常驻的「点击切换」。
+   两项都是「点一下换下一档」，而右侧那枚标只写当前档位、看不出还能点，
+   没有这句提示的话很容易被当成一个坏掉的只读读数。
+   写成同一行的次要文字而不是第二行副标题：菜单项是固定行高的单行控件，
+   撑成两行会让这两项在四项里高出一截，反而像是别的什么东西。 */
+.opt-label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.opt-hint {
+  flex-shrink: 0;
+  font-size: 10px;
+  letter-spacing: 0.2px;
+  color: var(--el-text-color-placeholder);
 }
 
 .opt-state {
@@ -1033,7 +1193,9 @@ watch(
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  /* 与组内 .status-item 之间的 14px 同值：「编辑中 / 只读」提到 footer 直属项之后，
+     这条 gap 就是它与左边最后一枚标之间的实际间隙，留 8px 会比组内窄一截、看着像贴上去的。 */
+  gap: 14px;
   padding: 6px 18px;
   /* 卡片内底部分区线 + 次级底色（明暗令牌自适配） */
   border-top: 1px solid var(--el-border-color-lighter);
@@ -1043,6 +1205,8 @@ watch(
   background: var(--el-fill-color-light);
 }
 
+/* ⚠️ overflow: hidden + white-space: nowrap = 装不下就从右边缘静默裁掉。
+   往组里加标之前先想清楚谁会被挤掉（原委见模板里那段注释）。 */
 .status-group {
   display: inline-flex;
   align-items: center;
@@ -1052,9 +1216,51 @@ watch(
   white-space: nowrap;
 }
 
+/* 右组吃掉两组之间的剩余空间，并把自己的内容顶到右边缘。
+   footer 上那条 justify-content: space-between 只摆得平两个子项；
+   现在多了「编辑中 / 只读」这个直属项，光靠 space-between 会把右组推到正中间。
+   让右组 flex-grow 之后 footer 已经没有自由空间可分，space-between 退化成无操作，
+   三项就是「左组贴左 → 右组内容贴右 → 模式标收尾」。 */
+.status-group--right {
+  flex: 1 1 auto;
+  justify-content: flex-end;
+}
+
 .status-item {
   letter-spacing: 0.4px;
   transition: color 0.16s ease, opacity 0.16s ease;
+}
+
+/* 「编辑中 / 只读」：唯一不参与裁切的读数，理由见模板里的注释。
+   它是 footer 直属项，flex-shrink: 0 之后左边两组会先被压缩，它永远完整。
+   nowrap 要在这里再写一遍：原来它是靠 .status-group 那条继承下来的，
+   提出来之后没人给它了，而「编辑中」是三个能各自断行的中日韩字符。 */
+.status-item--mode {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* 窄档收掉四枚镜像读数（Tab / Space / Map / Guide），取舍与上面 .wrap-btn-label 那条同源：
+   .status-group 带 overflow: hidden，装不下不是换行也不是滚动，而是从右边缘静默裁掉。
+   1280px 以下这一档 —— 桌面被 300px 目录树挤到约 450px、再往下整块换成移动布局 ——
+   右组能拿到的宽度只有 200px 上下，而 v3.2.4 那一版的常驻内容需要约 331px。
+
+   v3.2.4 只收 Map / Guide，理由是「Tab / Space 是循环档位、菜单外没有第二处读数」，
+   但这两枚加起来才 54px 左右（Map 在 CodeMirror 下压根不渲染，手机恒为 CodeMirror），
+   抵不掉 Tab / Space 新增的约 102px，于是溢出继续从右边缘吃进去，
+   吃掉的正是当时排在最右的「编辑中 / 只读」。
+   现在的取舍反过来：这四枚在齿轮菜单里都带一枚常驻状态标、点开就能读到，
+   而「能不能改」在菜单里读不到，所以宁可四枚一起收。
+
+   Tab / Space 刻意**不**改成「非默认档才渲染」：那样保留的恰好是用户改过的档位
+   （如「Space 始终」约 61px、「Tab 4」约 33px），而 360px 这一档同样塞不下它们；
+   而且档位是靠在菜单里连点循环切的，切一下状态条上的标就忽隐忽现，读起来更乱。
+
+   写成一条 max-width 而不是只针对 1025~1280 那一档：否则 769~1024 会「更窄反而显示更多」。 */
+@media screen and (max-width: 1280px) {
+  .status-item--optional {
+    display: none;
+  }
 }
 
 .status-item--lang {
@@ -1114,6 +1320,15 @@ watch(
   .editor-statusbar {
     padding: 5px 12px;
     font-size: 10.5px;
+    gap: 10px;
+  }
+
+  /* 360px 是最紧的一档：收掉四枚镜像读数之后右组仍有 UTF-8 / LF / 引擎 / Wrap 四项，
+     按 10.5px 字号估算约 134px，而右组能拿到的只有 136px 上下 —— 擦着边过。
+     14px 的组内间距在这个字号下本来就偏松，收到 10px 能再让出约 12px，
+     把「擦边」变成有余量，同时避免左组的「12.3 KB」被连带压掉半截。 */
+  .status-group {
+    gap: 10px;
   }
 
   .empty-card {

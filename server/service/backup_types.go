@@ -76,6 +76,16 @@ type BackupTwoFactorAuth struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// BackupUserPreference 是 per-user 的界面偏好（目前只有 Editor 那一组 JSON）。
+// 和 BackupTwoFactorAuth 一样跟着用户走，所以刻意**不**给 BackupSelection 加新开关：
+// 用户在恢复界面看到的仍然是原来那几项，勾「配置」就一起带上。
+type BackupUserPreference struct {
+	UserID    uint      `json:"user_id"`
+	Editor    string    `json:"editor"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // BackupEnvVar 用指针保存 enabled，区分「老备份缺少 enabled 字段」和「新备份明确 disabled」。
 type BackupEnvVar struct {
 	ID        uint      `json:"id"`
@@ -146,6 +156,7 @@ type BackupConfigBundle struct {
 	Users             []BackupUser              `json:"users,omitempty"`
 	IPWhitelists      []model.IPWhitelist       `json:"ip_whitelists,omitempty"`
 	TwoFactorAuths    []BackupTwoFactorAuth     `json:"two_factor_auths,omitempty"`
+	UserPreferences   []BackupUserPreference    `json:"user_preferences,omitempty"`
 	DependencyMirrors *DependencyMirrorSettings `json:"dependency_mirrors,omitempty"`
 }
 

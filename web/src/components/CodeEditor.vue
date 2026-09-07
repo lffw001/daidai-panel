@@ -1,108 +1,3 @@
-<script lang="ts">
-/**
- * 「自动换行」偏好的读写。
- *
- * 为什么放在这个组件文件里（而不是新起一个 utils 模块）：
- * 配置文件页与脚本页要共享同一份记忆（一处切换、另一处跟着变），读写范式就只能有一份；
- * 而这两个页面本来就都依赖本组件，偏好也只服务于下面那个 wordWrap prop，
- * 再抽一层通用存储封装属于「为通用性多套一层」，本仓约定是不做（见 AGENTS.md 写代码的风格）。
- *
- * 调试弹窗 / 代码运行器 / 版本对比这几个调用点不读这份偏好，
- * 它们不传 wordWrap，直接吃 prop 默认值 'on'，行为与改造前完全一致。
- *
- * 存储键与回落语义与 Monaco 时代逐字相同：换引擎不该让老用户的偏好丢一次。
- */
-export type EditorWordWrap = "on" | "off";
-
-const EDITOR_WORD_WRAP_STORAGE_KEY = "dd:editor:word_wrap";
-
-export function readStoredEditorWordWrap(): EditorWordWrap {
-  if (typeof window === "undefined") {
-    return "on";
-  }
-  try {
-    // 只认 'off'，其余（没写过、被人改成脏值、读不到）一律回落 'on'，
-    // 'on' 就是改造前硬编码的行为，老用户升级后第一眼观感不变。
-    return window.localStorage.getItem(EDITOR_WORD_WRAP_STORAGE_KEY) === "off"
-      ? "off"
-      : "on";
-  } catch {
-    // 隐私模式 / 禁用存储时 getItem 会抛错，不能让它把调用方的 setup 整块炸掉
-    return "on";
-  }
-}
-
-export function persistEditorWordWrap(value: EditorWordWrap) {
-  if (typeof window === "undefined") {
-    return;
-  }
-  try {
-    window.localStorage.setItem(EDITOR_WORD_WRAP_STORAGE_KEY, value);
-  } catch {
-    // 写失败只是这次记不住，不影响本次切换效果，静默忽略
-  }
-}
-
-/**
- * 三个「视图类」开关（issue #114-1/2/3）：缩略图、缩进参考线、空白符。
- *
- * 这三个和上面的自动换行是同一类东西（个人编辑习惯、每浏览器独立、脚本页与配置文件页共享），
- * 但**没有**照抄成三组「常量 + 读 + 写」—— 那是 6 个逐字雷同的函数。
- * 上面自动换行那组保持原样不动，是因为它的具名导出写进了组件契约（见
- * spec/frontend/component-guidelines.md），不能改签名。
- *
- * 默认值刻意各不相同，判据是「打开它会不会打扰到不需要它的人」：
- *   - 缩进参考线：默认开。它就是为了让缩进层级一眼看清，噪声极低。
- *   - 缩略图：默认关。它要占掉正文右侧 64px，窄屏尤其肉疼。
- *   - 空白符：默认关。每个空格一个灰点，读配置文件时纯属干扰。
- */
-export type EditorViewOption = "minimap" | "indent_guides" | "whitespace";
-
-const EDITOR_VIEW_OPTION_KEYS: Record<EditorViewOption, string> = {
-  minimap: "dd:editor:minimap",
-  indent_guides: "dd:editor:indent_guides",
-  whitespace: "dd:editor:whitespace",
-};
-
-const EDITOR_VIEW_OPTION_DEFAULTS: Record<EditorViewOption, boolean> = {
-  minimap: false,
-  indent_guides: true,
-  whitespace: false,
-};
-
-export function readStoredEditorViewOption(name: EditorViewOption): boolean {
-  const fallback = EDITOR_VIEW_OPTION_DEFAULTS[name];
-  if (typeof window === "undefined") {
-    return fallback;
-  }
-  try {
-    // 只认写死的 'on' / 'off' 两个值，其余（没写过、被人改成脏值、读不到）一律回落默认，
-    // 这样「用户从没碰过这个开关」和「存储被清掉了」表现一致。
-    const raw = window.localStorage.getItem(EDITOR_VIEW_OPTION_KEYS[name]);
-    if (raw === "on") return true;
-    if (raw === "off") return false;
-    return fallback;
-  } catch {
-    // 隐私模式 / 禁用站点存储时 getItem 会抛错，不能让它把调用方的 setup 整块炸掉
-    return fallback;
-  }
-}
-
-export function persistEditorViewOption(name: EditorViewOption, value: boolean) {
-  if (typeof window === "undefined") {
-    return;
-  }
-  try {
-    window.localStorage.setItem(
-      EDITOR_VIEW_OPTION_KEYS[name],
-      value ? "on" : "off",
-    );
-  } catch {
-    // 写失败只是这次记不住，不影响本次切换效果，静默忽略
-  }
-}
-</script>
-
 <script setup lang="ts">
 import {
   computed,
@@ -116,6 +11,7 @@ import {
   EDITOR_ENGINE_CHANGE_EVENT,
   readStoredEditorEngine,
   resolveEditorEngine,
+  type ResolvedEditorEngine,
 } from "@/utils/editorEngine";
 
 /**
@@ -126,12 +22,23 @@ import {
  *     选区就是原生 Selection，「长按出系统菜单 / 双击出选择手柄 / 按住拖动光标」天然可用。
  *   - MonacoEditor.vue：桌面端可选。多光标、列选、JSON 语言服务那套更强，
  *     但它是自绘编辑器，上面三条**无论怎么配都做不到**。
- * 两份实现的 props / emit / defineExpose / 根 class 逐字相同，调用点感知不到拿到的是哪一个。
+ * 两份实现的 props / emit / defineExpose / 根 class 逐字相同（唯一的例外是 minimap，
+ * 理由写在 CodeMirrorEditor.vue 那个 prop 的注释里），调用点感知不到拿到的是哪一个。
+ * 注意那条契约约束的是**两份实现之间**：本分发层的 emit 面是它们的超集
+ * （多一个 update:modelValue 的转发、多一个 engine-resolved 的上报），详见下面 emits 的注释。
  *
- * 上面那个普通 `<script>` 块里的 6 个具名导出（自动换行与三个视图开关各一组「类型 + 读 + 写」）
- * 刻意**留在本文件**：
- * 它们是写进 spec/frontend/component-guidelines.md 的组件契约，两个页面按名字引用。
- * 两个引擎实现**不从这里 import 任何东西**（这些偏好的值是页面读出来、当 prop 传进去的），
+ * 📦 v3.2.4 起本文件**不再是偏好的家**。
+ * 这里原本有一个普通 `<script>` 块，导出 6 个具名成员（自动换行一组、三个视图开关一组
+ * 「类型 + 读 + 写」，纯 localStorage）。issue #116 要求偏好「换设备 / 换 IP 也记得住」，
+ * 于是它们整体搬到了 utils/editorPreferences.ts —— 那边多了一条服务端同步链路
+ * （/api/auth/preferences），而**组件文件不是发请求的地方**。
+ * 顺带解决的还有：新加的 indent_width 是三态/五态而不是布尔，旧的
+ * readStoredEditorViewOption(name): boolean 那个签名装不下。
+ * 两个页面（脚本页 / 配置文件页）现在从 utils/editorPreferences.ts 引入，不再从本文件引入。
+ * 🔴 所以**不要**再往本文件加具名导出：普通 `<script>` 块一旦回来，
+ * 「偏好只有一处真源」这条又会开始漂。
+ *
+ * 两个引擎实现**不从这里 import 任何东西**（偏好的值是页面读出来、当 prop 传进去的），
  * 所以「分发层 import 实现、实现 import 分发层」的循环依赖不存在。
  *
  * 🔴 模板是**单个** `<component :is>` 根节点，不套 wrapper `<div>`、也不在根上放注释
@@ -176,21 +83,39 @@ const props = withDefaults(
     wordWrap?: "on" | "off";
     /**
      * 右侧代码缩略图。默认 false。
-     * ⚠️ 下面三个 prop 的默认值一律等于「加这些功能之前的行为」，
+     * ⚠️ 下面几个 prop 的默认值一律等于「加这些功能之前的行为」，
      * 所以不传它们的调用点（调试弹窗 / 代码运行器）一个像素都不会变。
      * 脚本页与配置文件页会显式传各自记住的偏好。
+     *
+     * 🔴 v3.2.4 起**只有 Monaco 真的实现它**：CodeMirror 侧那份自绘缩略图已经删掉，
+     * 那边同名 prop 是刻意留空的 no-op（理由见 CodeMirrorEditor.vue 的注释）。
+     * 这里仍然照常往下传 —— 换成「只在 monaco 分支才 v-bind 上去」的写法，
+     * 就等于放弃了下面模板逐个显式传时 vue-tsc 的逐项类型检查，不划算。
+     * 菜单里那一项该不该显示由**页面**按当前引擎决定，不在本层过滤。
      */
     minimap?: boolean;
     /** 缩进参考线。默认 false（同上，偏好本身的默认值是开，由页面侧决定） */
     indentGuides?: boolean;
-    /** 显示空白符：空格画灰点、Tab 画箭头、行尾空白标底色。默认 false */
-    showWhitespace?: boolean;
+    /**
+     * 显示空白符三态（issue #116-4）。默认 'none'。
+     *   - 'all'：一直画（空格灰点、Tab 箭头）
+     *   - 'selection'：只画选中范围内的
+     *   - 'none'：不画
+     * 取代了 v3.2.2 的布尔 showWhitespace：那个二态装不下用户真正想要的「仅选中」。
+     */
+    whitespace?: "none" | "selection" | "all";
+    /**
+     * 缩进宽度（issue #116-1/3）。默认 2，等于加这个功能之前两个引擎写死的值。
+     * 'auto' 表示按文档内容检测，页面侧的偏好默认就是 'auto'。
+     */
+    indentWidth?: "auto" | number;
   }>(),
   {
     wordWrap: "on",
     minimap: false,
     indentGuides: false,
-    showWhitespace: false,
+    whitespace: "none",
+    indentWidth: 2,
   },
 );
 
@@ -198,6 +123,20 @@ const props = withDefaults(
 // 调用点 v-model 的类型检查当场失效（值类型变成 any，写错了也查不出来）。
 const emit = defineEmits<{
   "update:modelValue": [value: string];
+  /**
+   * 把「本次真正用上的引擎」上报给页面（issue #117）。
+   * 值的类型就是 ResolvedEditorEngine，即 'codemirror' | 'monaco'。
+   * 触发时机与本层解析引擎的时机一一对应：挂载时一次，
+   * EDITOR_ENGINE_CHANGE_EVENT 触发 syncEngine() 重新解析后一次。
+   *
+   * 🔴 这一条**只加在分发层**，两个引擎实现里都不加。
+   * 「两份实现的 props / emit / defineExpose 逐字相同」那条契约约束的是**引擎实现之间**——
+   * 它们是同一个契约的两份实现，谁多一个事件都会让调用点在切引擎时行为分叉。
+   * 而分发层本来就比它们多一层职责（它已经多了一个 update:modelValue 的转发），
+   * 并且「当前用的是哪一个引擎」这件事**只有它知道**：引擎实现自己拿不到偏好，
+   * 也无从判断自己是被 auto 选中的还是被显式选中的，让它们来报反倒要多传一份信息进去。
+   */
+  "engine-resolved": [engine: ResolvedEditorEngine];
 }>();
 
 /** 两个引擎实现共同暴露的方法集，与它们各自 defineExpose 的四个键逐字对应。 */
@@ -221,10 +160,28 @@ const engine = ref(resolveEditorEngine(readStoredEditorEngine()));
 // 存储才是唯一真源。
 function syncEngine() {
   engine.value = resolveEditorEngine(readStoredEditorEngine());
+  // 解析完立刻上报，理由见 onMounted 里那次上报的大段注释。
+  // 刻意**不**先比较新旧值：页面侧收到的是「当前实际引擎」的一次断言，
+  // 重复上报只是给同一个 ref 赋同一个值（同值赋值不会触发更新），
+  // 而漏报一次的代价是菜单和正文重新分叉，两边不对等。
+  emit("engine-resolved", engine.value);
 }
 
 onMounted(() => {
   window.addEventListener(EDITOR_ENGINE_CHANGE_EVENT, syncEngine);
+  // 挂载时把解析结果报给页面。这是 issue #117「菜单里有这一项、点了没反应、按钮还高亮」
+  // 的修复主线，别当成一次多余的通知删掉：
+  //   - 页面侧的 resolvedEngine 是 computed(() => resolveEditorEngine(editorEngine.value))，
+  //     依赖只有偏好这一个 ref；而 resolveEditorEngine('auto') 内部读的
+  //     window.matchMedia('(pointer: coarse)') 与 window.innerWidth **都不是响应式的**，
+  //     偏好没变时那个 computed 求值一次就一直吃缓存。
+  //   - 本组件却是**每次挂载**重新解析的，而两个页面的编辑器都挂在 v-if 上
+  //     （配置文件页 v-if="!loading"，点一次「刷新」就整块重建；脚本页还有 v-if="isBinary"），
+  //     于是两者会分叉：宽窗口下打开页面（菜单里有「代码缩略图」）→ 把窗口贴靠成半屏
+  //     使 innerWidth ≤ 1024 → 点「刷新」→ 编辑器重建成了 CodeMirror，而菜单里那一项还在，
+  //     点它就是开关翻成 ON、正文毫无变化。反过来（窄 → 宽）则是本次会话再也没有入口开缩略图。
+  // 让分发层把真正用上的引擎报回去，页面就不必自己再猜一次。
+  emit("engine-resolved", engine.value);
 });
 
 onBeforeUnmount(() => {
@@ -268,7 +225,8 @@ defineExpose({
     :word-wrap="props.wordWrap"
     :minimap="props.minimap"
     :indent-guides="props.indentGuides"
-    :show-whitespace="props.showWhitespace"
+    :whitespace="props.whitespace"
+    :indent-width="props.indentWidth"
     @update:model-value="onInnerUpdate"
   />
 </template>

@@ -311,6 +311,19 @@ func snapshotConfigBundle() (BackupConfigBundle, error) {
 		})
 	}
 
+	var preferences []model.UserPreference
+	if err := database.DB.Order("id ASC").Find(&preferences).Error; err != nil {
+		return BackupConfigBundle{}, fmt.Errorf("load user preferences: %w", err)
+	}
+	for _, item := range preferences {
+		bundle.UserPreferences = append(bundle.UserPreferences, BackupUserPreference{
+			UserID:    item.UserID,
+			Editor:    item.Editor,
+			CreatedAt: item.CreatedAt,
+			UpdatedAt: item.UpdatedAt,
+		})
+	}
+
 	return bundle, nil
 }
 
@@ -1124,6 +1137,33 @@ func restoreTwoFactorAuths(tx *gorm.DB, items []BackupTwoFactorAuth, userIDMap m
 			UserID:    userID,
 			Secret:    item.Secret,
 			Enabled:   item.Enabled,
+			CreatedAt: item.CreatedAt,
+			UpdatedAt: item.UpdatedAt,
+		}
+		if err := tx.Create(&record).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// restoreUserPreferences 与上面的 restoreTwoFactorAuths 逐条同构：
+// 用户主键在恢复时会重新分配，只有能从 userIDMap 映射到新 ID 的记录才恢复，
+// 映射不到（归档里的那个用户没被一起恢复）就整条跳过，写失败则把错误抛给外层事务回滚。
+//
+// ⚠️ 现状：restoreUsers / restoreTwoFactorAuths 目前都**没有调用点** —— 用户、2FA
+// 只导出不恢复（恢复用户会连带换掉当前管理员的凭据，风险太大），
+// 所以这个函数同样先与它们成对放着，等哪天把用户恢复整条链路接上时一起接。
+// 不要以为「编辑器偏好已经能跟着备份恢复了」：现在只做到了随备份导出。
+func restoreUserPreferences(tx *gorm.DB, items []BackupUserPreference, userIDMap map[uint]uint) error {
+	for _, item := range items {
+		userID := userIDMap[item.UserID]
+		if userID == 0 {
+			continue
+		}
+		record := model.UserPreference{
+			UserID:    userID,
+			Editor:    item.Editor,
 			CreatedAt: item.CreatedAt,
 			UpdatedAt: item.UpdatedAt,
 		}

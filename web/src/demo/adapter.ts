@@ -2,6 +2,7 @@ import axios, { AxiosError } from 'axios'
 import type { AxiosAdapter, AxiosResponse, InternalAxiosRequestConfig } from 'axios'
 import { ElMessage } from 'element-plus'
 import request from '@/api/request'
+import { EDITOR_PREFERENCES_DEFAULTS } from '@/utils/editorPreferences'
 import notificationTypesFixture from './fixtures/notification-types.json'
 import {
   appendTaskRunLog,
@@ -315,6 +316,157 @@ route('PUT', '/auth/username', (ctx) => {
 //（MainLayout 那三处 <img> 没有 @error 兜底）。与其做半套，不如直接说明这里不可用。
 route('POST', '/auth/avatar', () => blocked())
 route('DELETE', '/auth/avatar', () => ({ message: '头像已删除' }))
+
+/**
+ * 当前登录用户的编辑器偏好（issue #116）。
+ *
+ * 真实面板按用户存一份在服务端；演示站没有后端，落在 localStorage 里 ——
+ * 这是整套 mock 里【唯一】持久化的东西，其余数据都在内存、刷新即回到初始 fixture（见 db.ts 顶部）。
+ * 偏好必须例外：#116 要的就是「换设备 / 换标签页也记得住」，跟着一起丢就正好演示不出来。
+ *
+ * ⚠️ 键名与 utils/editorPreferences.ts 的 `dd:editor:*` 刻意分开：那 5 个键是前端的本地缓存，
+ *    这里模拟的是服务端那一份真源。共用一处的话「从服务端拉回来覆盖本地缓存」这条链路
+ *    等于自己覆盖自己，永远看不出差别。
+ */
+const DEMO_EDITOR_PREFERENCES_KEY = 'dd:demo:editor-preferences'
+
+/**
+ * 接口下发的偏好形状。
+ *
+ * 与 EditorPreferences 差在两处，这两处都是【传输层】的口径，不是笔误：
+ *   - indent_width 是字符串（'auto' / '2' / '4' / '6' / '8'），不是数字；
+ *   - 两个开关下发时是 JSON 布尔（ensureEditorPreferencesLoaded 用 typeof === 'boolean' 判定），
+ *     面板前端写入时提交的**也是** JSON 布尔（setEditorPreference 里
+ *     `key === 'minimap' || key === 'indent_guides' ? (value as boolean) : String(value)`），
+ *     另外还兼容 'on' / 'off' / 'true' / 'false' 字符串 —— 那是留给 APP / 第三方脚本 / 历史客户端的。
+ */
+interface DemoEditorPreferences {
+  word_wrap: string
+  minimap: boolean
+  indent_guides: boolean
+  whitespace: string
+  indent_width: string
+}
+
+/**
+ * 默认值直接引用前端那份常量，不在这里手抄第二遍。
+ *
+ * 服务端的默认值本来就要求与 utils/editorPreferences.ts 逐字相同（那边的注释里写着），
+ * 演示站再抄一份就是制造第三份副本 —— 和文件顶部说的 notification-types / configs 是同一类问题。
+ */
+function demoEditorPreferenceDefaults(): DemoEditorPreferences {
+  return {
+    word_wrap: EDITOR_PREFERENCES_DEFAULTS.word_wrap,
+    minimap: EDITOR_PREFERENCES_DEFAULTS.minimap,
+    indent_guides: EDITOR_PREFERENCES_DEFAULTS.indent_guides,
+    whitespace: EDITOR_PREFERENCES_DEFAULTS.whitespace,
+    indent_width: String(EDITOR_PREFERENCES_DEFAULTS.indent_width),
+  }
+}
+
+/**
+ * 字段级合并：只认这 5 个键、只接受合法值，其余原样丢弃。
+ *
+ * 两个开关同时接受 JSON 布尔和 'on' / 'off'（'true' / 'false' 同样认）字符串。
+ * ⚠️ 面板前端发来的是【JSON 布尔】—— setEditorPreference 里这两个键刻意不走 String()：
+ *   `key === 'minimap' || key === 'indent_guides' ? (value as boolean) : String(value)`。
+ * 那为什么还要认字符串？为了 APP、第三方脚本和历史客户端：它们提交的是 'on' / 'off'。
+ * 少认哪一路，那一路的每一次切换都会被静默丢掉 —— 它的 catch 是空的，页面上一行报错都不会有，
+ * 表现为「这两个开关跨设备永远不生效」。服务端 handler/user_preference.go 的 editorFlag 认的是同一张取值表。
+ *
+ * 非法值这里是【忽略】而不是回 400：真实接口会 400，但演示站里没有能发出非法值的路径，
+ * 而 mock 的第一条规则是绝不让访客撞上 4xx。
+ */
+function mergeDemoEditorPreferences(
+  base: DemoEditorPreferences,
+  patch: Record<string, unknown>,
+): DemoEditorPreferences {
+  const merged: DemoEditorPreferences = { ...base }
+
+  const wordWrap = String(patch['word_wrap'] ?? '')
+  if (wordWrap === 'on' || wordWrap === 'off') merged.word_wrap = wordWrap
+
+  const whitespace = String(patch['whitespace'] ?? '')
+  if (whitespace === 'none' || whitespace === 'selection' || whitespace === 'all') merged.whitespace = whitespace
+
+  const indentWidth = String(patch['indent_width'] ?? '')
+  if (['auto', '2', '4', '6', '8'].includes(indentWidth)) merged.indent_width = indentWidth
+
+  for (const key of ['minimap', 'indent_guides'] as const) {
+    const value = patch[key]
+    if (typeof value === 'boolean') {
+      merged[key] = value
+      continue
+    }
+    // 'true' / 'false' 也认，与服务端 editorFlag.UnmarshalJSON 的取值表对齐
+    const raw = typeof value === 'string' ? value : ''
+    if (raw === 'on' || raw === 'true') merged[key] = true
+    else if (raw === 'off' || raw === 'false') merged[key] = false
+  }
+
+  return merged
+}
+
+/**
+ * 一次读取的结果：偏好本身 + 「这份是不是真的存过」。
+ *
+ * stored 的判定口径与真实服务端逐字一致：**有记录 且 内容能解析成 JSON 对象**才算 true。
+ * 没存过 / 空串 / 脏 JSON 一律 false —— 后两种当成「没存过」，正好让前端把本机那份重新迁上去。
+ */
+interface DemoEditorPreferencesRead {
+  editor: DemoEditorPreferences
+  stored: boolean
+}
+
+function readDemoEditorPreferences(): DemoEditorPreferencesRead {
+  const defaults = demoEditorPreferenceDefaults()
+  try {
+    const raw = window.localStorage.getItem(DEMO_EDITOR_PREFERENCES_KEY)
+    if (!raw) return { editor: defaults, stored: false }
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { editor: defaults, stored: false }
+    // 走同一个合并函数：存进去的 JSON 被人手改坏、或者是老版本留下的半份，
+    // 都按「认得的键才用、其余回落默认」处理，与服务端对没存过的用户下发默认值是同一个结果。
+    // 注意这里 stored 仍然是 true：能解析成对象就算存过，「半份」由字段级合并补齐，不是「没存过」。
+    return { editor: mergeDemoEditorPreferences(defaults, parsed as Record<string, unknown>), stored: true }
+  } catch {
+    // 隐私模式下 localStorage 读取本身就会抛，不能让它把这次请求整块炸掉。
+    // 读不到就是读不到，stored 必须是 false：让访客本机那份偏好走上行迁移，而不是被默认值冲掉。
+    return { editor: defaults, stored: false }
+  }
+}
+
+function writeDemoEditorPreferences(value: DemoEditorPreferences) {
+  try {
+    window.localStorage.setItem(DEMO_EDITOR_PREFERENCES_KEY, JSON.stringify(value))
+  } catch {
+    // 写失败只是这一次记不住，响应体照常返回合并后的值，本次切换在页面上仍然生效
+  }
+}
+
+/**
+ * ⚠️ stored 这个字段不是可选装饰，缺了它演示站会复现真面板的同一个缺陷：
+ * 访客先在演示站里调好偏好（落在本机 `dd:editor:*`），下一次进来首屏 GET 拿到的是一整套默认值，
+ * 前端逐项写回本地缓存 —— 他刚调好的开关被静默冲掉。
+ * 有了 stored=false，前端改走「把本机那 5 项一次性 PUT 上去」的上行迁移，本机偏好才保得住。
+ * editor 字段本身不受影响：无论 stored 是什么都下发一整套可用的值，不认得 stored 的老客户端行为零变化。
+ */
+route('GET', '/auth/preferences', () => {
+  const { editor, stored } = readDemoEditorPreferences()
+  return { editor, stored }
+})
+
+route('PUT', '/auth/preferences', (ctx) => {
+  const patch = bodyObject(ctx)['editor']
+  const merged = mergeDemoEditorPreferences(
+    readDemoEditorPreferences().editor,
+    patch && typeof patch === 'object' && !Array.isArray(patch) ? (patch as Record<string, unknown>) : {},
+  )
+  writeDemoEditorPreferences(merged)
+  // 写完必然是存过了，所以恒为 true。注意即使 writeDemoEditorPreferences 因隐私模式写失败也照样返回 true：
+  // 本次响应带回的就是合并后的值，这一轮对前端而言确实「服务端已有记录」，与真面板落库成功后的口径一致。
+  return { editor: merged, stored: true }
+})
 
 // ===========================================================================
 // 系统信息 / 面板设置

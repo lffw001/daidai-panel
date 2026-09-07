@@ -84,6 +84,117 @@ export function resolveCodeEditorLanguage(language?: string): Extension {
   }
 }
 
+/* --------------------------------------------------------------------------
+ * 缩进宽度检测（issue #116-1/3）。
+ * ⚠️ 这一段**两个引擎共用**，不是 CodeMirror 专属：
+ * CodeMirror 侧拿它去配 indentUnit + EditorState.tabSize，Monaco 侧拿它去配 tabSize。
+ * 放在这里的理由与语言别名表、调色板一样 —— 一份判断，两处使用，拆开就会漂。
+ * -------------------------------------------------------------------------- */
+
+/**
+ * 采样行数上限。
+ * 打开一份几万行的日志或压缩产物时，全量扫会明显拖慢首次渲染；
+ * 而缩进风格是文件级的习惯，看前 1000 行足够定性（Monaco 自己取的是 10000 行，
+ * 但它是在 TextModel 构造时同步跑的，我们是在每次外部换文档时跑，取更保守的值）。
+ */
+const INDENT_SAMPLE_LINES = 1000
+
+/** 允许的检测结果，与 utils/editorPreferences.ts 的 EditorIndentWidth 逐项对齐。 */
+const INDENT_WIDTH_CANDIDATES = [2, 4, 6, 8] as const
+
+/**
+ * 按内容猜「一级缩进等于几列」。
+ *
+ * 思路对齐 Monaco 的 guessIndentation：逐行取行首空格列数，与**上一条非空行**比一次，
+ * 正增量就是一次「进了一级」的证据，给这个增量投一票；票最多的那个宽度胜出。
+ *
+ * ⚠️ 为什么不直接用 Monaco 自带的 detectIndentation：
+ *   1. 它只在 TextModel **构造那一瞬间**跑一次，`setValue()` 永远不会重猜 ——
+ *      而脚本页是「先挂编辑器、再 await 拉内容」，构造时文档还是空串，
+ *      猜出来的永远是兜底值（这正是 issue #116-1「F5 之后随机 2 或 4」的成因）。
+ *   2. 我们有两个引擎，CodeMirror 侧根本没有这个东西。两边必须用**同一份**判断，
+ *      否则同一个文件换个引擎缩进宽度就变了。
+ * 所以 MonacoEditor.vue 里 detectIndentation 是显式关掉的，两边都吃这个函数的结果。
+ *
+ * 没有任何缩进证据（空文件、单行、全顶格）→ 回落 2；
+ * 用 Tab 缩进的文件也回落 2 —— Tab 的显示宽度由 tabSize 决定，这里只关心「一级缩进几列」。
+ */
+export function detectIndentWidth(content: string): 2 | 4 | 6 | 8 {
+  // 键是增量、值是出现次数：votes.get(4) 就是「相邻两级差 4 列」出现过几次。
+  // 用 Map 而不是定长数组，是因为本仓开了 noUncheckedIndexedAccess，
+  // 数组下标读出来是 number | undefined，`votes[diff]++` 会直接类型报错。
+  const votes = new Map<number, number>()
+  const voteOf = (width: number) => votes.get(width) ?? 0
+  let tabLines = 0
+  let spaceLines = 0
+  // 上一条「纯空格缩进的非空行」的缩进列数；-1 表示没有可比对象
+  let prevIndent = -1
+  let scanned = 0
+  let pos = 0
+
+  // 手写切行而不是 content.split('\n')：超长文件不必先造一个几万项的数组才发现只用前 1000 行
+  while (pos < content.length && scanned < INDENT_SAMPLE_LINES) {
+    let end = content.indexOf('\n', pos)
+    if (end < 0) end = content.length
+    const raw = content.slice(pos, end)
+    pos = end + 1
+    scanned++
+    // CRLF 文件的行尾 \r 必须先摘掉，否则「只有 \r 的空行」会被下面当成一条顶格的代码行，
+    // 把 prevIndent 拉回 0，紧跟着的那一行就会凭空贡献一个假的大增量
+    const text = raw.endsWith('\r') ? raw.slice(0, -1) : raw
+
+    let spaces = 0
+    let hasTab = false
+    let i = 0
+    for (; i < text.length; i++) {
+      const ch = text[i]
+      if (ch === ' ') spaces++
+      else if (ch === '\t') hasTab = true
+      else break
+    }
+
+    // 空行与纯空白行不作为证据：它们的缩进是排版残留，不代表代码层级
+    if (i >= text.length) continue
+
+    if (hasTab) {
+      tabLines++
+      // 跨过一条 Tab 缩进行去比对空格列数没有意义，断掉这条链
+      prevIndent = -1
+      continue
+    }
+
+    spaceLines++
+    if (prevIndent >= 0) {
+      const diff = spaces - prevIndent
+      // 只认正增量（进一级）。负增量是退出块，一次退几级是任意的，不是证据。
+      if (diff > 0 && diff <= 8) votes.set(diff, voteOf(diff) + 1)
+    }
+    prevIndent = spaces
+  }
+
+  // 整份文件主要靠 Tab 缩进：没有「一级等于几列」这回事，回落 2
+  if (tabLines > spaceLines) return 2
+
+  let best: 2 | 4 | 6 | 8 = 2
+  let bestScore = 0
+  for (const width of INDENT_WIDTH_CANDIDATES) {
+    // 严格大于：票数打平时靠遍历顺序让小的胜出
+    if (voteOf(width) > bestScore) {
+      bestScore = voteOf(width)
+      best = width
+    }
+  }
+  // 一条正增量证据都没有（空文件、单行、全顶格）→ 回落 2
+  if (bestScore === 0) return 2
+
+  // 抄自 Monaco 的一条经验规则：4 只有在明显压倒 2 时才算数。
+  // 典型场景是 YAML / shell 这类 2 空格文件里嵌了几处深层结构，跳级跳出一堆 4，
+  // 光比票数会把整份文件判成 4、于是每两级才画一条参考线。
+  if (best === 4 && voteOf(2) > 0 && voteOf(2) * 3 >= voteOf(4) * 2) return 2
+
+  return best
+}
+
 /**
  * 语法高亮配色。
  *
@@ -133,7 +244,11 @@ function buildHighlightStyle(dark: boolean) {
   // 同一个词命中多条规则时，lezer 按「标签更具体者胜」决定，与书写顺序无关，
   // 所以 function(variableName) 不会被下面那条裸 variableName 盖掉。
   return HighlightStyle.define([
-    { tag: [tags.comment, tags.lineComment, tags.blockComment, tags.docComment], color: color.comment, fontStyle: 'italic' },
+    // ⚠️ 注释刻意**不加** fontStyle: 'italic'（issue #116-6）：等宽字体的斜体多半是合成出来的
+    // （字体家族里没有真正的 italic 字形，浏览器直接把正体切一刀），笔画会发虚、行内还会串位。
+    // 下面 tags.emphasis 那条斜体是另一回事，别连坐删掉 —— 它是 Markdown 的 *强调*，
+    // 源文本本来就要求斜体，属于内容语义，不是「注释用斜体」这种主题偏好。
+    { tag: [tags.comment, tags.lineComment, tags.blockComment, tags.docComment], color: color.comment },
     { tag: [tags.keyword, tags.modifier, tags.self, tags.null, tags.atom, tags.bool], color: color.keyword },
     { tag: [tags.controlKeyword, tags.moduleKeyword], color: color.controlKeyword },
     { tag: [tags.string, tags.special(tags.string), tags.character], color: color.string },
@@ -543,7 +658,11 @@ export function defineMonacoTheme(monaco: MonacoThemeHost): MonacoThemeDescripto
     // 注：调色板里的 functionName 在这边用不上 —— Monarch 语法不区分「函数名」这个 token，
     // 函数名会落到 identifier 上，硬给它编一个 token 名只会写出一条永不命中的规则。
     rules: [
-      { token: 'comment', foreground: hex(color.comment), fontStyle: 'italic' },
+      // 与 CodeMirror 侧那条注释规则一样，**不给** fontStyle（issue #116-6）。
+      // 这里是整个 fontStyle 键都不写，不能写成 fontStyle: 'normal'：Monaco 的解析器只认
+      // italic / bold / underline / strikethrough 四个词，'normal' 是靠「认不出就当没设」容错生效的。
+      // inherit: true 也不会把斜体带回来 —— 0.56 的内置 vs / vs-dark 里 comment 与根规则都没有 fontStyle。
+      { token: 'comment', foreground: hex(color.comment) },
       { token: 'keyword', foreground: hex(color.keyword) },
       { token: 'keyword.control', foreground: hex(color.controlKeyword) },
       { token: 'string', foreground: hex(color.string) },

@@ -99,6 +99,7 @@ func allModels() []interface{} {
 		&model.IPWhitelist{},
 		&model.SecurityAudit{},
 		&model.TwoFactorAuth{},
+		&model.UserPreference{},
 		&model.OpenApp{},
 		&model.ApiCallLog{},
 		&model.Platform{},

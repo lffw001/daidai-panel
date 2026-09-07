@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { Edit, RefreshRight, Select, Tickets, VideoPause, VideoPlay } from '@element-plus/icons-vue'
-import { computed } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ansiToHtml, normalizeAnsi } from '@/utils/ansi'
+import {
+  EDITOR_PREFERENCES_CHANGE_EVENT,
+  readEditorPreferences,
+} from '@/utils/editorPreferences'
+import type { EditorIndentWidth } from '@/utils/editorPreferences'
 // 这里原来是 defineAsyncComponent 懒加载，但那层包装其实一直没带来收益：
 // 旧的 MonacoEditor 靠 utils/monaco.ts 在运行期用 AMD loader 去拉 /monaco/vs 下的资源，
 // 那几 MB 从来没被 Vite 打进任何 chunk，异步组件既挡不住它、也没什么可挡。
@@ -38,6 +43,39 @@ const props = defineProps<{
   onStopRunner: () => void | Promise<void>
 }>()
 
+/**
+ * 缩进宽度偏好。
+ *
+ * 🔴 这两个弹窗里的 <CodeEditor> **必须**显式传 :indent-width，不能吃 prop 默认值 2 ——
+ * 这不是「顺手也配一下」，删掉它会把主编辑器一起带偏：
+ * Monaco 的 tabSize 是**全进程共享**的配置，弹窗一开，全局 tabSize 就被拉回 2
+ * 并广播给所有活着的 model，后面那个还开着的脚本编辑器（可能正记着 Tab 4）当场
+ * 变成 2 列缩进、参考线跟着走位，而齿轮菜单和底部状态条仍然写着 Tab 4。
+ * 组件侧另有一道自愈守卫兜底，但那只是兜底，用户会看见一次可见的闪变。
+ *
+ * 其余四项（wordWrap / minimap / indentGuides / whitespace）**刻意保持不传**：
+ * 它们的 prop 默认值就等于「加这些功能之前的行为」，不传是这两个弹窗的既定取舍，
+ * 别顺手一起补上（见 CodeEditor.vue 里那几个 prop 的注释）。
+ *
+ * 只持这一项、不把整套 prefs 搬进来：弹窗要的就是「别把全局 tabSize 拉歪」这一件事。
+ */
+const indentWidth = ref<EditorIndentWidth>(readEditorPreferences().indent_width)
+
+// 与两个编辑器页面同一份真源：在齿轮菜单里切了缩进宽度、或者服务端那份偏好刚拉回来，
+// 都靠这个事件同步过来。刻意从存储重读而不是从事件里取值（事件本身不带载荷），
+// 范式对齐两个页面里的 syncPreferences。
+function syncIndentWidth() {
+  indentWidth.value = readEditorPreferences().indent_width
+}
+
+onMounted(() => {
+  window.addEventListener(EDITOR_PREFERENCES_CHANGE_EVENT, syncIndentWidth)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener(EDITOR_PREFERENCES_CHANGE_EVENT, syncIndentWidth)
+})
+
 const debugLogsHtml = computed(() => ansiToHtml(normalizeAnsi(props.debugLogs.join('\n'))))
 const runnerLogsHtml = computed(() => ansiToHtml(normalizeAnsi(props.runnerLogs.join('\n'))))
 
@@ -69,10 +107,13 @@ function markDebugCodeChanged() {
           </el-select>
         </div>
         <div class="panel-content" style="padding: 0">
+          <!-- :indent-width 必须传，理由见 <script> 里 indentWidth 的注释：
+               Monaco 的 tabSize 是全进程共享的，不传就会把主编辑器的缩进一起拉回 2。 -->
           <CodeEditor
             v-if="showCodeRunner"
             v-model="runnerCode"
             :language="runnerLanguage === 'shell' ? 'shell' : runnerLanguage"
+            :indent-width="indentWidth"
             min-height="0"
             style="height: 100%; min-height: 0"
           />
@@ -126,10 +167,13 @@ function markDebugCodeChanged() {
           <el-tag v-if="debugCodeChanged" type="warning" size="small" effect="plain">已修改</el-tag>
         </div>
         <div class="panel-content" style="padding: 0">
+          <!-- :indent-width 必须传，理由见 <script> 里 indentWidth 的注释：
+               Monaco 的 tabSize 是全进程共享的，不传就会把主编辑器的缩进一起拉回 2。 -->
           <CodeEditor
             v-if="showDebugDialog"
             v-model="debugCode"
             :language="editorLanguage"
+            :indent-width="indentWidth"
             min-height="0"
             style="height: 100%; min-height: 0"
             @update:modelValue="markDebugCodeChanged"

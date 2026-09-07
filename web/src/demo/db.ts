@@ -353,19 +353,28 @@ export function taskSortGroup(status: number): number {
   return status === TASK_STATUS_ENABLED || status === TASK_STATUS_RUNNING || status === 0.5 ? 0 : 2
 }
 
+/**
+ * 默认排序的比较器，复刻服务端的 defaultTaskListLess。
+ *
+ * 抽成具名函数是因为它有两个调用方：默认排序本身，以及带 sort_rules 时「规则全平手」的回落——
+ * 服务端那两处也是同一个函数（sortPreparedTaskListItems 末尾直接调 defaultTaskListLess）。
+ * 两处各写一份的话，会漂成「按某一列排序时的平手顺序和不排序时不一样」。
+ */
+function compareTasksByDefault(left: DemoTask, right: DemoTask): number {
+  if (left.is_pinned !== right.is_pinned) return left.is_pinned ? -1 : 1
+  const groupDiff = taskSortGroup(left.status) - taskSortGroup(right.status)
+  if (groupDiff !== 0) return groupDiff
+  // list_order（拖拽顺序）插在 sort_order 之前，与服务端一致。
+  // 存量数据全是 0 ⇒ 这一步全平手、顺序完全由 sort_order 决定，行为与加这个字段之前一致。
+  if (left.list_order !== right.list_order) return left.list_order - right.list_order
+  if (left.sort_order !== right.sort_order) return left.sort_order - right.sort_order
+  if (left.created_at !== right.created_at) return right.created_at.localeCompare(left.created_at)
+  return right.id - left.id
+}
+
 /** 默认排序：置顶优先 → 启用/运行 在前、禁用在后 → list_order → sort_order → 创建时间倒序 */
 export function sortTasks(rows: DemoTask[]): DemoTask[] {
-  return [...rows].sort((left, right) => {
-    if (left.is_pinned !== right.is_pinned) return left.is_pinned ? -1 : 1
-    const groupDiff = taskSortGroup(left.status) - taskSortGroup(right.status)
-    if (groupDiff !== 0) return groupDiff
-    // list_order（拖拽顺序）插在 sort_order 之前，与服务端一致。
-    // 存量数据全是 0 ⇒ 这一步全平手、顺序完全由 sort_order 决定，行为与加这个字段之前一致。
-    if (left.list_order !== right.list_order) return left.list_order - right.list_order
-    if (left.sort_order !== right.sort_order) return left.sort_order - right.sort_order
-    if (left.created_at !== right.created_at) return right.created_at.localeCompare(left.created_at)
-    return right.id - left.id
-  })
+  return [...rows].sort(compareTasksByDefault)
 }
 
 /**
@@ -375,7 +384,11 @@ export function sortTasks(rows: DemoTask[]): DemoTask[] {
  * 生效条件（非禁用 + cron 类型 + 表达式非空）与 toTaskDict 保持一致，
  * 否则会出现「列表里显示有下次运行、排序却把它当成空值沉底」。
  *
- * 🔴 空值语义：从未运行 / 没有下次运行的任务【恒排最后，不随 asc/desc 翻转】。
+ * 🔴 分区语义：置顶与状态分组【压在排序规则之上】，规则只在同一分区内生效。
+ *    少了这两层的表现是「点一下最后运行倒序，置顶任务被冲散、禁用任务混进启用任务中间」——
+ *    而不带排序规则时它们规规矩矩地待在各自的区里，同一个列表两副面孔。
+ *
+ * 🔴 空值语义：从未运行 / 没有下次运行的任务【在各自分区内恒排最后，不随 asc/desc 翻转】。
  *    这段判定必须写在方向翻转【之前】——写在后面的话降序时一堆 `-` 会全冒到最前面。
  */
 function sortTasksByTimeField(
@@ -400,13 +413,22 @@ function sortTasksByTimeField(
   }
 
   return [...rows].sort((left, right) => {
+    // 两层分区先走，与服务端 sortPreparedTaskListItems 的口径一致：
+    // 置顶是用户主动设置的展示优先级，状态分组决定「能跑的在上、禁用的在下」，
+    // 这两件事都不该被一次列排序推翻，所以它们压在下面的时间比较之上。
+    if (left.is_pinned !== right.is_pinned) return left.is_pinned ? -1 : 1
+    const groupDiff = taskSortGroup(left.status) - taskSortGroup(right.status)
+    if (groupDiff !== 0) return groupDiff
+
     const leftValue = values.get(left.id) ?? null
     const rightValue = values.get(right.id) ?? null
-    if (leftValue === null && rightValue === null) return right.id - left.id
+    // 两边都没有值 / 值完全相同 ⇒ 这条规则给不出顺序，回落默认排序（拖拽顺序 > 手工顺序 > 创建时间），
+    // 与服务端「comparePreparedTaskByRule 返回 0 就走 defaultTaskListLess」逐字一致。
+    if (leftValue === null && rightValue === null) return compareTasksByDefault(left, right)
     if (leftValue === null) return 1
     if (rightValue === null) return -1
     if (leftValue !== rightValue) return direction === 'desc' ? rightValue - leftValue : leftValue - rightValue
-    return right.id - left.id
+    return compareTasksByDefault(left, right)
   })
 }
 

@@ -409,6 +409,62 @@ panel.add_or_update_env(
         responseExample: JSON.stringify({ message: '密码修改成功' }, null, 2),
       },
       {
+        id: 'auth-preferences-get',
+        method: 'GET',
+        path: '/api/auth/preferences',
+        title: '获取当前用户的界面偏好',
+        description: '读取当前登录用户自己的界面偏好，目前只有编辑器（脚本编辑 / 日志查看）那一组开关。⚠️ 这是【按用户】的偏好，不是全面板配置：每个账号各存一份、互不影响，也不在 /api/configs 里。鉴权只要求 JWTAuth、不限角色——operator / viewer 同样能读写自己那份，改自己的编辑器开关不该要管理员权限（对比 /api/configs 那组是管理员独占）。从没存过偏好的用户直接返回下面这份默认值，不会 404，但会带上 stored=false（见响应字段，这是升级路径的关键）。⚠️ 编辑器引擎（CodeMirror / Monaco）刻意【不在】这里：它带着设备自适应语义（触摸设备与窄屏硬回落 CodeMirror），只存在浏览器本地——引擎跟设备走，偏好跟人走。',
+        auth: 'jwt',
+        responseExample: JSON.stringify({
+          editor: {
+            word_wrap: 'on',
+            minimap: false,
+            indent_guides: true,
+            whitespace: 'selection',
+            indent_width: 'auto',
+          },
+          stored: false,
+        }, null, 2),
+        responseFields: [
+          { name: 'editor.word_wrap', type: 'string', description: '自动换行，取值 on / off，默认 on' },
+          { name: 'editor.minimap', type: 'boolean', description: '缩略图开关，JSON 布尔，默认 false。只对 Monaco 引擎生效（CodeMirror 没有缩略图）' },
+          { name: 'editor.indent_guides', type: 'boolean', description: '缩进参考线开关，JSON 布尔，默认 true' },
+          { name: 'editor.whitespace', type: 'string', description: '空白符显示，取值 none（从不）/ selection（仅选中）/ all（始终），默认 selection' },
+          { name: 'editor.indent_width', type: 'string', description: '缩进宽度，取值 auto / 2 / 4 / 6 / 8，默认 auto（按文件内容自动检测）。⚠️ 传输层是字符串，是 "4" 不是 4' },
+          { name: 'stored', type: 'boolean', description: '服务端是否真的存过这个用户的偏好。判定口径：有这个用户的记录 且 记录里的偏好能解析成 JSON 对象 → true；没有记录 / 空串 / 脏 JSON 一律 false（后两种当成「没存过」）。⚠️ 它是给客户端做升级路径判断用的：stored=false 说明服务端还没有这个用户的记录，此时客户端应当把【本机】那份偏好一次性 PUT 上去做上行迁移，而不是拿下面 editor 里这套默认值去覆盖本机——照着覆盖的话，老用户升级到有服务端偏好的版本时，本机调好的开关会在首屏被静默冲掉。stored=true 才允许拿 editor 的值写回本地。注意 editor 字段本身不受 stored 影响：无论 stored 是什么都下发一整套可用的值，不认得 stored 的老客户端行为与加这个字段之前逐字一致' },
+        ],
+      },
+      {
+        id: 'auth-preferences-update',
+        method: 'PUT',
+        path: '/api/auth/preferences',
+        title: '更新当前用户的界面偏好',
+        description: '更新当前登录用户自己的界面偏好。⚠️ 字段级合并：body 里只放要改的键，没传的键保持原值、不会被重置成默认值——面板自己就是这么用的（改一个开关只提交那一个键），两个标签页各改各的开关不会互相覆盖。鉴权同 GET：JWTAuth、不限角色，改的永远是调用者自己那份，没有「替别人改」的入口。任一字段取值非法返回 400，不做静默纠正。响应体是合并之后的完整偏好，与 GET 逐字同形。',
+        auth: 'jwt',
+        bodyParams: [
+          { name: 'editor', type: 'object', required: true, description: '编辑器偏好，取下面 5 个键的任意子集', example: '{ "whitespace": "all" }' },
+          { name: 'editor.word_wrap', type: 'string', description: '自动换行，取值 on / off', example: 'on' },
+          { name: 'editor.minimap', type: 'boolean', description: '缩略图开关（只对 Monaco 引擎生效）。写入时是 JSON 布尔——面板前端提交的就是布尔；另外也接受 "on" / "off" / "true" / "false" 字符串，那是留给 APP 与历史客户端的。读出来统一是 JSON 布尔', example: 'false' },
+          { name: 'editor.indent_guides', type: 'boolean', description: '缩进参考线开关。写入时是 JSON 布尔（面板前端提交的就是布尔），同样兼容 "on" / "off" / "true" / "false" 字符串以照顾 APP 与历史客户端。读出来统一是 JSON 布尔', example: 'true' },
+          { name: 'editor.whitespace', type: 'string', description: '空白符显示，字符串，取值 none / selection / all', example: 'all' },
+          { name: 'editor.indent_width', type: 'string', description: '缩进宽度，字符串，取值 auto / 2 / 4 / 6 / 8。⚠️ 传输层是字符串，要传 "4" 不是 4', example: 'auto' },
+        ],
+        responseExample: JSON.stringify({
+          editor: {
+            word_wrap: 'on',
+            minimap: false,
+            indent_guides: true,
+            whitespace: 'all',
+            indent_width: 'auto',
+          },
+          stored: true,
+        }, null, 2),
+        responseFields: [
+          { name: 'editor', type: 'object', description: '合并之后的完整偏好，字段说明见「获取当前用户的界面偏好」' },
+          { name: 'stored', type: 'boolean', description: '恒为 true——写完这一次，服务端必然已经有这个用户的记录了。含义与 GET 的 stored 相同（有记录且能解析 → true），客户端据此判断「服务端还没有这个用户的记录」并决定要不要做本机偏好上行迁移；PUT 之后这个判断的答案只可能是「已经有了」' },
+        ],
+      },
+      {
         id: 'auth-2fa-status',
         method: 'GET',
         path: '/api/security/2fa/status',
@@ -481,7 +537,7 @@ panel.add_or_update_env(
           { name: 'page_size', type: 'integer', description: '每页数量，默认 20', example: '20' },
           { name: 'label', type: 'string', description: '按标签模糊匹配（labels LIKE %值%）。分组要连前缀一起传，例如「分组:日常」，只传「日常」会把普通标签也捞进来' },
           { name: 'filters', type: 'string', description: '任务视图的筛选规则，JSON 字符串数组 [{field,operator,value}]。field 可选 command / name / cron_expression / status / labels / subscription；operator 可选 contains / not_contains / equals / not_equals；匹配一律先 trim 再转小写、不是正则；多条之间是 AND。status 的 value 用 1（已启用）/ 0（已禁用）/ 2（运行中）/ 0.5（排队中）。value 为空的规则会被整条丢弃，JSON 解析失败则静默降级为不筛选', example: '[{"field":"command","operator":"contains","value":"jd"}]' },
-          { name: 'sort_rules', type: 'string', description: '任务视图的排序规则，JSON 字符串数组 [{field,direction}]。field 可选 name / command / cron_expression / status / labels / subscription / created_at / last_run_at / next_run_at；direction 只认 desc，其它一律按 asc；多条按先后做 tie-break，全平手回落默认排序（置顶 > 状态 > 拖拽顺序 > 手工顺序）。last_run_at（最后运行）与 next_run_at（下次运行）是任务列表页两列的点击排序：next_run_at 不是数据库列，是按 cron 现算的快照，只能在内存里排；这两个字段的空值（从未运行、已禁用或非 cron 因而没有下次运行）一律排在最后，不随 asc/desc 翻转。未知 field 静默回落默认排序，不报 400', example: '[{"field":"next_run_at","direction":"asc"}]' },
+          { name: 'sort_rules', type: 'string', description: '任务视图的排序规则，JSON 字符串数组 [{field,direction}]。field 可选 name / command / cron_expression / status / labels / subscription / created_at / last_run_at / next_run_at；direction 只认 desc，其它一律按 asc。⚠️ 置顶与状态分组【压在排序规则之上】，排序规则只在同一分区内生效：先按置顶分区（置顶的整体在前），再按状态分区（启用/排队中/运行中一组、禁用一组、其余一组），所以「按最后运行倒序」不会把置顶任务冲散、也不会把禁用任务混进启用任务中间。⚠️ 状态分区有一条【豁免】：当 sort_rules 的【第一条】规则 field = "status" 时，状态分区不生效，整份列表按 status 值原样排序（置顶分区仍然生效，不受影响）。理由是状态分区本身就是按 status 分的，再按 status 排一次等于自相矛盾——用户显式点了「按状态排序」，拿到的却是被状态分区钉死的固定组序。只看第一条是因为它才代表用户的主排序意图，第二条起是 tie-break。分区内多条规则按先后做 tie-break，全平手再回落 拖拽顺序（list_order）> 手工顺序（sort_order）> 创建时间。last_run_at（最后运行）与 next_run_at（下次运行）是任务列表页两列的点击排序：next_run_at 不是数据库列，是按 cron 现算的快照，只能在内存里排；这两个字段的空值（从未运行、已禁用或非 cron 因而没有下次运行）在各自分区内一律排最后，不随 asc/desc 翻转。未知 field 静默回落默认排序，不报 400', example: '[{"field":"next_run_at","direction":"asc"}]' },
         ],
         responseExample: JSON.stringify({
           data: [{
@@ -579,7 +635,7 @@ panel.add_or_update_env(
         method: 'PUT',
         path: '/api/tasks/sort',
         title: '调整任务列表顺序',
-        description: '任务列表页的拖拽排序，需要 operator 及以上角色。把 source_id 挪到 target_id 前面（position=after 时挪到后面）；不传 target_id 表示移到本区末尾。这里改的是 list_order（列表展示顺序），不是 sort_order（开机运行任务的执行顺序），两者互不影响。只允许同一「区」内互拖：区 = 置顶状态相同 且 状态分组相同（启用/运行中/排队中算一组、禁用一组），跨区返回 400「置顶任务与普通任务、启用与禁用任务请分别排序，跨区移动请用置顶 / 启用按钮」。兄弟任务取的是整个区（不是当前页），所以跨页拖拽同样有效；一次调用会把该区整体按 10 的步长重编号，其它区的值不动。注意 GET /api/tasks 带了 sort_rules 时展示顺序由排序规则决定，list_order 不参与，此时拖拽没有意义。',
+        description: '任务列表页的拖拽排序，需要 operator 及以上角色。把 source_id 挪到 target_id 前面（position=after 时挪到后面）；不传 target_id 表示移到本区末尾。这里改的是 list_order（列表展示顺序），不是 sort_order（开机运行任务的执行顺序），两者互不影响。只允许同一「区」内互拖：区 = 置顶状态相同 且 状态分组相同（启用/运行中/排队中算一组、禁用一组），跨区返回 400「置顶任务与普通任务、启用与禁用任务请分别排序，跨区移动请用置顶 / 启用按钮」。兄弟任务取的是整个区（不是当前页），所以跨页拖拽同样有效；一次调用会把该区整体按 10 的步长重编号，其它区的值不动。注意 GET /api/tasks 带了 sort_rules 时，区的划分不变（排序规则同样只在分区内生效），但区内顺序由排序规则决定，list_order 只在规则全平手时才兜底，此时拖拽多半看不出效果。唯一的例外是 sort_rules 第一条规则 field = "status"：那种情况下列表侧的状态分区不生效（详见 GET /api/tasks 的 sort_rules 说明），但本接口的「区」定义不受影响 —— 能不能拖仍然按置顶 + 状态分组判定。',
         auth: 'jwt',
         bodyParams: [
           { name: 'source_id', type: 'integer', required: true, description: '被拖动的任务 ID', example: '12' },

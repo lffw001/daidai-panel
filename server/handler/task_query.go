@@ -567,13 +567,54 @@ func taskStatusFilterAlias(status float64) string {
 }
 
 func sortPreparedTaskListItems(items []preparedTaskListItem, sortRules []taskListSortRule) {
+	// 「首要排序字段就是 status」时豁免状态分区 —— 状态分区本身就是按 status 分的，
+	// 再按 status 排一次是自相矛盾：分区把 {空闲,排队,运行} 归一组、{禁用} 归另一组，
+	// 组内再按 status 升序，读出来是 0.5 → 1 → 2 → 0（禁用的 0 反而在最后），
+	// 一个标着「升序」的排序数值上并不递增；翻成降序又是 2 → 1 → 0.5 → 0，
+	// 禁用照样垫底 —— 对禁用任务而言 asc/desc 这个开关完全失效。
+	// 用户选「按状态排序」，要的就是纯粹按状态值排，这时分区不该再插一脚。
+	//
+	// 判据只看**第一条**规则，不是「任意一条规则里有 status」：
+	// status 当次级 tie-break（比如先按名称、名称相同再按状态）时，
+	// 先分区、再在区内 tie-break 才是对的，那种情况不能豁免。
+	//
+	// 置顶分区**不**豁免：置顶是用户主动设置的展示优先级，与状态语义无关，
+	// 按任何字段排序时它都留在最前（口径同 applyDefaultTaskListOrdering / defaultTaskListLess）。
+	//
+	// 提到比较器外面算一次：这个判定和被比较的两条任务无关，
+	// 放进比较器里每次比较都要重算一遍，纯属白费。
+	skipStatusGrouping := len(sortRules) > 0 && sortRules[0].Field == "status"
+
 	sort.SliceStable(items, func(i, j int) bool {
 		left := items[i]
 		right := items[j]
 
+		// 置顶区与状态分区必须压在所有排序规则【之上】，而不是等规则全部打平之后才轮到。
+		// 分区是列表的骨架，排序规则只决定「同一个区内部怎么排」：
+		// 点一下「最后运行」倒序，用户要的是「最近跑过的启用任务排前面」，
+		// 不是「刚被禁用、恰好留着最新 last_run_at 的任务冲到第一行」。
+		// 口径与默认排序（applyDefaultTaskListOrdering 的 SQL 与 defaultTaskListLess）逐条一致：
+		// 先置顶、再 taskSortGroup（空闲/排队/运行 → 禁用 → 其他），复用同一个 taskSortGroup，
+		// 免得内存排序和 SQL 排序各写一份分组口径、日后漂掉。
+		// 置顶之所以要排在状态分组前面：置顶是用户主动设置的展示优先级，
+		// 置顶的禁用任务在默认排序里也留在置顶区，这里翻转的话会出现
+		// 「默认排序在最上、点一下列排序掉到最下」的自相矛盾。
+		// 唯一的例外是「首要排序字段就是 status」，见 skipStatusGrouping：
+		// 那条规则的语义本来就是按状态值排，状态分区会把它压成非单调序列。
+		if left.task.IsPinned != right.task.IsPinned {
+			return left.task.IsPinned
+		}
+		// skipStatusGrouping 见函数开头：首要排序字段就是 status 时跳过这一层，
+		// 否则「按状态升序」读出来的状态值序列并不递增。
+		if !skipStatusGrouping {
+			if leftGroup, rightGroup := taskSortGroup(left.task.Status), taskSortGroup(right.task.Status); leftGroup != rightGroup {
+				return leftGroup < rightGroup
+			}
+		}
+
 		for _, rule := range sortRules {
 			// last_run_at / next_run_at 允许没有值：从未运行过、已禁用、非 cron 任务都算不出时间。
-			// 这类任务一律沉到最后，且【不跟随 asc/desc 翻转】——
+			// 这类任务一律沉到【本区】最后（分区在上面已经分完了），且【不跟随 asc/desc 翻转】——
 			// 所以空值判定必须写在下面翻转 direction 之前。写在后面的话，
 			// 用户点「按下次运行倒序」想看最晚要跑的，结果一整屏全是压根不会跑的禁用任务。
 			if rule.Field == "last_run_at" || rule.Field == "next_run_at" {
@@ -622,7 +663,7 @@ func comparePreparedTaskByRule(left, right preparedTaskListItem, rule taskListSo
 		}
 		return 0
 	case "last_run_at", "next_run_at":
-		// 走到这里时空值情况已经在 sortPreparedTaskListItems 里判掉了（恒排最后、不随方向翻转），
+		// 走到这里时空值情况已经在 sortPreparedTaskListItems 里判掉了（恒排本区最后、不随方向翻转），
 		// 剩下的要么两边都有值、要么两边都为空 —— 后者按相等处理，退回默认序。
 		leftTime := preparedTaskRuleTime(left, rule.Field)
 		rightTime := preparedTaskRuleTime(right, rule.Field)

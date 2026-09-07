@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, watch } from "vue";
-import { defineMonacoTheme, resolveMonacoLanguage } from "@/utils/codeEditor";
+import {
+  defineMonacoTheme,
+  detectIndentWidth,
+  resolveMonacoLanguage,
+} from "@/utils/codeEditor";
 import { PANEL_APPEARANCE_CHANGE_EVENT } from "@/utils/panelAppearance";
 // ⚠️ 只能是 `import type`：MonacoApi 是纯类型，type 关键字保证这一行被 TS 完全擦掉、
 // 不产生任何运行时导入。漏掉它就等于给本文件加了一条对 monacoEngine 的静态 import，
@@ -36,18 +40,33 @@ const props = withDefaults(
     fillHeight?: boolean;
     /** 自动换行。默认 'on'，与 CodeMirror 侧一致。 */
     wordWrap?: "on" | "off";
-    /** 右侧代码缩略图。默认 false（默认值三条与 CodeMirror 侧逐字对齐）。 */
+    /**
+     * 右侧代码缩略图。默认 false。
+     * 🔴 v3.2.4 起这一项**只有本引擎真的实现**：CodeMirror 侧那份自绘缩略图
+     * （utils/codeMinimap.ts）已经删掉，那边的同名 prop 是刻意留空的 no-op。
+     * 这是「两个引擎 props 逐字相同」这条契约唯一开的例外，理由写在 CodeMirrorEditor.vue
+     * 那个 prop 的注释里。Monaco 的缩略图是它自己原生画的，白送，没有删的理由。
+     */
     minimap?: boolean;
     /** 缩进参考线。默认 false（偏好本身的默认值是开，由页面侧决定） */
     indentGuides?: boolean;
-    /** 显示空白符：空格画灰点、Tab 画箭头。默认 false */
-    showWhitespace?: boolean;
+    /**
+     * 显示空白符三态（issue #116-4）。默认 'none'。
+     * 取值与 Monaco 原生的 renderWhitespace 逐字相同，直接透传下去。
+     */
+    whitespace?: "none" | "selection" | "all";
+    /**
+     * 缩进宽度（issue #116-1/3）。默认 2，与改造前写死的 tabSize: 2 一致。
+     * 'auto' 表示按文档内容检测（detectIndentWidth），页面侧的偏好默认就是 'auto'。
+     */
+    indentWidth?: "auto" | number;
   }>(),
   {
     wordWrap: "on",
     minimap: false,
     indentGuides: false,
-    showWhitespace: false,
+    whitespace: "none",
+    indentWidth: 2,
   },
 );
 
@@ -67,6 +86,8 @@ const EDITOR_FONT_FAMILY =
 // 从 create() 的返回值反推实例类型，而不是 import Monaco 的 IStandaloneCodeEditor：
 // 全仓只有 utils/monacoEngine.ts 可以出现 `from 'monaco-editor/...'`（见那个文件顶部）。
 type MonacoStandaloneEditor = ReturnType<MonacoApi["editor"]["create"]>;
+// 同理再从 getModel() 反推模型类型（去掉它的 null 分支），不去 import Monaco 的 ITextModel。
+type MonacoTextModel = NonNullable<ReturnType<MonacoStandaloneEditor["getModel"]>>;
 
 const editorRef = ref<HTMLElement>();
 let editor: MonacoStandaloneEditor | null = null;
@@ -75,8 +96,18 @@ let editor: MonacoStandaloneEditor | null = null;
 let monacoApi: MonacoApi | null = null;
 // onDidChangeModelContent 的订阅句柄。类型写成结构化最小形状，理由同上（不引 IDisposable）。
 let contentSubscription: { dispose(): void } | null = null;
+// model.onDidChangeOptions 的订阅句柄，即下面那个「缩进宽度自愈守卫」。类型同上。
+let modelOptionsSubscription: { dispose(): void } | null = null;
 // 组件是否已卸载。onMounted 是 async 的，见下面 create 前那道守卫。
 let destroyed = false;
+
+/**
+ * 本实例**期望**的缩进宽度，也就是自愈守卫判断「model 被别人改坏了」的唯一基准。
+ * 每一条会写 model tabSize 的路径都必须顺带更新它：
+ * create 的 options 那一次在 onMounted 里显式对齐，其余全部走 applyIndentWidth。
+ * 初值 2 与 props.indentWidth 的默认值一致（也就是加这个功能之前两个引擎写死的值）。
+ */
+let desiredIndentWidth = 2;
 
 /**
  * 定义并应用主题。
@@ -103,12 +134,110 @@ function syncEditorTheme() {
   applyEditorTheme(monacoApi);
 }
 
+/**
+ * 解析出本次要用的缩进宽度。与 CodeMirrorEditor.vue 的同名函数逐字同构。
+ * 'auto' 走内容检测；数字直接用，非法值兜回 2。
+ */
+function resolveIndentWidth(doc: string) {
+  if (props.indentWidth === "auto") {
+    return detectIndentWidth(doc);
+  }
+  return Number.isInteger(props.indentWidth) && props.indentWidth > 0
+    ? props.indentWidth
+    : 2;
+}
+
+/**
+ * 应用缩进宽度。**两处都要写**：
+ * tabSize 既是编辑器选项、又是**模型**选项，而真正决定「\t 显示多宽 / 一级缩进插几个空格」的
+ * 是挂在模型上的那份。只调 editor.updateOptions 的表现是「改了没反应」，不报错。
+ * indentSize 跟着 tabSize 走（Monaco 允许两者不同，我们这个面板没有分开配的需求）。
+ *
+ * 🔴 但第一句 editor.updateOptions({ tabSize }) 同时是一个**全进程副作用**，别当冗余删掉。
+ * monaco-editor 0.56 的 standaloneCodeEditor 在 create（standaloneCodeEditor.js:184）与
+ * updateOptions（:218）里都会调 updateConfigurationService(...)，把 tabSize 写进**全局**那个
+ * StandaloneConfigurationService（editor.tabSize 是 editorConfigurationSchema 里注册过的配置键）。
+ * 全局配置一变，services/modelService.js:162 的 _updateModelOptions 会遍历**当前所有活着的
+ * model**，在 _setModelOptionsForModel(:180-209) 里把新的 tabSize / indentSize 推给每一个。
+ * 也就是说：本实例设一次缩进宽度，会顺手把同一页上**别的** Monaco 实例的 model 一起改掉
+ * ——改造前 tabSize 处处写死 2、全局只有一个值，所以看不出来；indent_width 变成可配之后
+ * 这条就浮出水面了。反向的受害路径与修法见 installModelOptionsGuard。
+ *
+ * ⚠️ 反过来「把 tabSize 从 create 的 options 里拿掉、只留 model.updateOptions」并不能修这个问题，
+ * 别照那个方向改：建 model 时 ModelService 用的缓存键是 `language + undefined`、
+ * _updateModelOptions 用的是 `language + uri`，首次必然对不上，于是 _setModelOptionsForModel
+ * 在 oldOptions 为 undefined 时不会 early-return，会把**全局配置里的** tabSize 直接盖到新 model 上。
+ * 现在这里全局与 model 两处一起写，恰好让那条路径无害（盖上来的正是我们刚写进去的值）。
+ */
+function applyIndentWidth(width: number) {
+  desiredIndentWidth = width;
+  editor?.updateOptions({ tabSize: width });
+  editor?.getModel()?.updateOptions({ tabSize: width, indentSize: width });
+}
+
+/**
+ * 给本实例的 model 装一个「缩进宽度自愈守卫」，返回订阅句柄（卸载时必须 dispose）。
+ *
+ * 要挡的就是 applyIndentWidth 注释里那条全进程副作用的**反向**：别的 Monaco 实例
+ * create / updateOptions 时改了全局配置，ModelService 再把新的 tabSize 广播给所有活着的
+ * model —— 包括我们这一个。两条真实触发路径：
+ *   A. 脚本页开着一个 4 空格 Python 脚本（自动检测得 4，状态条显示 Tab 4）→ 点「调试运行」，
+ *      ScriptExecutionDialogs.vue 里那个 <CodeEditor> 没传 indent-width、吃默认值 2 →
+ *      它以 tabSize: 2 create → 全局值从 4 变 2 → 主编辑器那个**还活着的** model 被一起刷成 2。
+ *      关掉弹窗也不会还原：正文按 2 列画参考线、按 Tab 只插 2 个空格，
+ *      而齿轮菜单和状态条仍然写着 Tab 4。
+ *   B. 不用弹窗也能中：脚本页与配置文件页都被 keep-alive，两个实例同时活着。
+ *      配置文件（2 空格 shell）先打开 → 全局 2；切到脚本页打开 4 空格脚本 → 全局 4 →
+ *      配置文件页那个 model 跟着变 4；切回配置文件页时 keep-alive 不重建、内容没变
+ *      也就不走 replaceValue，于是 2 空格的文件按 4 列画参考线。
+ * CodeMirror 侧没有这个毛病（Compartment 是实例级的），所以同一个操作在两个引擎下表现
+ * 不一致，更难被认出来。
+ *
+ * 修法：一旦发现本实例 model 的缩进宽度不是自己想要的，就用 **model 级**的
+ * model.updateOptions 顶回来 —— 它只改这一个 model、**不写全局配置**，
+ * 所以两个实例之间不会互相推来推去（谁被改坏谁自己顶回去，各修各的）。
+ *
+ * ⚠️ 不会死循环，这一点别怀疑、更别为此把守卫删掉：顶回去之后值已经相等，
+ * 事件即使再触发一次，也会在下面那道判等处直接 return。而且 TextModel.updateOptions 只在真的有字段
+ * 变化时才 fire，写入相同的值连事件都不会发；它还是**先**更新 _options 再 fire 的，
+ * 所以哪怕同步重入，重入的那一层读到的也已经是新值。
+ *
+ * ⚠️ 订阅的是**传进来的这一个 model**。本仓换文档走 editor.setValue()（见 replaceValue）、
+ * 换语言走 setModelLanguage()，两条路都不换 model 对象，所以一次订阅够用；
+ * 哪天真改成 editor.setModel(newModel)，这里必须跟着重新订阅（旧的先 dispose）。
+ */
+function installModelOptionsGuard(model: MonacoTextModel) {
+  return model.onDidChangeOptions(() => {
+    // 卸载顺序上先摘订阅再 dispose model，正常走不到这里；留一道守卫免得将来顺序被人调换后
+    // 在一个已 dispose 的 model 上调 getOptions() 抛错。
+    if (model.isDisposed()) return;
+    const options = model.getOptions();
+    if (
+      options.tabSize === desiredIndentWidth &&
+      options.indentSize === desiredIndentWidth
+    ) {
+      return;
+    }
+    model.updateOptions({
+      tabSize: desiredIndentWidth,
+      indentSize: desiredIndentWidth,
+    });
+  });
+}
+
 // 写回文档前先比一次：setValue 会触发 onDidChangeModelContent，
 // 不比就和父组件转成回环（CodeMirror 侧的 replaceDoc 是同一个思路）。
 function replaceValue(value: string) {
   if (!editor) return;
   if (editor.getValue() === value) return;
   editor.setValue(value);
+  // 与 CodeMirror 侧 replaceDoc 同一条规则：外部整体换文档时，「自动」档按新内容重测一次。
+  // 这一条是 issue #116-1 的另一半 —— 页面是「先挂编辑器、再 await 拉内容」的，
+  // create 那一刻文档还是空串，不在这里补测的话「自动」永远停在兜底的 2。
+  // 用户自己打字触发的那次会在上面那条判等提前 return，走不到这里。
+  if (props.indentWidth === "auto") {
+    applyIndentWidth(detectIndentWidth(value));
+  }
 }
 
 onMounted(async () => {
@@ -130,6 +259,11 @@ onMounted(async () => {
   // 不会先闪一下 Monaco 自带的 vs / vs-dark。
   applyEditorTheme(monaco);
 
+  // create 的 options 里那个 tabSize 是唯一不走 applyIndentWidth 的写入路径，
+  // 所以在这里显式对齐一次自愈守卫的基准值。少了这一句，守卫会拿着初值 2
+  // 去「纠正」一个本来就正确的 4 —— 那就从修 bug 变成造 bug 了。
+  desiredIndentWidth = resolveIndentWidth(props.modelValue);
+
   editor = monaco.editor.create(editorRef.value, {
     value: props.modelValue,
     language: resolveMonacoLanguage(props.language),
@@ -137,10 +271,10 @@ onMounted(async () => {
     wordWrap: props.wordWrap,
     minimap: { enabled: props.minimap },
     guides: { indentation: props.indentGuides },
-    // ⚠️ 必须显式给：renderWhitespace 的默认值是 'selection'（只在选中时显示），
-    // 不写的话「显示空白符」这个开关关掉时看着正常、打开时也看着正常，
-    // 但关掉的状态其实是「选中才显示」而不是「不显示」，等于功能没生效。
-    renderWhitespace: props.showWhitespace ? "all" : "none",
+    // ⚠️ 必须显式给：renderWhitespace 的默认值是 'selection'，不写就等于永远停在中间那档。
+    // v3.2.4 起这一项是三态（none / selection / all），取值与 Monaco 原生逐字相同，直接透传；
+    // CodeMirror 侧没有 'selection' 这一档，是自己写的（utils/selectionWhitespace.ts）。
+    renderWhitespace: props.whitespace,
     // ⚠️ 也必须显式给：renderLineHighlight 的默认值是 'line'，只涂内容区、**不涂行号栏那一格**。
     // 而 CodeMirror 侧同时开了 highlightActiveLine() 与 highlightActiveLineGutter()，
     // 主题里 .cm-activeLine 与 .cm-activeLineGutter 两处铺的是同一个底色。
@@ -150,8 +284,26 @@ onMounted(async () => {
     // 让 Monaco 自己装 ResizeObserver 盯容器尺寸：三个调用点的高度都由外层 flex 链决定
     // （撑满卡片 / 撑满弹窗），不给这条就得自己在每次布局变化时调 layout()。
     automaticLayout: true,
-    // 缩进 2 空格，与 CodeMirror 侧的 indentUnit.of("  ") + EditorState.tabSize.of(2) 对齐
-    tabSize: 2,
+    /*
+     * 🔴 detectIndentation 必须显式关掉，这是 issue #116-1「F5 之后缩进随机 2 或 4」的**根治点**，
+     * 别当成一个「没用的 false」顺手删掉 —— 删了当场复发，而且是概率性的，很难查。
+     *
+     * 成因有两条，给了这个 false 之后两条同时消失：
+     *   1. 它默认是 true，只在 **TextModel 构造那一瞬间**按内容猜一次 tabSize
+     *      （`setValue()` 永远不会重猜）。而页面是「先挂编辑器、再 await 拉脚本内容」的：
+     *      两个异步谁先到就决定了它猜的是空串（→ 兜底 4，再被下面的 tabSize 盖成 2）
+     *      还是真实的 4 空格脚本（→ 4）。同一份文件刷两次能得到两个结果。
+     *   2. Monaco 的 ModelService 有个缓存键不一致的坑：**任何**一次带 wordWrap /
+     *      renderWhitespace 之类选项的 updateOptions()，都会顺带触发一次
+     *      model.detectIndentation() 重猜 —— 也就是「点一下自动换行，缩进宽度自己变了」。
+     *
+     * 关掉之后缩进宽度只有一个来源：下面这个 tabSize（'auto' 档由 detectIndentWidth 自己算，
+     * 两个引擎共用同一份判断）。
+     */
+    detectIndentation: false,
+    // 缩进宽度。与 CodeMirror 侧的 indentUnit + EditorState.tabSize 吃的是同一个解析结果。
+    // 用上面刚算好的那份，不在这里重算一次：两处必须是同一个值（见 desiredIndentWidth 的注释）。
+    tabSize: desiredIndentWidth,
     insertSpaces: true,
     fontSize: 14,
     fontFamily: EDITOR_FONT_FAMILY,
@@ -159,6 +311,13 @@ onMounted(async () => {
     // 多出一屏空白只会让人以为内容没加载完
     scrollBeyondLastLine: false,
   });
+
+  // 装上缩进宽度自愈守卫。必须在 create 之后拿 model：standalone editor 是自己建 model 的，
+  // create 之前根本没有这个对象。理由与死循环疑虑见 installModelOptionsGuard 的注释。
+  const createdModel = editor.getModel();
+  if (createdModel) {
+    modelOptionsSubscription = installModelOptionsGuard(createdModel);
+  }
 
   contentSubscription = editor.onDidChangeModelContent(() => {
     const value = editor?.getValue() ?? "";
@@ -225,11 +384,22 @@ watch(
   },
 );
 
-// 同 create 时那条：关掉必须给 'none'，给回默认的 'selection' 等于没关干净
+// 三态直接透传，Monaco 原生就认这三个值
 watch(
-  () => props.showWhitespace,
-  (enabled) => {
-    editor?.updateOptions({ renderWhitespace: enabled ? "all" : "none" });
+  () => props.whitespace,
+  (mode) => {
+    editor?.updateOptions({ renderWhitespace: mode });
+  },
+);
+
+// 缩进宽度。读的是编辑器里当下的文档而不是 props.modelValue：两者在同一帧里可能还没同步，
+// 而「自动」档要按编辑器**真正显示着的**内容来测。
+// （另外两个重算时机：create 的 options 里一次、外部整体换文档时在 replaceValue 里一次。）
+watch(
+  () => props.indentWidth,
+  () => {
+    if (!editor) return;
+    applyIndentWidth(resolveIndentWidth(editor.getValue()));
   },
 );
 
@@ -240,6 +410,10 @@ onBeforeUnmount(() => {
   window.removeEventListener(PANEL_APPEARANCE_CHANGE_EVENT, syncEditorTheme);
   contentSubscription?.dispose();
   contentSubscription = null;
+  // 缩进宽度自愈守卫也必须在这里摘掉，而且要摘在下面 dispose model **之前**：
+  // 它的回调闭包持着那个 model，漏掉就是每开一个文件泄漏一份订阅（表现同样是「用久了才吃内存」）。
+  modelOptionsSubscription?.dispose();
+  modelOptionsSubscription = null;
   // 模型必须在 dispose 编辑器**之前**取出来：dispose 之后 getModel() 返回 null，就没得回收了。
   const model = editor?.getModel() ?? null;
   editor?.dispose();

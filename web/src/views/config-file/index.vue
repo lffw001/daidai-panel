@@ -1,22 +1,28 @@
 <script setup lang="ts">
-import { computed, onActivated, onMounted, ref } from 'vue'
+import { computed, onActivated, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Check, CopyDocument, Document, Refresh, Setting, Switch } from '@element-plus/icons-vue'
 import { configScriptApi } from '@/api/system'
-import CodeEditor, {
-  persistEditorViewOption,
-  persistEditorWordWrap,
-  readStoredEditorViewOption,
-  readStoredEditorWordWrap,
-} from '@/components/CodeEditor.vue'
-import type { EditorViewOption } from '@/components/CodeEditor.vue'
+import CodeEditor from '@/components/CodeEditor.vue'
 import { copyText } from '@/utils/clipboard'
 import {
   persistEditorEngine,
   readStoredEditorEngine,
   resolveEditorEngine,
 } from '@/utils/editorEngine'
-import type { EditorEngine } from '@/utils/editorEngine'
+import type { EditorEngine, ResolvedEditorEngine } from '@/utils/editorEngine'
+import {
+  EDITOR_INDENT_WIDTH_OPTIONS,
+  EDITOR_PREFERENCES_CHANGE_EVENT,
+  EDITOR_WHITESPACE_MODES,
+  cycleEditorOption,
+  editorIndentWidthLabel,
+  editorWhitespaceLabel,
+  ensureEditorPreferencesLoaded,
+  readEditorPreferences,
+  setEditorPreference,
+} from '@/utils/editorPreferences'
+import type { EditorPreferences } from '@/utils/editorPreferences'
 
 const content = ref('')
 const savedContent = ref('')
@@ -25,37 +31,53 @@ const loading = ref(false)
 const saving = ref(false)
 const copying = ref(false)
 
-// 自动换行开关必须活在页面级 ref 里：下面的 CodeEditor 挂在 v-if="!loading" 上，
-// 点一次「刷新」编辑器实例就整个重建，状态若只活在编辑器内部会被一起丢掉。
-// 这份记忆与脚本页共享（同一个 dd:editor:word_wrap），所以读写走 CodeEditor 导出的那两个函数。
-const wordWrap = ref(readStoredEditorWordWrap())
+// 五项编辑器偏好（自动换行 / 缩略图 / 缩进参考线 / 空白符 / 缩进宽度）必须活在页面级 ref 里：
+// 下面的 CodeEditor 挂在 v-if="!loading" 上，点一次「刷新」编辑器实例就整个重建，
+// 状态若只活在编辑器内部会被一起丢掉。
+// v3.2.4 起这份记忆不再只是 localStorage：utils/editorPreferences.ts 会把每次改动同步到
+// /api/auth/preferences，换设备、换 IP 登进来还是这一份（issue #116）。
+// 默认值全在那个模块里定，本页只管「读到什么用什么」，不复制一份默认值到这里。
+const prefs = ref<EditorPreferences>(readEditorPreferences())
 
 function toggleWordWrap() {
-  wordWrap.value = wordWrap.value === 'on' ? 'off' : 'on'
-  persistEditorWordWrap(wordWrap.value)
+  const next = prefs.value.word_wrap === 'on' ? 'off' : 'on'
+  prefs.value.word_wrap = next
+  setEditorPreference('word_wrap', next)
 }
 
-// 三个视图开关（缩略图 / 缩进参考线 / 空白符）与自动换行同源同命：
-// 同样必须活在页面级 ref（编辑器挂在 v-if="!loading" 上，点刷新会整个重建），
-// 同样与脚本页共享一份记忆，读写同样走 CodeEditor 的导出函数。
-// 三项收在一个对象里按名字读写，避免写成三组雷同的 ref + toggle。
-// 默认值（minimap/whitespace 关、indent_guides 开）由 CodeEditor 那两个函数负责，本页不复制一份。
-const viewOptions = ref({
-  minimap: readStoredEditorViewOption('minimap'),
-  indent_guides: readStoredEditorViewOption('indent_guides'),
-  whitespace: readStoredEditorViewOption('whitespace'),
-})
-
-function toggleViewOption(name: EditorViewOption) {
-  const next = !viewOptions.value[name]
-  viewOptions.value[name] = next
-  persistEditorViewOption(name, next)
+// 两个布尔开关按名字读写。空白符曾经也走这个通道（v3.2.2 时它是二态），
+// 现在它是三档循环，语义变了，拆去下面单独一个函数。
+function toggleViewOption(name: 'minimap' | 'indent_guides') {
+  const next = !prefs.value[name]
+  prefs.value[name] = next
+  setEditorPreference(name, next)
 }
 
-// 引擎偏好（auto / codemirror / monaco）：同样是「每浏览器一份、两页共享」，
+// 缩进宽度与空白符是「点一下换下一档」的循环项，档位顺序与取下一档的算法都由
+// utils/editorPreferences.ts 定，本页不复制一份（复制一份的表现是两页循环顺序不一致，而且构建全绿）。
+function cycleIndentWidth() {
+  const next = cycleEditorOption(EDITOR_INDENT_WIDTH_OPTIONS, prefs.value.indent_width)
+  prefs.value.indent_width = next
+  setEditorPreference('indent_width', next)
+}
+
+function cycleWhitespace() {
+  const next = cycleEditorOption(EDITOR_WHITESPACE_MODES, prefs.value.whitespace)
+  prefs.value.whitespace = next
+  setEditorPreference('whitespace', next)
+}
+
+// 「在脚本页改了一项」「刚从服务端拉回来了一份」都靠这个事件同步到本页。
+// 刻意从存储重读、而不是从事件里取值：偏好可能是在另一个组件里改的，存储才是唯一真源
+// （范式对齐 CodeEditor.vue 里的 syncEngine）。
+function syncPreferences() {
+  prefs.value = readEditorPreferences()
+}
+
+// 引擎偏好（auto / codemirror / monaco）：同样是「两页共享」，
 // 也同样必须活在页面级 ref —— 编辑器挂在 v-if="!loading" 上，点一次刷新就整个重建。
-// 但它**不是**视图开关那一档，菜单里用 divided 分开：
-// 上面三项是「同一个编辑器怎么显示」，改一下只是重配一个 Compartment；
+// 但它**不是**视图选项那一档，菜单里用 divided 分开：
+// 上面四项是「同一个编辑器怎么显示」，改一下只是重配一个 Compartment；
 // 引擎是「换一个编辑器」，切一次要把实例整块拆掉重建，撤销历史、光标、滚动位置全丢
 // （正文本身不丢，它活在本页的 content 里，重建后会重新灌进去）。
 const editorEngine = ref(readStoredEditorEngine())
@@ -68,26 +90,56 @@ const autoEngineLabel = computed(() =>
   resolveEditorEngine('auto') === 'monaco' ? 'Monaco' : 'CodeMirror',
 )
 
+// 解析后的实际引擎。本页原来只有上面那个 autoEngineLabel（只服务于「自动」那一档的括号说明），
+// 没有「现在实际跑的是哪个」的读数 —— 脚本页有（它底部状态条要用），本页没有状态条，两页天生不对称。
+// v3.2.4 需要它来决定齿轮菜单里「代码缩略图」渲不渲染：那一项只有 Monaco 认
+// （CodeMirror 侧的缩略图这一版被删掉了），CodeMirror 下留着它就是一个点了没反应的开关。
+//
+// 🔴 这里**不能**写成 computed(() => resolveEditorEngine(editorEngine.value))。
+// resolveEditorEngine 在 auto 档下读的是 matchMedia('(pointer: coarse)') 和 window.innerWidth，
+// 两者都不是响应式依赖，那个 computed 只会在 editorEngine 变时重算一次；
+// 而真正决定「现在跑的是哪个引擎」的 CodeEditor 是**每次挂载时按当下窗口宽度重新解析**的，
+// 本页的编辑器又挂在 v-if="!loading" 上 —— 点一次「刷新」就整块重建。
+// 于是「宽窗口打开页面（菜单里有代码缩略图）→ 把窗口贴靠成半屏 → 点刷新」之后，
+// 编辑器已经重建成 CodeMirror，菜单里「代码缩略图」还在，点它开关翻 ON、正文毫无变化。
+// 所以真源改成 CodeEditor 每次解析完 emit 上来的 engine-resolved（挂载时 + 引擎偏好变更后各一次）。
+const resolvedEngine = ref<ResolvedEditorEngine>(
+  // 初值只是兜底：编辑器还没挂载（loading 期间）时，齿轮菜单也要能渲染。
+  // 编辑器一挂上来，第一次 engine-resolved 就会把它覆盖成真值。
+  resolveEditorEngine(readStoredEditorEngine()),
+)
+
+function onEngineResolved(engine: ResolvedEditorEngine) {
+  resolvedEngine.value = engine
+}
+
 function selectEditorEngine(next: EditorEngine) {
   if (editorEngine.value === next) return
   editorEngine.value = next
+  // 顺手把 resolvedEngine 也推一次：编辑器没挂载（loading 期间）时不会有 engine-resolved 回来，
+  // 少了这一行菜单里的「代码缩略图」会停在旧引擎上。编辑器挂着的话，下一拍 CodeEditor 会用
+  // 同一份存储值 + 同一个窗口再解析一遍并 emit，结论必然相同，两者不会打架。
+  // ⚠️ 只在这里补，不要在 onActivated 里也补一次：那时窗口宽度可能已经和编辑器挂载时不同，
+  // 重解析出来的值会和实际跑着的实例对不上，正是上面注释里那个 bug 的翻版。
+  resolvedEngine.value = resolveEditorEngine(next)
   persistEditorEngine(next) // 内部会派发 EDITOR_ENGINE_CHANGE_EVENT，已挂载的编辑器跟着换
 }
 
 // 本页被 keep-alive 缓存，第二次进来只触发 onActivated 不触发 onMounted。
-// 不在这里补读一次的话，「在脚本页改了开关、切回本页却没变」——两页共享就名存实亡了。
-// 三个视图开关同理，漏掉任何一个就是那一项单独失去共享（构建和类型检查都发现不了）。
+// 下面 onMounted 里挂的变更事件监听在缓存期间是不摘的（keep-alive 只 deactivate 不 unmount），
+// 所以「切走时在脚本页改了偏好」其实已经同步过了；这里仍然同步补读一次，
+// 兜的是「事件没派发」那条路径 —— 比如另一个标签页改的偏好、或者存储被外部清掉。
 onActivated(() => {
-  wordWrap.value = readStoredEditorWordWrap()
-  viewOptions.value = {
-    minimap: readStoredEditorViewOption('minimap'),
-    indent_guides: readStoredEditorViewOption('indent_guides'),
-    whitespace: readStoredEditorViewOption('whitespace'),
-  }
-  // 引擎偏好同样两页共享，漏掉这一行的表现是「在脚本页切了引擎、切回本页菜单里还是旧的」——
-  // 编辑器实例其实已经被 EDITOR_ENGINE_CHANGE_EVENT 换掉了，只有菜单勾选在骗人，
-  // 比单纯不生效更难查。
+  prefs.value = readEditorPreferences()
+  // 引擎偏好没有走服务端同步，全靠这一行两页共享。漏掉它的表现是
+  // 「在脚本页切了引擎、切回本页菜单里还是旧的」——编辑器实例其实已经被
+  // EDITOR_ENGINE_CHANGE_EVENT 换掉了，只有菜单勾选在骗人，比单纯不生效更难查。
   editorEngine.value = readStoredEditorEngine()
+  void ensureEditorPreferencesLoaded()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener(EDITOR_PREFERENCES_CHANGE_EVENT, syncPreferences)
 })
 
 const hasChanged = computed(() => content.value !== savedContent.value)
@@ -101,6 +153,11 @@ const byteSizeLabel = computed(() => {
 
 onMounted(() => {
   void loadConfigScript()
+  window.addEventListener(EDITOR_PREFERENCES_CHANGE_EVENT, syncPreferences)
+  // 服务端那份偏好在这里拉一次（函数自己记忆化，重复调用不会重复发请求），
+  // 拉回来之后它会派发变更事件，由上面的监听把新值刷进来。
+  // 刻意不放进 main.ts 的启动流程：编辑器不在首屏，没必要给每一次打开面板都多加一个请求。
+  void ensureEditorPreferencesLoaded()
 })
 
 async function loadConfigScript(showSuccess = false) {
@@ -194,48 +251,69 @@ async function copyConfigScript() {
               <!-- 状态类按钮排在动作类按钮之前。配色沿用本仓工具栏切换按钮的既有写法
                    （tasks 页快捷排序：开启时 primary + plain），不另造一套语汇；
                    与「保存」的实心 primary 靠 plain 区分，不会抢主操作的注意力。 -->
-              <el-tooltip :content="wordWrap === 'on' ? '关闭自动换行' : '开启自动换行'" placement="bottom">
+              <el-tooltip :content="prefs.word_wrap === 'on' ? '关闭自动换行' : '开启自动换行'" placement="bottom">
                 <el-button
-                  :type="wordWrap === 'on' ? 'primary' : 'default'"
-                  :plain="wordWrap === 'on'"
+                  :type="prefs.word_wrap === 'on' ? 'primary' : 'default'"
+                  :plain="prefs.word_wrap === 'on'"
                   @click="toggleWordWrap"
                 >
                   <el-icon><Switch /></el-icon>
                   Wrap
                 </el-button>
               </el-tooltip>
-              <!-- 三个视图开关（缩略图 / 缩进参考线 / 空白符）收进齿轮下拉，与脚本页同一套交互。
+              <!-- 四个视图选项（缩略图 / 缩进参考线 / 缩进宽度 / 空白符）收进齿轮下拉，与脚本页同一套交互。
                    本页工具栏虽然能换行（.editor-card__actions 带 flex-wrap，不像脚本页会被裁掉），
-                   但三个开关并排就是三个按钮，窄屏必然把这一行折成三行；
-                   而且两页的这组开关是同一份记忆，入口长得不一样只会让人以为是两套东西。
-                   :hide-on-click="false"：三项经常连着切，点一下就收菜单会逼用户反复重开。 -->
+                   但四个选项并排就是四个按钮，窄屏必然把这一行折成好几行；
+                   而且两页的这组选项是同一份记忆，入口长得不一样只会让人以为是两套东西。
+                   :hide-on-click="false"：这几项经常连着切（缩进宽度和空白符还要连点好几下
+                   才能转到想要的档），点一下就收菜单会逼用户反复重开。 -->
               <el-dropdown trigger="click" placement="bottom-end" :hide-on-click="false">
                 <el-button aria-label="编辑器选项">
                   <el-icon><Setting /></el-icon>
                 </el-button>
                 <template #dropdown>
                   <el-dropdown-menu>
-                    <el-dropdown-item @click="toggleViewOption('minimap')">
+                    <!-- 「代码缩略图」只在解析后的引擎是 Monaco 时渲染。
+                         v3.2.4 删掉了 CodeMirror 侧的缩略图实现（它硬占正文右侧 64px，
+                         手机 360px 宽下就是 18% 的正文没了；而桌面 auto 档本来就走 Monaco），
+                         所以在 CodeMirror 下这一项已经没有任何东西可开。
+                         宁可整项不渲染也不留一个「点了没反应、按钮还高亮、构建全绿」的开关。 -->
+                    <el-dropdown-item v-if="resolvedEngine === 'monaco'" @click="toggleViewOption('minimap')">
                       <span class="opt-row">
                         <span>代码缩略图</span>
-                        <span class="opt-state" :class="{ 'is-on': viewOptions.minimap }">{{ viewOptions.minimap ? 'ON' : 'OFF' }}</span>
+                        <span class="opt-state" :class="{ 'is-on': prefs.minimap }">{{ prefs.minimap ? 'ON' : 'OFF' }}</span>
                       </span>
                     </el-dropdown-item>
                     <el-dropdown-item @click="toggleViewOption('indent_guides')">
                       <span class="opt-row">
                         <span>缩进参考线</span>
-                        <span class="opt-state" :class="{ 'is-on': viewOptions.indent_guides }">{{ viewOptions.indent_guides ? 'ON' : 'OFF' }}</span>
-                      </span>
-                    </el-dropdown-item>
-                    <el-dropdown-item @click="toggleViewOption('whitespace')">
-                      <span class="opt-row">
-                        <span>显示空白符</span>
-                        <span class="opt-state" :class="{ 'is-on': viewOptions.whitespace }">{{ viewOptions.whitespace ? 'ON' : 'OFF' }}</span>
+                        <span class="opt-state" :class="{ 'is-on': prefs.indent_guides }">{{ prefs.indent_guides ? 'ON' : 'OFF' }}</span>
                       </span>
                     </el-dropdown-item>
 
-                    <!-- 引擎切换：用 divided 单独起一组，不和上面三项混排。
-                         上面三项是「同一个编辑器怎么显示」，切一下只是重配一个 Compartment，代价为零；
+                    <!-- 下面两项不是开关而是「点一下换下一档」的循环项，
+                         光看一枚状态标读不出「还能点」，所以标题后面跟一句常驻的「点击切换」。
+                         不用 el-tooltip：这是下拉浮层里的菜单项，再套一层 popper 只会在
+                         悬停与层级上添乱，而这句提示本来就该常驻可见。
+
+                         状态标的配色规则在这四项里是统一的一条：**这一项此刻有没有在改变正文的样子**。
+                         缩略图 / 参考线关着是灰的；空白符「关闭」也是灰的；
+                         而缩进宽度没有「关」这一档（自动也是一种生效的档位），所以恒为主色。 -->
+                    <el-dropdown-item @click="cycleIndentWidth">
+                      <span class="opt-row">
+                        <span class="opt-label">缩进宽度<span class="opt-hint">点击切换</span></span>
+                        <span class="opt-state is-on">{{ editorIndentWidthLabel(prefs.indent_width) }}</span>
+                      </span>
+                    </el-dropdown-item>
+                    <el-dropdown-item @click="cycleWhitespace">
+                      <span class="opt-row">
+                        <span class="opt-label">显示空白符<span class="opt-hint">点击切换</span></span>
+                        <span class="opt-state" :class="{ 'is-on': prefs.whitespace !== 'none' }">{{ editorWhitespaceLabel(prefs.whitespace) }}</span>
+                      </span>
+                    </el-dropdown-item>
+
+                    <!-- 引擎切换：用 divided 单独起一组，不和上面四项混排。
+                         上面四项是「同一个编辑器怎么显示」，切一下只是重配一个 Compartment，代价为零；
                          引擎是「换一个编辑器」，切一次整块重建实例，撤销历史 / 光标 / 滚动位置全丢
                          （正文本身不丢，它活在本页的 content 里）。两者不是同一档，
                          并排放会让人以为引擎也是个随手可以来回拨的显示开关。
@@ -301,10 +379,12 @@ async function copyConfigScript() {
           v-model="content"
           language="shell"
           :fill-height="true"
-          :word-wrap="wordWrap"
-          :minimap="viewOptions.minimap"
-          :indent-guides="viewOptions.indent_guides"
-          :show-whitespace="viewOptions.whitespace"
+          :word-wrap="prefs.word_wrap"
+          :minimap="prefs.minimap"
+          :indent-guides="prefs.indent_guides"
+          :whitespace="prefs.whitespace"
+          :indent-width="prefs.indent_width"
+          @engine-resolved="onEngineResolved"
         />
         <div v-else class="editor-placeholder">
           正在读取配置文件...
@@ -464,10 +544,10 @@ async function copyConfigScript() {
   flex-wrap: wrap;
 }
 
-// 齿轮下拉里的视图开关项：左侧标题、右侧一枚 ON/OFF 状态标。
+// 齿轮下拉里的视图选项：左侧标题、右侧一枚状态标。
 // 下拉菜单项没有 EP 现成的选中态可用，只画一个对勾的话「没对勾」既可能是关、
-// 也可能是没渲染上，读不出确定状态，所以两种状态都出字。
-// 这两条与脚本页 ScriptsEditorPane.vue 里的同名规则是同一副长相：
+// 也可能是没渲染上，读不出确定状态，所以所有状态都出字。
+// 这几条与脚本页 ScriptsEditorPane.vue 里的同名规则是同一副长相：
 // 两边都是 scoped 样式、隔着组件边界够不到对方，只能各写一份，要改就两边一起改。
 .opt-row {
   display: flex;
@@ -476,6 +556,25 @@ async function copyConfigScript() {
   justify-content: space-between;
   gap: 16px;
   width: 100%;
+}
+
+// 循环档位那两项（缩进宽度 / 显示空白符）的标题：正文后面跟一句常驻的「点击切换」。
+// 两项都是「点一下换下一档」，而右侧那枚标只写当前档位、看不出还能点，
+// 没有这句提示的话很容易被当成一个坏掉的只读读数。
+// 写成同一行的次要文字而不是第二行副标题：菜单项是固定行高的单行控件，
+// 撑成两行会让这两项在四项里高出一截，反而像是别的什么东西。
+.opt-label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.opt-hint {
+  flex-shrink: 0;
+  font-size: 10px;
+  letter-spacing: 0.2px;
+  color: var(--el-text-color-placeholder);
 }
 
 .opt-state {
@@ -675,7 +774,7 @@ code {
   //    按上面的估算断点大约落在「保存」之前（前四个一行、保存独占第二行并被 flex: 1 拉满），
   //    但这个切分随字体度量浮动，别当成保证；要保证的只有一条：无论怎么折都不会挤出横向滚动条。
   //
-  // 三个视图开关之所以全塞进齿轮的下拉、而不是并排加三个按钮，就是为了这一档只多占约 44px。
+  // 四个视图选项之所以全塞进齿轮的下拉、而不是并排加四个按钮，就是为了这一档只多占约 44px。
   .editor-card__actions {
     width: 100%;
 
