@@ -181,6 +181,7 @@ func (h *SubscriptionHandler) Create(c *gin.Context) {
 		Whitelist      string `json:"whitelist"`
 		Blacklist      string `json:"blacklist"`
 		DependOn       string `json:"depend_on"`
+		PreScript      string `json:"pre_script"`
 		HookScript     string `json:"hook_script"`
 		AutoAddTask    bool   `json:"auto_add_task"`
 		AutoDelTask    bool   `json:"auto_del_task"`
@@ -192,6 +193,10 @@ func (h *SubscriptionHandler) Create(c *gin.Context) {
 		AuthToken      string `json:"auth_token"`
 		Alias          string `json:"alias"`
 		ForceOverwrite *bool  `json:"force_overwrite"`
+		// 覆盖拉取策略三态，前端只发这个；不传或传脏值都会被 Normalize 归到 inherit（跟随全局）。
+		OverwriteMode  string `json:"overwrite_mode"`
+		// 完整检出：开启后放弃 sparse-checkout，整仓拉取。不传就是 false（走原来的 sparse）。
+		FullCheckout   bool   `json:"full_checkout"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "请求参数错误")
@@ -211,6 +216,29 @@ func (h *SubscriptionHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// 订阅只做「先查后插」，刻意不给 subscriptions.url 加 DB 唯一索引：
+	// 同一个仓库以不同分支 / 不同子目录订阅两次是合法用法，加硬约束会让这些历史数据在升级时被动改名。
+	//
+	// 判重口径必须覆盖**所有决定这条订阅落到哪个目录**的字段，也就是
+	// service.subscriptionSaveDir 的整条取值链：save_dir → alias → URL 末段。
+	// 只卡「地址 + 分支 + 子目录」会误伤青龙生态里很常见的一种用法 ——
+	// 同一个脚本仓库订阅两次，一条 whitelist=jd_*.js 存进 jd、另一条 whitelist=utils/*.js 存进 libs，
+	// 两条的 url/branch/sub_path 逐字相同，升级后第二条会被 400 拒掉且没有任何绕过入口。
+	// 单文件订阅（type=file，branch 与 sub_path 恒为空）撞上的概率更高，save_dir 是它唯一的区分维度。
+	//
+	// 连点创建按钮时这五个字段本来就逐字相同，所以挡重复的能力不受影响。
+	// 注意这只是尽力而为的一道闸 —— 两个请求同时进来时仍可能双双查不到再双双插入，
+	// 前端的按钮在途锁才是主力，这里兜的是「超时后用户手动再点一次」那一半。
+	var duplicateSubCount int64
+	database.DB.Model(&model.Subscription{}).
+		Where("url = ? AND COALESCE(branch, '') = ? AND COALESCE(sub_path, '') = ? AND COALESCE(save_dir, '') = ? AND COALESCE(alias, '') = ?",
+			req.URL, req.Branch, req.SubPath, req.SaveDir, req.Alias).
+		Count(&duplicateSubCount)
+	if duplicateSubCount > 0 {
+		response.BadRequest(c, "相同地址、分支、子目录、保存目录和别名的订阅已存在")
+		return
+	}
+
 	sub := model.Subscription{
 		Name:           req.Name,
 		Type:           req.Type,
@@ -220,6 +248,7 @@ func (h *SubscriptionHandler) Create(c *gin.Context) {
 		Whitelist:      req.Whitelist,
 		Blacklist:      req.Blacklist,
 		DependOn:       req.DependOn,
+		PreScript:      req.PreScript,
 		HookScript:     req.HookScript,
 		AutoAddTask:    req.AutoAddTask,
 		AutoDelTask:    req.AutoDelTask,
@@ -232,6 +261,8 @@ func (h *SubscriptionHandler) Create(c *gin.Context) {
 		AuthToken:      authToken,
 		Alias:          req.Alias,
 		ForceOverwrite: req.ForceOverwrite,
+		OverwriteMode:  model.NormalizeSubscriptionOverwriteMode(req.OverwriteMode),
+		FullCheckout:   req.FullCheckout,
 	}
 
 	if err := database.DB.Create(&sub).Error; err != nil {
@@ -265,8 +296,12 @@ func (h *SubscriptionHandler) Update(c *gin.Context) {
 	allowed := map[string]bool{
 		"name": true, "type": true, "url": true, "branch": true,
 		"schedule": true, "whitelist": true, "blacklist": true,
-		"depend_on": true, "hook_script": true, "auto_add_task": true, "auto_del_task": true,
+		"depend_on": true, "pre_script": true, "hook_script": true, "auto_add_task": true, "auto_del_task": true,
 		"save_dir": true, "sub_path": true, "ssh_key_id": true, "auth_type": true, "auth_username": true, "auth_token": true, "alias": true, "force_overwrite": true,
+		"overwrite_mode": true,
+		// 完整检出开关。Update 走 map 更新，false 也会被写库（map 更新不会跳过零值），
+		// 所以用户在表单里关掉它能正常落库。
+		"full_checkout": true,
 	}
 	updates := make(map[string]interface{})
 	for k, v := range req {
@@ -280,6 +315,22 @@ func (h *SubscriptionHandler) Update(c *gin.Context) {
 			response.BadRequest(c, "无效的订阅定时规则")
 			return
 		}
+	}
+
+	// 覆盖拉取策略写库前先归一。Update 收的是 map[string]interface{}，
+	// 值可能是任意 JSON 类型（前端误传 null / 数字，或直接调接口塞脏字符串），
+	// 一律归到三个合法值之一，非字符串按 inherit（跟随全局）处理，绝不让脏值落库。
+	if value, exists := updates["overwrite_mode"]; exists {
+		text, _ := value.(string)
+		updates["overwrite_mode"] = model.NormalizeSubscriptionOverwriteMode(text)
+	}
+
+	// 完整检出开关同理：JSON 里可能是 null / 数字 / 字符串，直接 map 更新会把脏值塞进
+	// bool 列。非布尔一律归 false —— 也就是保持既有的 sparse 检出行为，方向安全
+	// （误开成完整检出会让整仓文件落盘，误关只是回到默认行为）。
+	if value, exists := updates["full_checkout"]; exists {
+		flag, _ := value.(bool)
+		updates["full_checkout"] = flag
 	}
 
 	if _, hasAuthType := updates["auth_type"]; hasAuthType || updates["ssh_key_id"] != nil || updates["auth_token"] != nil {

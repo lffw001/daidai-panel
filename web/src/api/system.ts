@@ -26,13 +26,13 @@ export interface RestoreProgressState {
 }
 
 export interface PanelUpdateStatus {
-  status?: 'idle' | 'running' | 'restarting' | 'failed'
+  status?: 'idle' | 'running' | 'restarting' | 'completed' | 'failed'
   phase?: string
   message?: string
   error?: string
   started_at?: string
   updated_at?: string
-  deployment_type?: 'docker' | 'binary'
+  deployment_type?: 'docker' | 'binary' | 'magisk'
   container_name?: string
   image_name?: string
   pull_image_name?: string
@@ -46,6 +46,25 @@ export interface PanelUpdateStatus {
   update_manager?: 'panel' | 'watchtower'
   watchtower_response?: Record<string, any>
 }
+
+/**
+ * GET /system/info 里与「部署形态」有关的两个字段（v3.0.4 新增）。
+ *
+ * 其余字段是资源快照，仍然平铺在同一层（服务端用匿名嵌入保证老字段位置不变），
+ * 这里只声明前端真正要拿来做分支判断的两项。
+ */
+export interface SystemDeploymentInfo {
+  /** 取值与 PanelUpdateStatus.deployment_type 同一套 */
+  deployment_type?: 'docker' | 'binary' | 'magisk'
+  /**
+   * Magisk 模块外壳版本。非模块版、或 v3.0.3 之前的旧外壳都是 0。
+   * 「停止面板服务」需要 >= 2（v3.0.4 的外壳），低于它只能重刷模块 ZIP。
+   */
+  magisk_shell_version?: number
+}
+
+/** 「停止面板服务」所需的最低模块外壳版本，与后端 magiskStopSupportedShellVersion 对齐 */
+export const MAGISK_STOP_SUPPORTED_SHELL_VERSION = 2
 
 export interface SystemHealthItem {
   name: string
@@ -63,11 +82,34 @@ export interface ConfigScriptPayload {
   path: string
 }
 
+/**
+ * 侧栏菜单角标的计数来源（GET /system/badges）。
+ *
+ * 服务端按角色裁剪：viewer 拿不到 subs_*，operator 拿不到 deps_*，
+ * 无权项一律返回 0 而不是缺字段，所以这里全部声明为必填。
+ *
+ * 注意这里【没有】「有新版本」——检查更新每次都要打一发 GitHub 外网请求且无缓存，
+ * 不能放进轮询接口。面板更新角标由 store 复用已发生的 checkUpdate 结果，见 stores/badges.ts。
+ */
+export interface SystemBadges {
+  /** 正在运行的任务数 */
+  tasks_running: number
+  /** 今日失败的执行日志数 */
+  logs_failed_today: number
+  /** 最近一次拉取失败的订阅数 */
+  subs_failed: number
+  /** 安装失败的依赖数 */
+  deps_failed: number
+  /** 排队中 / 安装中 / 卸载中的依赖数合计 */
+  deps_installing: number
+}
+
 export const systemApi = {
   info: () => request.get('/system/info'),
   machineCode: () => request.get('/system/machine-code'),
   dashboard: (range?: number) => request.get('/system/dashboard', { params: range ? { range } : undefined }),
   stats: () => request.get('/system/stats'),
+  badges: () => request.get('/system/badges') as Promise<{ data: SystemBadges }>,
   version: () => request.get('/system/version'),
   publicVersion: () => request.get('/system/public-version'),
   panelSettings: () => request.get('/system/panel-settings'),
@@ -75,6 +117,13 @@ export const systemApi = {
   updateStatus: () => request.get('/system/update-status'),
   updatePanel: () => request.post('/system/update'),
   restart: () => request.post('/system/restart'),
+  /**
+   * 停止面板服务 —— 只有 Magisk 模块版可用，且要求外壳版本 >= 2。
+   *
+   * 与 restart 的区别：停止之后没有任何东西会把面板拉回来（重启手机也不会），
+   * 所以【不要】复用 waitForRestart 那套轮询，它永远等不到。
+   */
+  stopPanel: () => request.post('/system/stop'),
   panelLog: (params?: { lines?: number; keyword?: string; level?: 'debug' | 'info' | 'warn' | 'error' | '' }) =>
     request.get('/system/panel-log', { params }),
   backup: (password?: string, selection?: Partial<BackupSelection>, name?: string) => request.post('/system/backup', { password, selection, name }),
@@ -109,8 +158,56 @@ export const configScriptApi = {
   save: (content: string) => request.put('/system/config-script', { content }) as Promise<{ message: string }>,
 }
 
+// ============================================================================
+// 系统配置 schema
+//
+// 下面这几个类型与服务端 server/handler/config.go 的 buildConfigResponseItem
+// 一一对应，是 GET /api/configs 的真实响应形状；字段真源在
+// server/model/system_config_registry.go（47 项）。
+//
+// 这份 schema 由服务端持有唯一真源，Web 只负责渲染。
+// 不做版本兼容降级：Web 与服务端永远同版本发布 —— release 产物里 web/ 目录和
+// 二进制来自同一次构建，Docker 镜像同理，面板自更新脚本也是整个 web/ 目录替换。
+// 不存在「新 Web + 老服务端」的组合。
+// ============================================================================
+
+/** 服务端 SystemConfigValueType 的四个取值 */
+export type SystemConfigValueType = 'string' | 'int' | 'bool' | 'enum'
+
+export interface SystemConfigOption {
+  value: string
+  label: string
+}
+
+export interface SystemConfigItemResponse {
+  /** 当前值。服务端在库里没记录或记录为空串时已经替换成 default_value */
+  value?: string
+  /** 长句说明（个别项有三行），只能当 hint，不能当输入框标题 */
+  description?: string
+  updated_at?: string | null
+  /** false 表示这是面板运行时自己写的临时状态，没有 schema，不要渲染也不要回写 */
+  registered?: boolean
+  default_value?: string
+  value_type?: SystemConfigValueType
+  group?: string
+  /** group 这个英文 slug 对应的中文分组名 */
+  group_label?: string
+  /** 输入框标题用的短词 */
+  label?: string
+  /** 注册顺序。本接口返回的是 map 本身没有顺序，客户端要按声明顺序渲染只能靠它 */
+  order?: number
+  /** 凭据类配置，渲染时应当用密码框（服务端仍然明文下发） */
+  secret?: boolean
+  /** 只有 int 类型有值，供前端做范围校验（服务端仍会独立校验一次） */
+  min?: number
+  max?: number
+  options?: SystemConfigOption[]
+}
+
+export type SystemConfigMap = Record<string, SystemConfigItemResponse>
+
 export const configApi = {
-  list: () => request.get('/configs'),
+  list: () => request.get('/configs') as Promise<{ data: SystemConfigMap }>,
   get: (key: string) => request.get(`/configs/${key}`),
   set: (data: { key: string; value: string; description?: string }) => request.post('/configs', data),
   batchSet: (configs: Record<string, string>) => request.put('/configs/batch', { configs }),

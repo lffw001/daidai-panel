@@ -66,6 +66,24 @@ func parseEnvGroupFilter(rawValues ...string) []string {
 	return model.SplitEnvGroups(strings.Join(rawValues, ","))
 }
 
+// parseEnvNameFilter 解析「变量名筛选」参数，套路与 parseEnvGroupFilter 一致。
+// 变量名受 envNamePattern（^[A-Za-z_][A-Za-z0-9_]*$）约束、不可能含逗号，所以逗号分隔在这里是安全的；
+// 复用 SplitEnvGroups 只是借它「切分 + 去空白 + 去重」这套通用逻辑，与分组语义无关。
+// 🔴 「逗号分隔安全」这个前提只对变量名成立，别把同一套解析扩散到 value / remarks 这类自由文本字段上。
+func parseEnvNameFilter(rawValues ...string) []string {
+	return model.SplitEnvGroups(strings.Join(rawValues, ","))
+}
+
+// applyEnvNameFilters 按变量名做【精确】匹配（不是 keyword 那种 LIKE）：
+// 多个变量名之间是 OR（IN），与 keyword / groups / enabled 之间仍是 AND —— 由 GORM 的多次 Where 串成。
+// 传了库里不存在的名字时自然筛出空列表，绝不会回落成「不筛」。
+func applyEnvNameFilters(query *gorm.DB, names []string) *gorm.DB {
+	if len(names) == 0 {
+		return query
+	}
+	return query.Where("name IN ?", names)
+}
+
 func applyEnvGroupFilters(query *gorm.DB, groups []string) *gorm.DB {
 	if len(groups) == 0 {
 		return query
@@ -208,6 +226,8 @@ func reorderEnvWithinSortBucket(tx *gorm.DB, sourceID uint, targetID *uint) erro
 
 func (h *EnvHandler) List(c *gin.Context) {
 	keyword := c.Query("keyword")
+	// names 同时支持 `names=A,B` 和 `names=A&names=B` 两种写法（QueryArray 已经把重复参数收齐）。
+	nameFilters := parseEnvNameFilter(c.QueryArray("names")...)
 	groupFilters := parseEnvGroupFilter(append(c.QueryArray("groups"), c.Query("groups"), c.Query("group"))...)
 	enabledRaw := c.Query("enabled")
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -228,6 +248,7 @@ func (h *EnvHandler) List(c *gin.Context) {
 		like := "%" + keyword + "%"
 		query = query.Where("UPPER(name) LIKE UPPER(?) OR UPPER(remarks) LIKE UPPER(?) OR UPPER(value) LIKE UPPER(?) OR UPPER(\"group\") LIKE UPPER(?)", like, like, like, like)
 	}
+	query = applyEnvNameFilters(query, nameFilters)
 	query = applyEnvGroupFilters(query, groupFilters)
 	if enabledRaw != "" {
 		enabled, err := strconv.ParseBool(enabledRaw)
@@ -364,6 +385,170 @@ func (h *EnvHandler) Create(c *gin.Context) {
 		return
 	}
 	response.Success(c, payload)
+}
+
+// errEnvUpsertAmbiguous 标记「同名记录不止一条」。这是数据安全防线而不是偷懒：
+// 同名多条 = 多账号场景，脚本读到的是合并且转义后的串，整段写回任意一条都会破坏结构。
+// 报错让脚本作者立刻发现，静默更新会无声毁掉用户的多账号配置。
+var errEnvUpsertAmbiguous = errors.New("env upsert matched multiple rows")
+
+type upsertEnvByNameRequest struct {
+	Name    string    `json:"name"`
+	Value   *string   `json:"value"`
+	Remarks *string   `json:"remarks"`
+	Group   *string   `json:"group"`
+	Groups  *[]string `json:"groups"`
+	Enabled *bool     `json:"enabled"`
+}
+
+// UpsertByName 按变量名 upsert，语义与 `ddp env set` 对齐（0 条创建 / 1 条更新 / >1 条报错），
+// 消除 CLI 与 HTTP 的分叉，让脚本"跑完更新 Cookie"不必先 GET 找 id 再 PUT。
+//
+// 注意：POST /envs 的纯 insert 是刻意的青龙兼容行为，不在这里合并。两个入口各司其职。
+func (h *EnvHandler) UpsertByName(c *gin.Context) {
+	limitEnvRequestBody(c)
+
+	var req upsertEnvByNameRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		if isRequestBodyTooLarge(err) {
+			response.BadRequest(c, "请求体过大（最大 1MB）")
+			return
+		}
+		response.BadRequest(c, "请求参数错误")
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		response.BadRequest(c, "变量名不能为空")
+		return
+	}
+	if !envNamePattern.MatchString(name) {
+		response.BadRequest(c, "变量名格式无效")
+		return
+	}
+
+	// remarks 在这里有两个身份：同名多条时的消歧条件，以及创建/更新时写入的值。
+	// 与 `ddp env set --remarks` 保持一致。
+	remarks := ""
+	if req.Remarks != nil {
+		remarks = strings.TrimSpace(*req.Remarks)
+	}
+
+	var (
+		result       model.EnvVar
+		created      bool
+		matchedCount int
+	)
+
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		var matched []model.EnvVar
+		query := tx.Where("name = ?", name)
+		if remarks != "" {
+			query = query.Where("remarks = ?", remarks)
+		}
+		if err := query.Order("id ASC").Find(&matched).Error; err != nil {
+			return err
+		}
+		matchedCount = len(matched)
+
+		// 先判分叉再写：这一条返回时事务里还没有任何写操作，保证报错路径零副作用。
+		if matchedCount > 1 {
+			return errEnvUpsertAmbiguous
+		}
+
+		if matchedCount == 0 {
+			position, posErr := nextEnvPosition(tx, envNormalSortOrder)
+			if posErr != nil {
+				return posErr
+			}
+
+			env := model.EnvVar{
+				Name:      name,
+				Remarks:   remarks,
+				Enabled:   true,
+				SortOrder: envNormalSortOrder,
+				Position:  position,
+			}
+			if req.Value != nil {
+				// 逐字节原样写入，不做任何转义：转义只发生在多条同名记录合并成
+				// 环境变量时（joinTaskEnvValues），单条记录存的就是原始值。
+				env.Value = *req.Value
+			}
+			if req.Groups != nil {
+				env.Group = model.JoinEnvGroups(*req.Groups)
+			} else if req.Group != nil {
+				env.Group = normalizeEnvGroupValue(*req.Group)
+			}
+			if req.Enabled != nil {
+				env.Enabled = *req.Enabled
+			}
+
+			if createErr := tx.Create(&env).Error; createErr != nil {
+				return createErr
+			}
+			if req.Enabled != nil && !*req.Enabled {
+				// EnvVar.Enabled 带 `default:true` 标签，GORM 对这类字段可能跳过零值插入。
+				// 显式回写一次，保证调用方传的 enabled:false 不被数据库默认值悄悄翻成 true。
+				if disableErr := tx.Model(&model.EnvVar{}).Where("id = ?", env.ID).
+					Update("enabled", false).Error; disableErr != nil {
+					return disableErr
+				}
+				env.Enabled = false
+			}
+			result = env
+			created = true
+			return nil
+		}
+
+		existing := matched[0]
+		updates := make(map[string]interface{})
+		if req.Value != nil && *req.Value != existing.Value {
+			updates["value"] = *req.Value
+		}
+		if req.Remarks != nil && remarks != existing.Remarks {
+			updates["remarks"] = remarks
+		}
+		if req.Groups != nil {
+			normalized := model.JoinEnvGroups(*req.Groups)
+			if normalized != existing.Group {
+				updates["group"] = normalized
+			}
+		} else if req.Group != nil {
+			normalized := normalizeEnvGroupValue(*req.Group)
+			if normalized != existing.Group {
+				updates["group"] = normalized
+			}
+		}
+		if req.Enabled != nil && *req.Enabled != existing.Enabled {
+			updates["enabled"] = *req.Enabled
+		}
+
+		if len(updates) > 0 {
+			if updateErr := tx.Model(&model.EnvVar{}).Where("id = ?", existing.ID).Updates(updates).Error; updateErr != nil {
+				return updateErr
+			}
+		}
+
+		return tx.First(&result, existing.ID).Error
+	})
+
+	if err != nil {
+		if errors.Is(err, errEnvUpsertAmbiguous) {
+			response.Error(c, http.StatusConflict, fmt.Sprintf(
+				"存在 %d 条名为 '%s' 的环境变量（多账号场景），已拒绝写入以免破坏结构。请在请求体中带上 remarks 精确定位，或改用 PUT /envs/:id。",
+				matchedCount, name))
+			return
+		}
+		response.InternalError(c, "保存失败")
+		return
+	}
+
+	if created {
+		response.Created(c, gin.H{"message": "创建成功", "data": result.ToDict(), "created": true})
+		return
+	}
+	response.Success(c, gin.H{"message": "更新成功", "data": result.ToDict(), "created": false})
 }
 
 type updateEnvRequest struct {
@@ -662,6 +847,28 @@ func (h *EnvHandler) Groups(c *gin.Context) {
 	sort.Strings(groups)
 
 	response.Success(c, gin.H{"data": groups})
+}
+
+// envNameCount 是 /envs/names 的一项：变量名 + 全库同名条数。
+type envNameCount struct {
+	Name  string `json:"name"`
+	Count int64  `json:"count"`
+}
+
+// Names 按变量名聚合，给前端「变量名筛选」下拉提供选项与条数，形态与 Groups 对齐。
+//
+// 🔴 count 的口径是【全库同名条数】，刻意不跟随当前的 keyword / groups / enabled 筛选：
+// 它与 UpsertByName 冲突文案里那句「存在 N 条名为 'X' 的环境变量」是同一个 N，两处必须对得上。
+// 若改成筛选后的条数，同一个变量名会在下拉里和报错里显示两个不同的数字。
+func (h *EnvHandler) Names(c *gin.Context) {
+	var rows []envNameCount
+	database.DB.Raw(`SELECT name, COUNT(*) AS count FROM env_vars WHERE name != '' GROUP BY name ORDER BY name ASC`).Scan(&rows)
+
+	// Scan 到空结果时 rows 仍是 nil，直接返回会序列化成 null；/envs/groups 空库返回的是 []，
+	// 两个下拉接口的空值形态保持一致。
+	data := make([]envNameCount, 0, len(rows))
+	data = append(data, rows...)
+	response.Success(c, gin.H{"data": data})
 }
 
 func parseEnvExportIDs(raw string) []uint {
@@ -1018,6 +1225,9 @@ func (h *EnvHandler) RegisterRoutes(r *gin.RouterGroup) {
 		envs.GET("", h.List)
 		envs.GET("/:id", h.Get)
 		envs.POST("", h.Create)
+		// by-name 走独立静态路径：POST /envs 保持纯 insert（青龙兼容），
+		// 需要按名字 upsert 的脚本走这里。
+		envs.PUT("/by-name", h.UpsertByName)
 		envs.PUT("/:id", h.Update)
 		envs.DELETE("/:id", h.Delete)
 		envs.PUT("/:id/enable", h.Enable)
@@ -1032,6 +1242,8 @@ func (h *EnvHandler) RegisterRoutes(r *gin.RouterGroup) {
 		envs.PUT("/:id/move-top", h.MoveToTop)
 		envs.PUT("/:id/cancel-top", h.CancelMoveToTop)
 		envs.GET("/groups", h.Groups)
+		// 与 /groups 同理：静态路径优先于上面的 /:id，不会被当成 id 走进 Get。
+		envs.GET("/names", h.Names)
 		envs.GET("/export-all", h.ExportAll)
 		envs.POST("/export-files", h.ExportFiles)
 		envs.POST("/import", h.Import)

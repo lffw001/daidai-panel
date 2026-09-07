@@ -133,6 +133,20 @@ func InitDefaultConfigs() {
 		if def.Key == "max_log_content_size" && strings.TrimSpace(existing.Value) == "102400" {
 			normalizedValue = def.DefaultValue
 		}
+		// repo_file_extensions 的历史默认值漏了 mjs，导致 .mjs 脚本在订阅同步时连扫描都进不去
+		// （表现为「仓库拉取成功但 mjs 不建任务」）。库里存的还正好是那份旧默认，说明用户从没动过
+		// 这项配置，直接抬到新默认；用户自己改过的值一律不动，免得覆盖掉「故意不要某后缀」的意图。
+		if def.Key == "repo_file_extensions" && strings.TrimSpace(existing.Value) == LegacyRepoFileExtensions {
+			normalizedValue = def.DefaultValue
+		}
+		// log_background_color 在 v1.8.0 ~ v2.2.3 的默认值是固定深色 #0f172a，v2.2.4 才改成
+		// 「留空跟随明暗主题」。老实例库里那行一直是旧默认，升级不会自愈，表现为浅色面板下
+		// 日志区仍然是黑底。库里存的正好等于旧默认 ⇒ 用户从没动过这项，抬到新默认（空串）；
+		// 用户自己选过的颜色（哪怕也是深色）一律不动。
+		// 写回空串后下次启动 existing.Value 已经是空串、不再命中这条分支，因此是幂等的。
+		if def.Key == "log_background_color" && strings.TrimSpace(existing.Value) == LegacyLogBackgroundColor {
+			normalizedValue = def.DefaultValue
+		}
 		if normalizedValue != existing.Value {
 			updates["value"] = normalizedValue
 		}

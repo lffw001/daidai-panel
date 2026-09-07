@@ -4,6 +4,7 @@ import { useAuthStore } from '@/stores/auth'
 import AlertConfigCard from './components/AlertConfigCard.vue'
 import BackupManagementCard from './components/BackupManagementCard.vue'
 import CaptchaConfigCard from './components/CaptchaConfigCard.vue'
+import ExtraConfigCard from './components/ExtraConfigCard.vue'
 import IPWhitelistCard from './components/IPWhitelistCard.vue'
 import LoginLogsCard from './components/LoginLogsCard.vue'
 import OverviewHeroCard from './components/OverviewHeroCard.vue'
@@ -42,6 +43,7 @@ const {
   updateStatus,
   checkingUpdate,
   updatingPanel,
+  stoppingPanel,
   autoUpdateEnabled,
   savingAutoUpdate,
   lastCheckTime,
@@ -58,6 +60,7 @@ const {
   handleCheckUpdate,
   handleUpdatePanel,
   handleRestartPanel,
+  handleStopPanel,
   handleToggleAutoUpdate,
   openReleaseNotes,
   closeReleaseNotes,
@@ -70,6 +73,9 @@ const {
   configsLoading,
   configsSaving,
   configForm,
+  extraConfigGroups,
+  extraConfigDraft,
+  handleSaveExtraConfigs,
   loadSystemConfigs,
   handleSaveSystemConfig,
   handleSaveAlertConfig,
@@ -115,6 +121,8 @@ const {
   backupScheduleSelection,
   uploadProgress,
   uploadUploading,
+  // 创建备份的在途锁，透传给备份卡片绑「创建」按钮的 loading
+  backupCreating,
   showRestoreDialog,
   restoreFilename,
   restorePassword,
@@ -147,6 +155,8 @@ const {
   showAddIPDialog,
   newIP,
   newIPRemarks,
+  // 添加 IP 白名单的在途锁，透传给白名单卡片绑「添加」按钮的 loading
+  ipAdding,
   loadBackups,
   handleCreateBackup,
   handleUploadBackup,
@@ -263,8 +273,10 @@ watch(
             :current-version="currentVersion"
             :update-info="updateInfo"
             :update-status="updateStatus"
+            :system-info="systemInfo"
             :checking-update="checkingUpdate"
             :updating-panel="updatingPanel"
+            :stopping-panel="stoppingPanel"
             :auto-update-enabled="autoUpdateEnabled"
             :saving-auto-update="savingAutoUpdate"
             :release-notes-visible="releaseNotesVisible"
@@ -274,6 +286,7 @@ watch(
             :on-check-update="handleCheckUpdate"
             :on-start-update="handleUpdatePanel"
             :on-restart-panel="handleRestartPanel"
+            :on-stop-panel="handleStopPanel"
             :on-toggle-auto-update="handleToggleAutoUpdate"
             :on-open-release-notes="openReleaseNotes"
             :on-close-release-notes="closeReleaseNotes"
@@ -310,6 +323,21 @@ watch(
           :on-icon-upload="handleIconUpload"
           :on-log-background-upload="handleLogBackgroundUpload"
           :on-appearance-preview="previewPanelAppearance"
+        />
+
+        <!--
+          兜底卡片：渲染面板注册了、但本页没有专属表单的配置项（当前是运行时日志输出、
+          守护方式、systemd 服务名三项，都属于「面板与运行时」分组，所以挂在这个标签页）。
+          没有这类配置项时整卡不渲染，页面与改造前完全一致。
+        -->
+        <ExtraConfigCard
+          v-if="extraConfigGroups.length"
+          class="extra-config-card"
+          :configs-loading="configsLoading"
+          :configs-saving="configsSaving"
+          :groups="extraConfigGroups"
+          :draft="extraConfigDraft"
+          :on-save="handleSaveExtraConfigs"
         />
       </el-tab-pane>
 
@@ -403,6 +431,7 @@ watch(
           :restore-progress-error="restoreProgressError"
           :upload-progress="uploadProgress"
           :upload-uploading="uploadUploading"
+          :backup-creating="backupCreating"
           :on-create-backup="handleCreateBackup"
           :on-upload-backup="handleUploadBackup"
           :on-confirm-create-backup="confirmCreateBackup"
@@ -477,6 +506,7 @@ watch(
               v-model:new-i-p-remarks="newIPRemarks"
               :ip-whitelist="ipWhitelist"
               :ip-whitelist-loading="ipWhitelistLoading"
+              :ip-adding="ipAdding"
               :on-load-i-p-whitelist="loadIPWhitelist"
               :on-add-i-p="handleAddIP"
               :on-remove-i-p="handleRemoveIP"
@@ -497,7 +527,8 @@ watch(
   align-items: center;
   margin-bottom: 12px;
   padding: 4px;
-  border-radius: 14px;
+  // 按钮组的灰底槽 → control 档（与槽内按钮同档，圆角一致才不会露出内外错位的角）
+  border-radius: var(--dd-radius-control);
   background: color-mix(in srgb, var(--el-fill-color-light) 84%, transparent);
 }
 
@@ -525,6 +556,11 @@ watch(
   align-items: center;
   gap: 4px;
   font-weight: 500;
+}
+
+// 兜底配置卡跟在「面板外观」卡后面，间距与概览网格保持一致
+.extra-config-card {
+  margin-top: 16px;
 }
 
 // 概览主网格：入场淡入上移，幅度小、走切页动效令牌（reduced-motion 由 global.scss 统一降级）
@@ -571,7 +607,8 @@ watch(
   // 下划线指示条：品牌色，跟随选中项滑动，无填充背景不会被裁切
   .el-tabs__active-bar {
     height: 3px;
-    border-radius: 3px;
+    // 3px 高的下划线指示条属天然胶囊（与进度条同类）→ pill 档
+    border-radius: var(--dd-radius-pill);
     background-color: var(--el-color-primary);
   }
 }

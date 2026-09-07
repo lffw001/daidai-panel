@@ -126,6 +126,11 @@
     </el-card>
 
     <div class="deps-tabs">
+      <!-- 类型页签上各挂一个自己的失败数。三者之和 == 侧栏「依赖管理」角标，
+           用户看到角标 9 时能直接看出是哪一类、各几个，不用挨个切标签去凑。
+           与右边那排状态角标（level="info" + show-zero 的中性计数）刻意不同：
+           这三个是「需要用户处理」的告警，所以用 danger，且为 0 时整个消失，
+           免得三个红 0 常驻抢注意力。 -->
       <div class="status-tabs">
         <button
           :class="['status-tab', { active: activeTab === 'nodejs' }]"
@@ -136,6 +141,11 @@
           "
         >
           Node.js
+          <DdBadge
+            :value="failedByType.nodejs"
+            level="danger"
+            title="Node.js 下安装失败的依赖数"
+          />
         </button>
         <button
           :class="['status-tab', { active: activeTab === 'python' }]"
@@ -146,6 +156,11 @@
           "
         >
           Python3
+          <DdBadge
+            :value="failedByType.python"
+            level="danger"
+            title="Python 下安装失败的依赖数（含所有 Python 版本）"
+          />
         </button>
         <button
           :class="['status-tab', { active: activeTab === 'linux' }]"
@@ -156,8 +171,17 @@
           "
         >
           Linux
+          <DdBadge
+            :value="failedByType.linux"
+            level="danger"
+            title="Linux 下安装失败的依赖数"
+          />
         </button>
       </div>
+      <!-- 状态筛选是【纯前端】的：点这三个按钮只改 statusFilter + 复位页码，不重新请求
+           （对比左边的 Node/Python/Linux 组，那一组每次都 loadData()）。
+           depsApi.list() 一次就把当前运行时的全量依赖拉回来，分页也是前端 slice，
+           所以角标里的数字是真实总数，不是拿当前页凑的。 -->
       <div class="status-tabs status-tabs--filter">
         <button
           :class="['status-tab', { active: statusFilter === '' }]"
@@ -167,6 +191,12 @@
           "
         >
           全部
+          <DdBadge
+            :value="allCount"
+            level="info"
+            show-zero
+            title="当前列表的依赖总数"
+          />
         </button>
         <button
           :class="[
@@ -178,7 +208,13 @@
             depsPage = 1;
           "
         >
-          已安装 <span class="status-tab__count">{{ installedCount }}</span>
+          已安装
+          <DdBadge
+            :value="installedCount"
+            level="info"
+            show-zero
+            title="已安装的依赖数"
+          />
         </button>
         <button
           :class="[
@@ -190,39 +226,36 @@
             depsPage = 1;
           "
         >
-          失败 <span class="status-tab__count">{{ failedCount }}</span>
+          失败
+          <DdBadge
+            :value="failedCount"
+            level="info"
+            show-zero
+            title="安装失败的依赖数"
+          />
         </button>
       </div>
     </div>
 
     <div class="toolbar">
       <div class="toolbar__left">
-        <el-button
+        <!-- 原来这里平铺 5 个按钮（新增依赖 / 刷新 / 批量重装 / 导出清单 / 镜像源设置），
+             主次不分、横着吃掉半条工具条。改成 Split Button：
+             主体是「新增依赖」——它只打开一个弹窗，是这 5 个里点错代价最小的一个；
+             其余 4 项收进菜单。原按钮的 :loading 在菜单项里没有对应表达，
+             降级成 disabled（见 toolbarActionItems），避免刷新/导出进行中被重复点。 -->
+        <DdSplitButton
+          label="新增依赖"
+          :icon="Plus"
           type="primary"
+          size="default"
+          :items="toolbarActionItems"
           @click="
             createType = activeTab;
             showCreateDialog = true;
           "
-        >
-          <el-icon><Plus /></el-icon> 新增依赖
-        </el-button>
-        <el-button @click="loadData" :loading="loading">
-          <el-icon><Refresh /></el-icon> 刷新
-        </el-button>
-        <el-button
-          type="warning"
-          plain
-          @click="handleBatchReinstall"
-          :disabled="batchReinstallIds.length === 0"
-        >
-          <el-icon><RefreshRight /></el-icon> 批量重装
-        </el-button>
-        <el-button @click="handleExport" :loading="exporting">
-          <el-icon><Download /></el-icon> 导出清单
-        </el-button>
-        <el-button @click="openMirrorDialog">
-          <el-icon><Setting /></el-icon> 镜像源设置
-        </el-button>
+          @command="onToolbarAction"
+        />
       </div>
       <div class="toolbar__right">
         <el-select
@@ -284,14 +317,19 @@
           <el-option label="已取消" value="cancelled" />
           <el-option label="卸载中" value="removing" />
         </el-select>
-        <el-button
-          v-if="selectedIds.length > 0"
-          type="danger"
-          plain
-          @click="handleBatchDelete"
-        >
-          <el-icon><Delete /></el-icon> 批量卸载
-        </el-button>
+        <!-- 勾选后凭空冒出一个红按钮会把工具条右区顶一下。淡入淡出让它「浮现」出来，
+             而不是瞬间插进去。只做 opacity：按钮的宽度仍是即时占位的，
+             如果连宽度/高度一起过渡，工具条会在动画期间持续重排，整页跟着抖。 -->
+        <Transition name="dd-batch-fade">
+          <el-button
+            v-if="selectedIds.length > 0"
+            type="danger"
+            plain
+            @click="handleBatchDelete"
+          >
+            <el-icon><Delete /></el-icon> 批量卸载
+          </el-button>
+        </Transition>
       </div>
     </div>
 
@@ -350,18 +388,22 @@
             <div class="dd-mobile-card__field">
               <span class="dd-mobile-card__label">状态</span>
               <div class="dd-mobile-card__value">
-                <el-tag
-                  :type="statusType(row.status)"
-                  size="small"
-                  effect="light"
-                  >{{ statusLabel(row.status) }}</el-tag
-                >
+                <!-- 与桌面表格同一套过渡：key 绑状态值，只做 opacity -->
+                <Transition name="dd-status-switch" mode="out-in">
+                  <el-tag
+                    :key="row.status"
+                    :type="statusType(row.status)"
+                    size="small"
+                    effect="light"
+                    >{{ statusLabel(row.status) }}</el-tag
+                  >
+                </Transition>
               </div>
             </div>
             <div class="dd-mobile-card__field">
               <span class="dd-mobile-card__label">创建时间</span>
               <span class="dd-mobile-card__value">{{
-                new Date(row.created_at).toLocaleString("zh-CN")
+                formatDateTime(row.created_at)
               }}</span>
             </div>
             <div v-if="activeTab === 'python'" class="dd-mobile-card__field">
@@ -465,68 +507,57 @@
             }}</el-tag>
           </template>
         </el-table-column>
+        <!-- 依赖状态是全站流转最密集的一处：排队中 → 安装中 → 已安装/失败，
+             卸载时还会走 卸载中 → 行消失，全靠 3s 轮询推进。硬切换时用户只会看到
+             文字突然变了，分不清是自己看漏了还是真的变了。out-in 让旧标签先淡出、
+             新标签再淡入，交接过程本身就是「状态更新了」的信号。
+             key 必须绑 row.status（状态值）：绑 row.id 的话同一行的 key 永远不变，
+             过渡一次也不会触发。
+             只做 opacity，不做位移——表格行里的位移会带着整行一起晃。 -->
         <el-table-column label="状态" width="100" align="center">
           <template #default="{ row }">
-            <el-tag
-              :type="statusType(row.status)"
-              size="small"
-              effect="light"
-              round
-              >{{ statusLabel(row.status) }}</el-tag
-            >
+            <Transition name="dd-status-switch" mode="out-in">
+              <el-tag
+                :key="row.status"
+                :type="statusType(row.status)"
+                size="small"
+                effect="light"
+                round
+                >{{ statusLabel(row.status) }}</el-tag
+              >
+            </Transition>
           </template>
         </el-table-column>
         <el-table-column prop="created_at" label="创建时间" width="180">
           <template #default="{ row }">
-            <span class="time-text">{{
-              new Date(row.created_at).toLocaleString("zh-CN")
-            }}</span>
+            <span class="time-text">{{ formatDateTime(row.created_at) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="176" fixed="right" align="center">
+        <!-- 原来是「详情 + 取消/重装 + 更多▾」的手工版 split button：三个 text 按钮
+             靠 .action-btns 的 gap 拼出来，还得把按钮压到 26px 才塞得进 176px。
+             换成真正的 DdSplitButton 后只剩一个按钮组。
+             宽度是【浏览器实测】的，不是估的（估算口诀在 caret 那一项上会算小）：
+               主体「详情」42px（2×12 文字 + 本页 .action-btns 覆盖的 8px×2 内边距 + 2px 边框）
+               caret     32px  ← 不是 24px。EP 的 `.el-dropdown--small .el-dropdown__caret-button
+                                { width: 24px }` 命中不了：el-dropdown 根节点只挂
+                                `el-dropdown` + `is-disabled`，不带 size 修饰类，
+                                所以 size="small" 的 caret 实际吃的是基础档 32px。
+               合计 42 + 32 − 1（button-group 的 -1px 负边距）= 73px
+             .el-table .cell 是 padding:0 12px，可用内容宽 = 列宽 − 24。
+             列宽 176 → 110（可用 86px，余量 13px，与环境变量页同口径）。
+             最初改成 100 时余量只剩 3px，够是够，但把「详情」改成任何 3 字标签就会溢出，
+             而 .cell 一溢出就会变成可滚动容器、点按钮时整行左移且不复位。 -->
+        <el-table-column label="操作" width="110" fixed="right" align="center">
           <template #default="{ row }">
             <div class="action-btns">
-              <el-button type="primary" text size="small" @click="viewLog(row)"
-                >详情</el-button
-              >
-              <el-button
-                v-if="row.status === 'installing' || row.status === 'removing'"
-                type="warning"
-                text
+              <DdSplitButton
+                label="详情"
+                type="primary"
                 size="small"
-                @click="handleCancel(row)"
-                >取消</el-button
-              >
-              <el-button
-                v-else
-                type="warning"
-                text
-                size="small"
-                @click="handleReinstall(row)"
-                :disabled="isProcessing(row.status)"
-                >重装</el-button
-              >
-              <el-dropdown trigger="click" placement="bottom-end">
-                <el-button text size="small" class="action-more-btn">
-                  更多
-                  <el-icon><ArrowDown /></el-icon>
-                </el-button>
-                <template #dropdown>
-                  <el-dropdown-menu>
-                    <el-dropdown-item
-                      @click="handleDelete(row)"
-                      :disabled="isProcessing(row.status)"
-                      >卸载</el-dropdown-item
-                    >
-                    <el-dropdown-item
-                      @click="handleForceDelete(row)"
-                      :disabled="isProcessing(row.status)"
-                    >
-                      <span class="danger-dropdown-text">强制卸载</span>
-                    </el-dropdown-item>
-                  </el-dropdown-menu>
-                </template>
-              </el-dropdown>
+                :items="depActionItems(row)"
+                @click="viewLog(row)"
+                @command="(key: string) => onDepAction(key, row)"
+              />
             </div>
           </template>
         </el-table-column>
@@ -599,31 +630,56 @@
       :fullscreen="dialogFullscreen"
     >
       <div class="log-dialog-toolbar">
-        <div>
-          <el-tag
-            v-if="!logDone"
-            type="warning"
-            size="small"
-            class="running-tag"
-          >
-            <LoadingMotion
-              variant="dots"
-              size="sm"
-              tone="warning"
-              :stacked="false"
-            />
-            <span>执行中</span>
-          </el-tag>
-          <el-tag
-            v-else-if="currentLogRow?.status === 'cancelled'"
-            type="info"
-            size="small"
-            >已取消</el-tag
-          >
-          <el-tag v-else type="success" size="small">已完成</el-tag>
+        <div class="log-dialog-status">
+          <!-- 这个标签必须读依赖行的真实 status，不能读「日志流是否结束」。
+               以前用 logDone 判定，导致日志流断开（例如长时间无输出）时明明还在装，
+               却显示成绿色的「已完成」。 -->
+          <!-- 弹窗开着的时候状态是由 SSE / 轮询实时推进的，这里是用户盯得最紧的一处，
+               同样包 out-in。key 绑的是状态值而不是分支：
+                 - 前两个分支之间（安装中 → 失败）跨分支切，会触发；
+                 - 分支内部（排队中 → 安装中，两者都算 isProcessing）状态值变了也会触发，
+                   靠分支切换的隐式 key 反而漏掉这一档。
+               「已卸载」分支没有对应的 status（行已被后端删掉），单独给个静态 key。 -->
+          <Transition name="dd-status-switch" mode="out-in">
+            <el-tag v-if="logRowRemoved" key="removed" type="success" size="small"
+              >已卸载</el-tag
+            >
+            <el-tag
+              v-else-if="currentLogRow && isProcessing(currentLogRow.status)"
+              :key="currentLogRow.status"
+              type="warning"
+              size="small"
+              class="running-tag"
+            >
+              <LoadingMotion
+                variant="dots"
+                size="sm"
+                tone="warning"
+                :stacked="false"
+              />
+              <span>{{ statusLabel(currentLogRow.status) }}</span>
+            </el-tag>
+            <el-tag
+              v-else-if="currentLogRow"
+              :key="currentLogRow.status"
+              :type="statusType(currentLogRow.status)"
+              size="small"
+              >{{ statusLabel(currentLogRow.status) }}</el-tag
+            >
+          </Transition>
+          <el-tag v-if="logStreamNotice" type="info" size="small">{{
+            logStreamNotice
+          }}</el-tag>
         </div>
+        <!-- 只有 installing / removing 能取消：服务端的 Cancel 接口对 queued 直接返回 400
+             「当前依赖任务未在处理中」，把按钮显示出来只会让用户点了报错。 -->
         <el-button
-          v-if="currentLogRow && !logDone"
+          v-if="
+            currentLogRow &&
+            !logRowRemoved &&
+            (currentLogRow.status === 'installing' ||
+              currentLogRow.status === 'removing')
+          "
           type="warning"
           plain
           size="small"
@@ -799,6 +855,7 @@ import {
 } from "vue";
 import {
   depsApi,
+  type DepsFailedByType,
   type MirrorsResponse,
   type PythonRuntimeInfo,
 } from "@/api/deps";
@@ -809,7 +866,6 @@ import {
 } from "@/api/androidRuntime";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
-  ArrowDown,
   Box,
   Cpu,
   Delete,
@@ -820,13 +876,20 @@ import {
   Search,
   Setting,
 } from "@element-plus/icons-vue";
+import DdSplitButton from "@/components/ui/DdSplitButton.vue";
+import type { SplitButtonItem } from "@/components/ui/DdSplitButton.vue";
+import DdBadge from "@/components/ui/DdBadge.vue";
 import {
   openAuthorizedEventStream,
   type EventStreamConnection,
 } from "@/utils/sse";
 import { usePageActivity } from "@/composables/usePageActivity";
 import { useResponsive } from "@/composables/useResponsive";
+import { useBadgesStore } from "@/stores/badges";
 import { ansiToHtml, normalizeAnsi } from "@/utils/ansi";
+import { formatDateTime } from "@/utils/datetime";
+
+const badgesStore = useBadgesStore();
 
 // ---------- Android 面具版脚本运行时 ----------
 const androidStatus = ref<AndroidRuntimeStatus | null>(null);
@@ -947,6 +1010,16 @@ const pythonRuntimeInstallSummary = computed(() => {
   return labels.length > 0 ? labels.join(" / ") : "Python 3.12";
 });
 const depsList = ref<any[]>([]);
+/**
+ * Node.js / Python3 / Linux 三个类型页签上各自的失败数，由 GET /deps 一并带回。
+ *
+ * 【为什么不在前端自己数】
+ * depsList 只有【当前选中类型】（python 还只有当前版本）的依赖，数出来的失败数
+ * 永远只是三分之一，与侧栏那个跨类型汇总的角标对不上——这正是用户看到「侧栏 9、
+ * 页面失败 2」的原因。服务端那份是全量统计，且本页本来就在轮询这个接口，
+ * 计数天然新鲜、零额外请求。
+ */
+const failedByType = ref<DepsFailedByType>({ nodejs: 0, python: 0, linux: 0 });
 const loading = ref(false);
 const showCreateDialog = ref(false);
 const showLogDialog = ref(false);
@@ -954,7 +1027,13 @@ const logContent = ref("");
 const logContentHtml = computed(() =>
   ansiToHtml(normalizeAnsi(logContent.value || "暂无日志")),
 );
+// logDone 的语义是「日志流已结束」，不等于「任务已完成」。
+// 任务是否完成一律看 currentLogRow.status。
 const logDone = ref(true);
+// 日志流意外断开（服务端硬超时、网络中断）时给用户的提示，避免用户以为任务停了。
+const logStreamNotice = ref("");
+// 依赖已被后端删除（卸载成功）。此时 currentLogRow 只是个查不到对应行的旧快照。
+const logRowRemoved = ref(false);
 const currentLogRow = ref<any | null>(null);
 let eventSource: EventStreamConnection | null = null;
 const logContainerRef = ref<HTMLElement>();
@@ -976,6 +1055,85 @@ const batchReinstallRows = computed(() =>
 const batchReinstallIds = computed(() =>
   batchReinstallRows.value.map((dep) => dep.id),
 );
+
+/**
+ * 工具栏 Split Button 的菜单项。
+ *
+ * 主体是「新增依赖」（写在模板上），它只打开弹窗，点错了不产生任何副作用。
+ * 「批量重装」是这一组里唯一会立刻对多行下手的写操作，用 divided 与三个
+ * 只读/设置类操作隔开；它不是不可撤销操作，所以不标 danger。
+ * 必须是 computed：刷新/导出的进行中状态和「有没有可重装的选中项」都会变。
+ */
+const toolbarActionItems = computed<SplitButtonItem[]>(() => [
+  { key: "refresh", label: "刷新", icon: Refresh, disabled: loading.value },
+  {
+    key: "export",
+    label: "导出清单",
+    icon: Download,
+    disabled: exporting.value,
+  },
+  { key: "mirror", label: "镜像源设置", icon: Setting },
+  {
+    key: "batch-reinstall",
+    label: "批量重装",
+    icon: RefreshRight,
+    divided: true,
+    disabled: batchReinstallIds.value.length === 0,
+  },
+]);
+
+function onToolbarAction(key: string) {
+  if (key === "refresh") loadData();
+  else if (key === "export") handleExport();
+  else if (key === "mirror") openMirrorDialog();
+  else if (key === "batch-reinstall") handleBatchReinstall();
+}
+
+/**
+ * 操作列 Split Button 的菜单项，按行状态生成。
+ *
+ * 主体固定是「详情」——只打开日志弹窗，六种状态下都可用、点错零代价。
+ * 「取消 / 重装」互斥：只有 installing / removing 能取消（服务端对 queued 的
+ * Cancel 直接返回 400），所以用 visible 联动，绝不会出现「安装中的行菜单里
+ * 同时挂着取消和重装」。queued 行仍然显示重装但禁用，与改造前一致。
+ * 「卸载 / 强制卸载」不可撤销，只能待在菜单里并标红；divided 只加在危险组的
+ * 第一项，用一条分隔线把这两项整体隔开——两项都加会在它们中间再画一条线，
+ * 反而把同一组危险操作拆散。
+ */
+function depActionItems(row: any): SplitButtonItem[] {
+  const cancellable = row.status === "installing" || row.status === "removing";
+  const processing = isProcessing(row.status);
+  return [
+    { key: "cancel", label: "取消", visible: cancellable },
+    {
+      key: "reinstall",
+      label: "重装",
+      visible: !cancellable,
+      disabled: processing,
+    },
+    {
+      key: "delete",
+      label: "卸载",
+      danger: true,
+      divided: true,
+      disabled: processing,
+    },
+    {
+      key: "force-delete",
+      label: "强制卸载",
+      danger: true,
+      disabled: processing,
+    },
+  ];
+}
+
+function onDepAction(key: string, row: any) {
+  if (key === "cancel") handleCancel(row);
+  else if (key === "reinstall") handleReinstall(row);
+  else if (key === "delete") handleDelete(row);
+  else if (key === "force-delete") handleForceDelete(row);
+}
+
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 const { isMobile, dialogFullscreen } = useResponsive();
 const { isPageActive } = usePageActivity();
@@ -999,23 +1157,33 @@ let mounted = false;
 const searchKeyword = ref("");
 const statusFilter = ref("");
 
+/**
+ * 只套了搜索词、还没套状态筛选的列表。
+ *
+ * 状态标签页上的角标要数的就是它：点某个状态标签 = 在这份列表上再加一层状态过滤，
+ * 所以角标数字和点进去看到的条数天然一致。
+ * 如果角标改成直接数 depsList（无视搜索词），搜索状态下就会出现
+ * 「失败 3」点进去却是空列表的自相矛盾。
+ */
+const searchScopedDeps = computed(() => {
+  if (!searchKeyword.value) return depsList.value;
+  const kw = searchKeyword.value.toLowerCase();
+  return depsList.value.filter((dep) => dep.name?.toLowerCase().includes(kw));
+});
+
+const allCount = computed(() => searchScopedDeps.value.length);
 const failedCount = computed(
-  () => depsList.value.filter((dep) => dep.status === "failed").length,
+  () => searchScopedDeps.value.filter((dep) => dep.status === "failed").length,
 );
 const installedCount = computed(
-  () => depsList.value.filter((dep) => dep.status === "installed").length,
+  () =>
+    searchScopedDeps.value.filter((dep) => dep.status === "installed").length,
 );
 
 const filteredDepsList = computed(() => {
-  let list = depsList.value;
-  if (searchKeyword.value) {
-    const kw = searchKeyword.value.toLowerCase();
-    list = list.filter((dep) => dep.name?.toLowerCase().includes(kw));
-  }
-  if (statusFilter.value) {
-    list = list.filter((dep) => dep.status === statusFilter.value);
-  }
-  return list;
+  const list = searchScopedDeps.value;
+  if (!statusFilter.value) return list;
+  return list.filter((dep) => dep.status === statusFilter.value);
 });
 
 const paginatedDepsList = computed(() => {
@@ -1178,14 +1346,20 @@ async function loadData() {
       activeTab.value === "python" ? pythonVersion.value : undefined,
     );
     depsList.value = res.data || [];
+    // 三个类型页签上的失败数由服务端一并带回（跨类型全量，python 跨所有版本）。
+    // 老版本服务端没有这个字段，读不到就退回全 0，别把 undefined 渲染出去。
+    failedByType.value = res.failed_by_type || { nodejs: 0, python: 0, linux: 0 };
     selectedIds.value = selectedIds.value.filter((id) =>
       depsList.value.some((dep) => dep.id === id),
     );
+    syncCurrentLogRow();
     syncPendingRefresh();
   } catch {
     if (!refreshTimer) {
       depsList.value = [];
     }
+    // failedByType 刻意不清零：网络抖一下就把「有 3 个失败」的提示抹掉，
+    // 比不显示更糟——失败数保留上一次的值，只在请求成功时整体替换。
     syncPendingRefresh();
   } finally {
     loading.value = false;
@@ -1486,9 +1660,32 @@ async function handleCancel(row: any) {
   }
 }
 
+// currentLogRow 原本只是打开弹窗那一刻的快照，列表刷新后不会跟着变，
+// 于是后端把状态改成 failed 时弹窗里还停在旧状态。这里在每次拉列表后回填。
+function syncCurrentLogRow() {
+  const current = currentLogRow.value;
+  if (!current) {
+    return;
+  }
+  const fresh = depsList.value.find((dep) => dep.id === current.id);
+  if (fresh) {
+    currentLogRow.value = fresh;
+    return;
+  }
+  // 卸载成功后后端会直接删掉这一行（deleteOnSuccess），列表里再也找不到它。
+  // 不识别这种情况的话，弹窗会一直停在快照里的「卸载中」，
+  // 「取消当前任务」按钮也会常亮，点下去必然 404。
+  // 只在日志流已经结束后才认定为已删除，避免切换 tab 造成的误判。
+  if (logDone.value) {
+    logRowRemoved.value = true;
+  }
+}
+
 function viewLog(row: any) {
   currentLogRow.value = row;
   logContent.value = "";
+  logStreamNotice.value = "";
+  logRowRemoved.value = false;
   logDone.value = !(row.status === "installing" || row.status === "removing");
   showLogDialog.value = true;
 
@@ -1523,15 +1720,22 @@ function viewLog(row: any) {
       }
     },
     onEvent(event) {
-      if (event.event === "done") {
-        logDone.value = true;
-        closeSSE();
-        loadData();
+      if (event.event !== "done") {
+        return;
       }
+      logDone.value = true;
+      closeSSE();
+      // data 携带的是结束原因：真实终态（installed/failed/...）表示任务确实结束了；
+      // timeout 只代表服务端把这条日志流收了，任务本身可能还在跑，不能当成结束。
+      if ((event.data || "").trim() === "timeout") {
+        logStreamNotice.value = "日志流已断开，任务可能仍在进行";
+      }
+      loadData();
     },
     onError() {
       logDone.value = true;
       closeSSE();
+      logStreamNotice.value = "日志流已断开，任务可能仍在进行";
       loadData();
     },
   });
@@ -1548,6 +1752,8 @@ watch(showLogDialog, (val) => {
   if (!val) {
     closeSSE();
     currentLogRow.value = null;
+    logStreamNotice.value = "";
+    logRowRemoved.value = false;
   }
 });
 
@@ -1622,6 +1828,8 @@ function getLetterColor(name: string): string {
 onMounted(async () => {
   mounted = true;
   createType.value = activeTab.value;
+  // 进页即把侧栏的「依赖管理」失败角标标记为已读——用户已经站在这一页上了，再红着没有意义
+  badgesStore.ackDepsFailed();
   await loadPythonRuntimes();
   createPythonVersion.value = pythonVersion.value || pythonDefaultVersion.value;
   loadData();
@@ -1629,6 +1837,11 @@ onMounted(async () => {
 });
 
 onActivated(() => {
+  // 角标清零刻意放在下面那道 mounted 闸【外面】、且无条件执行：
+  // 那道闸是给 loadData 防重复请求用的（onMounted 刚拉过一次），
+  // 而 MainLayout 的 keep-alive 是 :max="14"，第二次以后进本页只触发 onActivated、
+  // 不再触发 onMounted，写进 if 里就只有首次访问才会清零。
+  badgesStore.ackDepsFailed();
   if (!mounted) {
     void loadData();
   }
@@ -1737,11 +1950,11 @@ onBeforeUnmount(() => {
 }
 
 // ---------- Table Card ----------
-// 表格卡：圆角/阴影/边框全部对齐卡片令牌；本页是滚动页（dd-scroll-page），不做 fixed 高度链处理。
+// 表格卡：无阴影，仅用 1px 边框与页面底色区分；本页是滚动页（dd-scroll-page），不做 fixed 高度链处理。
 .table-card {
   background: var(--el-bg-color);
-  border-radius: var(--dd-card-radius);
-  box-shadow: var(--dd-shadow-card);
+  // 表格容器属容器类表面 → surface 档；overflow:hidden 让内部贴边的表头/行自动被圆角裁角
+  border-radius: var(--dd-radius-surface);
   border: 1px solid var(--el-border-color-lighter);
   overflow: hidden;
 }
@@ -1753,10 +1966,11 @@ onBeforeUnmount(() => {
   min-width: 0;
 }
 
+// 依赖名首字头像：形状承载语义（圆形=头像/身份标识），两种圆角模式下都固定正圆，不吃 --dd-radius-* 令牌
 .dep-name-avatar {
   width: 24px;
   height: 24px;
-  border-radius: 8px;
+  border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1764,7 +1978,6 @@ onBeforeUnmount(() => {
   font-size: 11px;
   font-weight: 700;
   color: #fff;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
 }
 
 .deps-tabs {
@@ -1775,20 +1988,23 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
 }
 
-// 状态分段控件：与定时任务页/执行日志页/订阅页/环境变量页一致的胶囊容器 + 选中态白底品牌色 + 卡片阴影令牌。
+// 状态分段控件：与定时任务页/执行日志页/订阅页/环境变量页一致的分段容器 + 选中态白底品牌色 + 1px 边框。
 // 本页有两组：①运行时切换（Node/Python3/Linux）②状态筛选（.status-tabs--filter，含已安装/失败计数），
 // 共用同一套观感，使两组视觉统一。
 .status-tabs {
   display: inline-flex;
   background: var(--el-fill-color-light);
-  border-radius: var(--dd-radius-sm);
+  // 分段控件的灰底槽属控件类表面 → control 档（与槽内的项同档，两者一致才不会露出内外错位的角）
+  border-radius: var(--dd-radius-control);
   padding: 3px;
   gap: 2px;
 }
 .status-tab {
   padding: 6px 14px;
-  border-radius: 7px;
-  border: none;
+  // 分段项属控件类表面 → control 档
+  border-radius: var(--dd-radius-control);
+  // 未选中态用透明边框占位，选中态只换边框颜色，避免尺寸跳动
+  border: 1px solid transparent;
   background: transparent;
   color: var(--el-text-color-secondary);
   font-size: 13px;
@@ -1797,7 +2013,7 @@ onBeforeUnmount(() => {
   transition:
     color var(--dd-motion-fast) var(--dd-ease-standard),
     background-color var(--dd-motion-fast) var(--dd-ease-standard),
-    box-shadow var(--dd-motion-fast) var(--dd-ease-standard);
+    border-color var(--dd-motion-fast) var(--dd-ease-standard);
   white-space: nowrap;
   display: inline-flex;
   align-items: center;
@@ -1808,10 +2024,11 @@ onBeforeUnmount(() => {
   &.active {
     background: var(--el-bg-color);
     color: var(--el-color-primary);
-    box-shadow: var(--dd-shadow-card);
+    border-color: var(--el-border-color-lighter);
     font-weight: 600;
   }
-  // 成功/失败筛选选中态用语义色，与计数徽标协调
+  // 成功/失败筛选选中态用语义色，标出「这一档筛的是哪类结果」。
+  // 语义色只上在标签文字上，角标本身保持中性——见下方说明。
   &--success.active {
     color: var(--el-color-success);
   }
@@ -1819,30 +2036,13 @@ onBeforeUnmount(() => {
     color: var(--el-color-danger);
   }
 }
-// 计数徽标：默认次级底色；选中态跟随分段控件语义色（已安装=success / 失败=danger）反白
-.status-tab__count {
-  font-size: 11px;
-  font-weight: 700;
-  min-width: 18px;
-  height: 18px;
-  line-height: 18px;
-  text-align: center;
-  border-radius: 9px;
-  background: var(--el-fill-color);
-  color: var(--el-text-color-secondary);
-  display: inline-block;
-  transition:
-    color var(--dd-motion-fast) var(--dd-ease-standard),
-    background-color var(--dd-motion-fast) var(--dd-ease-standard);
-  .status-tab--success.active & {
-    background: var(--el-color-success);
-    color: #fff;
-  }
-  .status-tab--danger.active & {
-    background: var(--el-color-danger);
-    color: #fff;
-  }
-}
+// 计数徽标改用 DdBadge（level="info" + show-zero），原来手写的 .status-tab__count 删除。
+// 两点变化，都是有意的：
+//  1. 统一到全站唯一的角标实现，顺带白拿翻牌动效——本页角标会随 3s 轮询跳字
+//     （安装完成时「已安装」+1、「失败」可能同时 +1），跳字比静默换数字更能被注意到。
+//  2. 放弃原来「选中态反白成 success/danger 实心」的处理。设计系统里 danger 实心是
+//     留给「需要用户处理」的，这三个角标只是中性计数；一个实心红的「失败 0」会和
+//     真正要处理的告警抢注意力。现在筛选态由标签文字的语义色表达，角标始终中性描边。
 .dep-name-text {
   min-width: 0;
   overflow: hidden;
@@ -1861,6 +2061,13 @@ onBeforeUnmount(() => {
   font-size: 12px;
   color: var(--el-text-color-regular);
 }
+// 操作列按钮组。
+// 尺寸口径变更：原来这里把按钮压到 height:26px / padding:0 5px / font-size:12px，
+// 比全站其它页（定时任务页/执行日志页/订阅页的 padding:4px 8px）更紧一档——那是为了在
+// 176px 列宽里硬塞下「详情 + 取消/重装 + 更多▾」三个按钮。现在整列只剩一个 Split Button，
+// 不需要再压，统一回其它页的 padding: 4px 8px；列宽估算（详情 40px + caret 24px）也按这个口径算。
+// .action-more-btn（手写 caret 的 gap）和 .danger-dropdown-text（手写红色强制卸载）
+// 随手工版一起删除：前者由 DdSplitButton 自带的 caret 半边取代，后者由 item.danger 取代。
 .action-btns {
   display: flex;
   align-items: center;
@@ -1868,26 +2075,17 @@ onBeforeUnmount(() => {
   gap: 4px;
   min-width: 0;
 
-  :deep(.el-button) {
-    height: 26px;
-    padding: 0 5px;
-    margin-left: 0;
-    font-size: 12px;
+  // caret 半边保持 EP 自己的窄内边距（--small 档约 24px 宽），
+  // 一起套 8px 会把它撑宽，列宽余量随之失准。
+  :deep(.el-button:not(.el-dropdown__caret-button)) {
+    padding: 4px 8px;
   }
 
+  // EP 自带 `.el-button + .el-button { margin-left: 12px }`，split button 的两个半边
+  // 正是相邻的 el-button，不清零会在按钮组中间裂开一道 12px。
   :deep(.el-button + .el-button) {
     margin-left: 0;
   }
-}
-
-.action-more-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.danger-dropdown-text {
-  color: var(--el-color-danger);
 }
 
 // ---------- Pagination ----------
@@ -1937,7 +2135,8 @@ onBeforeUnmount(() => {
 
 // ---------- Log dialog ----------
 .log-content {
-  border-radius: 6px;
+  // 安装日志面板属容器类表面 → surface 档（弹窗 body 有内边距，不贴边，不会露角）
+  border-radius: var(--dd-radius-surface);
   padding: 16px;
   font-family: var(--dd-font-mono);
   font-size: 13px;
@@ -1958,6 +2157,14 @@ onBeforeUnmount(() => {
   margin-bottom: 8px;
 }
 
+.log-dialog-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
 .mirror-hint {
   font-size: 12px;
   color: var(--el-text-color-secondary);
@@ -1969,6 +2176,33 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+// ===== 状态标签切换过渡 =====
+// 表格状态列 / 移动卡片 / 日志弹窗共用。
+// 只过渡 opacity：状态标签在表格行里，做位移会连带整行一起晃；
+// 做缩放又违反「hover/active 禁 transform 位移或缩放」的同一条扁平约束。
+// 时长/缓动全走令牌，prefers-reduced-motion 下令牌自动降到 1ms，等效关闭。
+.dd-status-switch-enter-active,
+.dd-status-switch-leave-active {
+  transition: opacity var(--dd-motion-fast) var(--dd-ease-standard);
+}
+
+.dd-status-switch-enter-from,
+.dd-status-switch-leave-to {
+  opacity: 0;
+}
+
+// ===== 批量操作按钮进出场 =====
+// 同样只做 opacity，不碰宽高——工具条是 flex 行，尺寸类过渡会让整条工具条持续重排。
+.dd-batch-fade-enter-active,
+.dd-batch-fade-leave-active {
+  transition: opacity var(--dd-motion-fast) var(--dd-ease-standard);
+}
+
+.dd-batch-fade-enter-from,
+.dd-batch-fade-leave-to {
+  opacity: 0;
 }
 
 // ---------- Responsive ----------
@@ -2024,16 +2258,13 @@ onBeforeUnmount(() => {
     flex-direction: column;
     align-items: stretch;
     gap: 10px;
+    // 原来是「5 个按钮排两列网格 + 每个按钮 width:100%」。现在左区只剩一个 Split Button，
+    // 两列网格会把它压成半行宽；而 `:deep(.el-button){width:100%}` 会让它的主体与 caret
+    // 两个半边各自撑到按钮组的 100%，直接溢出。改回单行 flex，按钮取自身自然宽度。
     &__left {
       width: 100%;
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      display: flex;
       gap: 8px;
-
-      :deep(.el-button) {
-        width: 100%;
-        margin-left: 0;
-      }
     }
     &__right {
       flex-direction: column;
@@ -2089,7 +2320,8 @@ onBeforeUnmount(() => {
 }
 .runtime-item {
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
+  // 运行时条目是弹窗内的列表卡片，属容器类表面 → surface 档
+  border-radius: var(--dd-radius-surface);
   padding: 12px 14px;
   margin-bottom: 12px;
   background: var(--el-fill-color-lighter);
@@ -2129,7 +2361,8 @@ onBeforeUnmount(() => {
 }
 .android-runtime-log pre {
   background: var(--el-fill-color);
-  border-radius: 6px;
+  // 运行时安装日志代码块属容器类表面 → surface 档（上方有虚线分隔+padding-top，不贴边）
+  border-radius: var(--dd-radius-surface);
   padding: 10px 12px;
   font-size: 12px;
   max-height: 240px;
@@ -2138,7 +2371,8 @@ onBeforeUnmount(() => {
 }
 
 // ===== 入场动画 =====
-// 与定时任务页/执行日志页/订阅页/环境变量页统一：只对卡片级容器（状态标签区 / 工具条 / 表格卡 / 移动列表）
+// 与定时任务页/执行日志页/订阅页/环境变量页统一：只对卡片级容器
+// （Android 运行时卡 / 状态标签区 / 工具条 / 表格卡 / 移动列表）
 // 做克制的淡入上移 + 轻微错落；不给表格每一行或每张移动卡做 stagger。
 // 时长走令牌，prefers-reduced-motion 时令牌自动降为 1ms 即等效关闭。
 @keyframes dd-deps-rise-in {
@@ -2152,6 +2386,10 @@ onBeforeUnmount(() => {
   }
 }
 
+// android-runtime-card 也是卡片级容器，而且是页面最上面那一块：原来它不参与入场，
+// 下面几块却都在淡入上移，视觉上像是「上半页没加载完」。
+// 它是异步的（loadAndroidStatus 返回后才 v-if 成立），补上入场后从「突然弹出」变成淡入。
+.android-runtime-card,
 .deps-tabs,
 .toolbar,
 .table-card,

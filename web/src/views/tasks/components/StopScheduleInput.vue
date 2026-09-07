@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import { taskApi } from '@/api/task'
+import { formatDateTime } from '@/utils/datetime'
 
 type StopRuleState = {
   id: number
@@ -165,7 +166,7 @@ function handleKeyDown(event: KeyboardEvent) {
             <div v-if="rule.parseResult.next_run_times?.length" class="next-times">
               <el-icon class="time-icon"><Clock /></el-icon>
               <span class="label">下次停止</span>
-              <span class="time-value">{{ new Date(rule.parseResult.next_run_times[0]).toLocaleString() }}</span>
+              <span class="time-value">{{ formatDateTime(rule.parseResult.next_run_times[0]) }}</span>
             </div>
           </div>
         </template>
@@ -240,11 +241,11 @@ function handleKeyDown(event: KeyboardEvent) {
   align-items: center;
   gap: 4px;
   padding: 4px 10px;
-  background: linear-gradient(135deg, #67c23a 0%, #85ce61 100%);
-  border-radius: 14px;
+  background: var(--el-color-success);
+  // 与 .error-badge 是同一槽位互斥的两态，统一走 control 档，避免有效/错误之间形状跳变
+  border-radius: var(--dd-radius-control);
   color: #fff;
   font-weight: 500;
-  box-shadow: 0 2px 6px rgba(103, 194, 58, 0.25);
 
   .badge-icon {
     font-size: 14px;
@@ -261,11 +262,11 @@ function handleKeyDown(event: KeyboardEvent) {
   align-items: center;
   gap: 4px;
   padding: 4px 10px;
-  background: linear-gradient(135deg, #f56c6c 0%, #f78989 100%);
-  border-radius: 14px;
+  background: var(--el-color-danger);
+  // 校验错误提示块 → control 档（与 CronInput 的同名元素保持一致）
+  border-radius: var(--dd-radius-control);
   color: #fff;
   font-weight: 500;
-  box-shadow: 0 2px 6px rgba(245, 108, 108, 0.25);
 
   .badge-icon {
     font-size: 14px;
@@ -281,8 +282,9 @@ function handleKeyDown(event: KeyboardEvent) {
   align-items: center;
   gap: 5px;
   padding: 4px 10px;
-  background: linear-gradient(135deg, var(--el-color-warning-light-9) 0%, var(--el-color-warning-light-8) 100%);
-  border-radius: 14px;
+  background: var(--el-color-warning-light-9);
+  // 「下次停止」信息小块 → control 档
+  border-radius: var(--dd-radius-control);
   color: var(--el-color-warning);
   font-weight: 500;
   border: 1px solid var(--el-color-warning-light-7);

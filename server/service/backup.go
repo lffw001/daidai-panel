@@ -11,28 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"daidai-panel/config"
-	"daidai-panel/model"
 )
 
 type ScriptFile struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
-}
-
-type BackupData struct {
-	Version   string                `json:"version"`
-	CreatedAt time.Time             `json:"created_at"`
-	Tasks     []model.Task          `json:"tasks"`
-	EnvVars   []model.EnvVar        `json:"env_vars"`
-	Subs      []model.Subscription  `json:"subscriptions"`
-	Channels  []model.NotifyChannel `json:"notify_channels"`
-	SSHKeys   []model.SSHKey        `json:"ssh_keys"`
-	Configs   []model.SystemConfig  `json:"system_configs"`
-	Scripts   []ScriptFile          `json:"scripts,omitempty"`
-	Deps      []model.Dependency    `json:"dependencies,omitempty"`
 }
 
 func collectScripts(scriptsDir string) []ScriptFile {
@@ -44,12 +29,12 @@ func collectScripts(scriptsDir string) []ScriptFile {
 			return nil
 		}
 		if info.IsDir() {
-			if ShouldIgnoreScriptPath(scriptsDir, path) {
+			if ShouldHideScriptTreePath(scriptsDir, path) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if ShouldIgnoreScriptPath(scriptsDir, path) {
+		if ShouldHideScriptTreePath(scriptsDir, path) {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(info.Name()))
@@ -79,7 +64,8 @@ func restoreScripts(scriptsDir string, scripts []ScriptFile) {
 		if strings.Contains(sf.Path, "..") {
 			continue
 		}
-		if ShouldIgnoreScriptRelativePath(sf.Path) {
+		// 逐段遍历：避免旧 JSON 备份把 SmallWorld/.git/... 之类的内容写回脚本目录
+		if ShouldHideScriptTreeRelativePath(sf.Path) {
 			continue
 		}
 		data, err := base64.StdEncoding.DecodeString(sf.Content)

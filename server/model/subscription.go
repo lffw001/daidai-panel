@@ -10,6 +10,12 @@ const (
 	SubTypeGitRepo    = "git-repo"
 	SubAuthTypeSSH    = "ssh"
 	SubAuthTypeToken  = "token"
+
+	// 覆盖拉取策略三态：inherit 跟随全局开关，force 强制覆盖，preserve 强制保留本地。
+	// inherit 是默认值，存量订阅补列后一律落在这一档，升级前后行为完全一致。
+	SubOverwriteInherit  = "inherit"
+	SubOverwriteForce    = "force"
+	SubOverwritePreserve = "preserve"
 )
 
 type Subscription struct {
@@ -22,6 +28,9 @@ type Subscription struct {
 	Whitelist   string     `gorm:"size:512;default:''" json:"whitelist"`
 	Blacklist   string     `gorm:"size:512;default:''" json:"blacklist"`
 	DependOn    string     `gorm:"size:512;default:''" json:"depend_on"`
+	// PreScript 是「拉取前指令」，在 git 拉取之前执行；HookScript 是「拉取后钩子」，
+	// 在拉取成功之后、同步定时任务之前执行。两者共用同一套环境变量与超时。
+	PreScript   string     `gorm:"type:text;default:''" json:"pre_script"`
 	HookScript  string     `gorm:"type:text;default:''" json:"hook_script"`
 	AutoAddTask bool       `gorm:"default:false" json:"auto_add_task"`
 	AutoDelTask bool       `gorm:"default:false" json:"auto_del_task"`
@@ -36,6 +45,16 @@ type Subscription struct {
 	SubPath     string     `gorm:"size:512;default:''" json:"sub_path"`
 	Alias       string     `gorm:"size:128;default:''" json:"alias"`
 	ForceOverwrite *bool   `gorm:"default:true" json:"force_overwrite"`
+	// OverwriteMode 覆盖拉取策略：inherit=跟随全局 / force=强制覆盖 / preserve=强制保留本地。
+	// 作用域只有 git 工作区文件（reset --hard vs stash），与任务的名称、定时无关
+	// —— 详见 task.go SubscriptionLocked 的注释。
+	// 上面那个 ForceOverwrite 是 v2.2.15 之后就没人维护的旧列，只做只读兼容，不再参与判定。
+	OverwriteMode string `gorm:"size:16;not null;default:'inherit'" json:"overwrite_mode"`
+	// FullCheckout 完整检出：开启后放弃 sparse-checkout，把整个仓库拉下来。
+	// 默认 false = 继续走既有的 sparse 逻辑，存量订阅补列后行为逐字节不变。
+	// 存在的理由：青龙生态里 BiliBiliToolPro 这类脚本会去读仓库自己的 src/ 源码编译，
+	// 只检出白名单命中的那几个 .sh 根本跑不起来。代价是整仓体积，所以默认关。
+	FullCheckout bool `gorm:"not null;default:false" json:"full_checkout"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
 }
@@ -55,6 +74,7 @@ func (s *Subscription) ToDict() map[string]interface{} {
 		"whitelist":       s.Whitelist,
 		"blacklist":       s.Blacklist,
 		"depend_on":       s.DependOn,
+		"pre_script":      s.PreScript,
 		"hook_script":     s.HookScript,
 		"auto_add_task":   s.AutoAddTask,
 		"auto_del_task":   s.AutoDelTask,
@@ -68,7 +88,11 @@ func (s *Subscription) ToDict() map[string]interface{} {
 		"auth_username":   s.AuthUsername,
 		"has_auth_token":  s.HasAuthToken(),
 		"alias":           s.Alias,
+		// force_overwrite 是 v2.2.15 之前的旧字段，保留输出只为老客户端不炸；
+		// 真正生效的是下面的 overwrite_mode，前端读的也是它。
 		"force_overwrite": s.ForceOverwrite == nil || *s.ForceOverwrite,
+		"overwrite_mode":  NormalizeSubscriptionOverwriteMode(s.OverwriteMode),
+		"full_checkout":   s.FullCheckout,
 		"created_at":      s.CreatedAt,
 		"updated_at":      s.UpdatedAt,
 	}
@@ -84,6 +108,20 @@ func NormalizeSubscriptionAuthType(value string) string {
 		return SubAuthTypeToken
 	default:
 		return ""
+	}
+}
+
+// NormalizeSubscriptionOverwriteMode 把覆盖拉取策略归一到三个合法值之一。
+// 空串、老库补列前读出来的 NULL、以及直接改库塞进去的脏值，一律按 inherit（跟随全局）处理，
+// 这样任何异常输入都只会退回「和升级前一样」的行为，不会静默把某个订阅切到覆盖或保留。
+func NormalizeSubscriptionOverwriteMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case SubOverwriteForce:
+		return SubOverwriteForce
+	case SubOverwritePreserve:
+		return SubOverwritePreserve
+	default:
+		return SubOverwriteInherit
 	}
 }
 

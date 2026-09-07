@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -133,8 +135,15 @@ func buildBackupManifest(selection BackupSelection) (BackupManifest, error) {
 	}
 
 	if selection.Tasks {
-		if err := database.DB.Order("id ASC").Find(&manifest.Data.Tasks).Error; err != nil {
+		// 不能直接 Find(&manifest.Data.Tasks)：清单里存的是 BackupTask，标签要单独拎成数组。
+		// 形态照下面紧邻的 EnvVars 分支。
+		var tasks []model.Task
+		if err := database.DB.Order("id ASC").Find(&tasks).Error; err != nil {
 			return BackupManifest{}, fmt.Errorf("load tasks: %w", err)
+		}
+		manifest.Data.Tasks = make([]BackupTask, 0, len(tasks))
+		for _, task := range tasks {
+			manifest.Data.Tasks = append(manifest.Data.Tasks, backupTaskFromModel(task))
 		}
 	}
 
@@ -150,8 +159,14 @@ func buildBackupManifest(selection BackupSelection) (BackupManifest, error) {
 	}
 
 	if selection.Subscriptions {
-		if err := database.DB.Order("id ASC").Find(&manifest.Data.Subscriptions).Error; err != nil {
+		// 同上：清单里存的是 BackupSubscription，auth_token 要单独带出来。
+		var subscriptions []model.Subscription
+		if err := database.DB.Order("id ASC").Find(&subscriptions).Error; err != nil {
 			return BackupManifest{}, fmt.Errorf("load subscriptions: %w", err)
+		}
+		manifest.Data.Subscriptions = make([]BackupSubscription, 0, len(subscriptions))
+		for _, subscription := range subscriptions {
+			manifest.Data.Subscriptions = append(manifest.Data.Subscriptions, backupSubscriptionFromModel(subscription))
 		}
 
 		var sshKeys []model.SSHKey
@@ -254,6 +269,7 @@ func snapshotConfigBundle() (BackupConfigBundle, error) {
 			Name:      channel.Name,
 			Type:      channel.Type,
 			Config:    channel.Config,
+			PushScope: channel.EffectivePushScope(),
 			Enabled:   channel.Enabled,
 			CreatedAt: channel.CreatedAt,
 			UpdatedAt: channel.UpdatedAt,
@@ -290,6 +306,19 @@ func snapshotConfigBundle() (BackupConfigBundle, error) {
 			UserID:    item.UserID,
 			Secret:    item.Secret,
 			Enabled:   item.Enabled,
+			CreatedAt: item.CreatedAt,
+			UpdatedAt: item.UpdatedAt,
+		})
+	}
+
+	var preferences []model.UserPreference
+	if err := database.DB.Order("id ASC").Find(&preferences).Error; err != nil {
+		return BackupConfigBundle{}, fmt.Errorf("load user preferences: %w", err)
+	}
+	for _, item := range preferences {
+		bundle.UserPreferences = append(bundle.UserPreferences, BackupUserPreference{
+			UserID:    item.UserID,
+			Editor:    item.Editor,
 			CreatedAt: item.CreatedAt,
 			UpdatedAt: item.UpdatedAt,
 		})
@@ -407,8 +436,67 @@ func addDirectoryToTar(tw *tar.Writer, sourceDir, archiveRoot string) error {
 		if err != nil {
 			return err
 		}
+
+		// .git 依然照常打包（还原行为完全不变、零数据丢失风险），
+		// 但 .git/config 里存着订阅 Token 鉴权注入到 remote URL 的 PAT，
+		// 必须在写进 tar 之前把凭据清掉。
+		if isGitConfigRelativePath(relPath) {
+			return addSanitizedGitConfigToTar(tw, path, filepath.Join(archiveRoot, relPath))
+		}
+
 		return addFileToTar(tw, path, filepath.Join(archiveRoot, relPath))
 	})
+}
+
+// isGitConfigRelativePath 判断相对路径是不是某个 git 仓库的 .git/config。
+func isGitConfigRelativePath(relPath string) bool {
+	segments := strings.Split(filepath.ToSlash(relPath), "/")
+	if len(segments) < 2 {
+		return false
+	}
+	return strings.EqualFold(segments[len(segments)-2], ".git") &&
+		strings.EqualFold(segments[len(segments)-1], "config")
+}
+
+// gitURLCredentialPattern 匹配 URL 里带密码的 userinfo（形如 https://user:token@host/...）。
+// 刻意要求 userinfo 中含冒号：ssh://git@host/... 这种只有用户名、没有凭据，不能动，
+// 否则还原后 SSH 订阅会连不上。
+var gitURLCredentialPattern = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/@\s:]+:[^/@\s]*@`)
+
+// sanitizeGitConfigCredentials 去掉 git config 内容里 remote URL 内嵌的账号密码。
+// 只作用于写进备份包的那份字节流，不动磁盘上的真实 .git/config ——
+// 动了会让后续 fetch 直接失去鉴权。还原后下一次拉取会由
+// syncGitRemoteWithCallback 重新写回带凭据的 remote URL。
+func sanitizeGitConfigCredentials(content []byte) []byte {
+	return gitURLCredentialPattern.ReplaceAll(content, []byte("$1"))
+}
+
+func addSanitizedGitConfigToTar(tw *tar.Writer, sourcePath, archivePath string) error {
+	info, err := os.Stat(sourcePath)
+	if err != nil || info.IsDir() {
+		return nil
+	}
+
+	raw, err := os.ReadFile(sourcePath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", sourcePath, err)
+	}
+	sanitized := sanitizeGitConfigCredentials(raw)
+
+	header, err := tar.FileInfoHeader(info, "")
+	if err != nil {
+		return fmt.Errorf("build tar header %s: %w", sourcePath, err)
+	}
+	header.Name = filepath.ToSlash(archivePath)
+	header.Size = int64(len(sanitized))
+
+	if err := tw.WriteHeader(header); err != nil {
+		return fmt.Errorf("write tar header %s: %w", sourcePath, err)
+	}
+	if _, err := tw.Write(sanitized); err != nil {
+		return fmt.Errorf("write tar body %s: %w", sourcePath, err)
+	}
+	return nil
 }
 
 func restoreBackupFile(filename, password string) (err error) {
@@ -538,6 +626,19 @@ func restoreLegacyJSONBytes(data []byte) error {
 		}
 	}
 
+	// 老 JSON 备份里 tasks / subscriptions 存的是 model.X 原样序列化的结果，
+	// 本来就没有 labels / auth_token 这两个键（它们在 model 上是 json:"-"）。
+	// 这里只是把类型对齐到新的 BackupTask / BackupSubscription，标签与令牌仍为空 ——
+	// 老备份的恢复行为逐字节不变。
+	legacyTasks := make([]BackupTask, 0, len(legacy.Tasks))
+	for _, task := range legacy.Tasks {
+		legacyTasks = append(legacyTasks, backupTaskFromModel(task))
+	}
+	legacySubscriptions := make([]BackupSubscription, 0, len(legacy.Subs))
+	for _, subscription := range legacy.Subs {
+		legacySubscriptions = append(legacySubscriptions, backupSubscriptionFromModel(subscription))
+	}
+
 	manifest := BackupManifest{
 		Format:    "daidai-panel-backup",
 		Version:   legacy.Version,
@@ -556,18 +657,21 @@ func restoreLegacyJSONBytes(data []byte) error {
 			Configs: BackupConfigBundle{
 				SystemConfigs: legacy.Configs,
 			},
-			Tasks:         legacy.Tasks,
+			Tasks:         legacyTasks,
 			EnvVars:       legacy.EnvVars,
-			Subscriptions: legacy.Subs,
+			Subscriptions: legacySubscriptions,
 		},
 	}
 
+	// legacy.Channels 是 []model.NotifyChannel，老备份里 push_scope 是空串，
+	// EffectivePushScope 归一后落成 default —— 老备份本来就没有「绑定推送」这个概念。
 	for _, channel := range legacy.Channels {
 		manifest.Data.Configs.NotifyChannels = append(manifest.Data.Configs.NotifyChannels, BackupNotifyChannel{
 			ID:        channel.ID,
 			Name:      channel.Name,
 			Type:      channel.Type,
 			Config:    channel.Config,
+			PushScope: channel.EffectivePushScope(),
 			Enabled:   channel.Enabled,
 			CreatedAt: channel.CreatedAt,
 			UpdatedAt: channel.UpdatedAt,
@@ -660,6 +764,8 @@ func restoreBackupManifest(manifest BackupManifest, extractedDir string) error {
 	var createdDependencies []model.Dependency
 	taskIDMap := map[uint]uint{}
 	sshKeyIDMap := map[uint]uint{}
+	// 订阅恢复会重新分配主键，任务上的 subscription:<旧ID> 标签要靠这份映射回头改写，见下面的后置 pass。
+	subscriptionIDMap := map[uint]uint{}
 
 	rollback := func(err error) error {
 		tx.Rollback()
@@ -751,7 +857,18 @@ func restoreBackupManifest(manifest BackupManifest, extractedDir string) error {
 		if err != nil {
 			return rollback(err)
 		}
-		if err := restoreSubscriptions(tx, manifest.Data.Subscriptions, sshKeyIDMap); err != nil {
+		subscriptionIDMap, err = restoreSubscriptions(tx, manifest.Data.Subscriptions, sshKeyIDMap)
+		if err != nil {
+			return rollback(err)
+		}
+	}
+
+	// 后置 pass：恢复顺序是先任务后订阅，等订阅拿到新主键之后再回头改任务标签，
+	// 照上面 restoreTasks 里 pendingDepends 那套写法，不动既有恢复顺序。
+	// 只勾选任务不勾选订阅时 subscriptionIDMap 为空 → 所有 subscription: 标签被丢弃，
+	// 等价于今天（标签整列丢失）的行为。
+	if selection.Tasks {
+		if err := remapSubscriptionLabels(tx, subscriptionIDMap); err != nil {
 			return rollback(err)
 		}
 	}
@@ -771,9 +888,12 @@ func restoreBackupManifest(manifest BackupManifest, extractedDir string) error {
 	}
 
 	if selection.TaskViews {
+		// task_views.name 从 v3.1.0 起是唯一索引，归档里的重名要先改名再落库（理由见 restoreNotifyChannels）。
+		// 表在上面已经 deleteAll 清空，所以只需要处理归档内部的重名。
+		usedViewNames := make(map[string]bool, len(manifest.Data.TaskViews))
 		for _, view := range manifest.Data.TaskViews {
 			newView := model.TaskView{
-				Name:      view.Name,
+				Name:      resolveRestoredUniqueName(usedViewNames, view.Name, "任务视图"),
 				Filters:   view.Filters,
 				SortRules: view.SortRules,
 				Hidden:    view.Hidden,
@@ -905,13 +1025,63 @@ func restoreUsers(tx *gorm.DB, users []BackupUser) (map[uint]uint, error) {
 	return idMap, nil
 }
 
+// resolveRestoredUniqueName 给恢复中的一条记录挑一个「本次归档里还没被用掉」的名字，
+// 并把改名这件事写进面板日志 —— 用户恢复完发现「我的渠道名怎么多了个 (2)」，得能在日志里找到答案。
+//
+// used 会被就地更新（把最终采用的名字标记为已占用），调用方每张表各传一个 map 即可。
+// label 只参与日志文案。
+func resolveRestoredUniqueName(used map[string]bool, original, label string) string {
+	name := database.NextAvailableName(used, original)
+	if name == "" {
+		// 极端脏数据（同一个名字在归档里重复上万次）时退回原名：
+		// 宁可让 DB 唯一约束把这次恢复挡下来并报错，也不能拿一个空名字盖掉用户数据。
+		name = original
+	}
+	if name != original {
+		log.Printf("恢复备份：归档里存在重名的%s「%s」，已改名为「%s」", label, original, name)
+	}
+	used[name] = true
+	return name
+}
+
 func restoreNotifyChannels(tx *gorm.DB, channels []BackupNotifyChannel) (map[uint]uint, error) {
 	idMap := make(map[uint]uint, len(channels))
+	// notify_channels.name 从 v3.1.0 起是唯一索引，但**归档里的数据永远不会随升级被清洗**：
+	// 用户在 v3.0.10 连点创建出两条都叫「推送」的渠道（当时完全合法）并导出过备份，
+	// 升级后启动迁移只改了活库，那份备份里仍然是两条「推送」。
+	// 不在这里改名的话，第二条 Create 会返回 UNIQUE constraint failed → rollback → 整次恢复全白做，
+	// 用户拿着一份永远恢复不了的备份，且没有任何自救入口。
+	//
+	// 这张表在上面已经被 deleteAll 清空，所以只需要处理**归档内部**的重名。
+	// 改名规则复用 database.NextAvailableName，与启动迁移保持同一套口径。
+	usedChannelNames := make(map[string]bool, len(channels))
 	for _, item := range channels {
+		// 老备份里可能带着被客户端写坏的 config（例如 smtp_ssl 是 JSON 布尔），
+		// 那种渠道恢复回来会直接发不出任何通知。这里顺手归一一次，让它恢复即可用。
+		//
+		// 归一失败（值是嵌套对象/数组这类修不了的）时保留原文继续恢复：
+		// 恢复流程的首要职责是把数据完整搬回来，不能因为一个渠道配置有问题就整批失败。
+		// 用户后续在通知页编辑保存时会拿到明确的中文报错。
+		config := item.Config
+		if normalized, err := model.NormalizeNotifyChannelConfig(config); err == nil {
+			config = normalized
+		}
+
+		// 老备份没有 push_scope 键，反序列化后是空串；非法值同样按 default 落库。
+		// 归一后一定是 default / bound 之一，不会把「绑定推送」在恢复时悄悄翻成参与广播 ——
+		// 那正是同一行 Enabled 踩过的坑（GORM 省略零值 false，DB 默认 true 反而生效）。
+		pushScope, ok := model.NormalizeNotifyPushScope(item.PushScope)
+		if !ok {
+			pushScope = model.NotifyPushScopeDefault
+		}
+
+		name := resolveRestoredUniqueName(usedChannelNames, item.Name, "通知渠道")
+
 		channel := model.NotifyChannel{
-			Name:      item.Name,
+			Name:      name,
 			Type:      item.Type,
-			Config:    item.Config,
+			Config:    config,
+			PushScope: pushScope,
 			Enabled:   item.Enabled,
 			CreatedAt: item.CreatedAt,
 			UpdatedAt: item.UpdatedAt,
@@ -925,9 +1095,13 @@ func restoreNotifyChannels(tx *gorm.DB, channels []BackupNotifyChannel) (map[uin
 }
 
 func restoreOpenApps(tx *gorm.DB, apps []BackupOpenApp) error {
+	// open_apps.name 从 v3.1.0 起是唯一索引，这里同样要处理归档内部的重名（理由见 restoreNotifyChannels）。
+	// 这条路径比通知渠道更容易踩到：青龙导入会把青龙 app 表原样搬进 Configs.OpenApps，
+	// 而青龙的 app.name 没有任何唯一约束 —— 青龙用户有两个同名应用时，整个导入会直接失败。
+	usedAppNames := make(map[string]bool, len(apps))
 	for _, item := range apps {
 		app := model.OpenApp{
-			Name:      item.Name,
+			Name:      resolveRestoredUniqueName(usedAppNames, item.Name, "OpenAPI 应用"),
 			AppKey:    item.AppKey,
 			AppSecret: item.AppSecret,
 			Scopes:    item.Scopes,
@@ -963,6 +1137,33 @@ func restoreTwoFactorAuths(tx *gorm.DB, items []BackupTwoFactorAuth, userIDMap m
 			UserID:    userID,
 			Secret:    item.Secret,
 			Enabled:   item.Enabled,
+			CreatedAt: item.CreatedAt,
+			UpdatedAt: item.UpdatedAt,
+		}
+		if err := tx.Create(&record).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// restoreUserPreferences 与上面的 restoreTwoFactorAuths 逐条同构：
+// 用户主键在恢复时会重新分配，只有能从 userIDMap 映射到新 ID 的记录才恢复，
+// 映射不到（归档里的那个用户没被一起恢复）就整条跳过，写失败则把错误抛给外层事务回滚。
+//
+// ⚠️ 现状：restoreUsers / restoreTwoFactorAuths 目前都**没有调用点** —— 用户、2FA
+// 只导出不恢复（恢复用户会连带换掉当前管理员的凭据，风险太大），
+// 所以这个函数同样先与它们成对放着，等哪天把用户恢复整条链路接上时一起接。
+// 不要以为「编辑器偏好已经能跟着备份恢复了」：现在只做到了随备份导出。
+func restoreUserPreferences(tx *gorm.DB, items []BackupUserPreference, userIDMap map[uint]uint) error {
+	for _, item := range items {
+		userID := userIDMap[item.UserID]
+		if userID == 0 {
+			continue
+		}
+		record := model.UserPreference{
+			UserID:    userID,
+			Editor:    item.Editor,
 			CreatedAt: item.CreatedAt,
 			UpdatedAt: item.UpdatedAt,
 		}
@@ -1026,11 +1227,39 @@ func restoreEnvVars(tx *gorm.DB, envVars []BackupEnvVar) error {
 	return nil
 }
 
-func restoreTasks(tx *gorm.DB, tasks []model.Task, notifyChannelIDMap map[uint]uint) (map[uint]uint, error) {
+// backupTaskFromModel 把库里的 Task 转成备份形态：标签单独拎成数组，
+// 否则 model.Task.Labels 上的 json:"-" 会让整列标签在写 manifest.json 时被丢掉（issue #112）。
+func backupTaskFromModel(item model.Task) BackupTask {
+	// GetLabels 在空标签时返回 []string{} 而不是 nil，所以清单里恒为 JSON 数组，
+	// 与 /api/tasks/export 和 ToDict() 的形态一致。
+	return BackupTask{Task: item, Labels: item.GetLabels()}
+}
+
+// modelTaskFromBackup 把备份形态转回落库用的 model.Task。
+// 外层的 Labels 数组是唯一权威：老备份没有这个键 → nil → 拼出空串，与升级前完全一致。
+func modelTaskFromBackup(item BackupTask) model.Task {
+	task := item.Task
+	task.SetLabelsFromSlice(item.Labels)
+	return task
+}
+
+// backupSubscriptionFromModel / modelSubscriptionFromBackup 同理，处理 AuthToken（订阅 PAT）。
+func backupSubscriptionFromModel(item model.Subscription) BackupSubscription {
+	return BackupSubscription{Subscription: item, AuthToken: item.AuthToken}
+}
+
+func modelSubscriptionFromBackup(item BackupSubscription) model.Subscription {
+	subscription := item.Subscription
+	subscription.AuthToken = item.AuthToken
+	return subscription
+}
+
+func restoreTasks(tx *gorm.DB, tasks []BackupTask, notifyChannelIDMap map[uint]uint) (map[uint]uint, error) {
 	idMap := make(map[uint]uint, len(tasks))
 	pendingDepends := make(map[uint]uint)
 
-	for _, item := range tasks {
+	for _, backupTask := range tasks {
+		item := modelTaskFromBackup(backupTask)
 		oldID := item.ID
 		oldDepends := item.DependsOn
 		oldNotificationChannelID := item.NotificationChannelID
@@ -1077,9 +1306,13 @@ func normalizeRestoredTaskStatus(status float64) float64 {
 
 func restoreSSHKeys(tx *gorm.DB, keys []BackupSSHKey) (map[uint]uint, error) {
 	idMap := make(map[uint]uint, len(keys))
+	// ssh_keys.name 从 v3.1.0 起是唯一索引，同样要处理归档内部的重名（理由见 restoreNotifyChannels）。
+	// 这里失败的代价尤其大：SSH 密钥恢复失败会连带订阅一起 rollback，
+	// 而私钥往往只有备份里这一份。
+	usedKeyNames := make(map[string]bool, len(keys))
 	for _, item := range keys {
 		key := model.SSHKey{
-			Name:       item.Name,
+			Name:       resolveRestoredUniqueName(usedKeyNames, item.Name, "SSH 密钥"),
 			PrivateKey: item.PrivateKey,
 			CreatedAt:  item.CreatedAt,
 			UpdatedAt:  item.UpdatedAt,
@@ -1092,8 +1325,14 @@ func restoreSSHKeys(tx *gorm.DB, keys []BackupSSHKey) (map[uint]uint, error) {
 	return idMap, nil
 }
 
-func restoreSubscriptions(tx *gorm.DB, subscriptions []model.Subscription, sshKeyIDMap map[uint]uint) error {
-	for _, item := range subscriptions {
+// restoreSubscriptions 返回「备份里的订阅 ID → 恢复后新 ID」的映射，
+// 写法照 restoreSSHKeys / restoreNotifyChannels —— 以前只有它把映射扔了，
+// 于是任务上的 subscription:<旧ID> 标签没法跟着改（见 remapSubscriptionLabels）。
+func restoreSubscriptions(tx *gorm.DB, subscriptions []BackupSubscription, sshKeyIDMap map[uint]uint) (map[uint]uint, error) {
+	idMap := make(map[uint]uint, len(subscriptions))
+	for _, backupSubscription := range subscriptions {
+		item := modelSubscriptionFromBackup(backupSubscription)
+		oldID := item.ID
 		item.ID = 0
 		item.Status = 0
 		if item.SSHKeyID != nil {
@@ -1105,6 +1344,70 @@ func restoreSubscriptions(tx *gorm.DB, subscriptions []model.Subscription, sshKe
 			}
 		}
 		if err := tx.Create(&item).Error; err != nil {
+			return nil, err
+		}
+		// 老备份里可能没有 id（青龙以外的历史格式），0 不是合法订阅 ID，不进映射表，
+		// 免得把 subscription:0 这类脏标签误指到某个真订阅上。
+		if oldID != 0 {
+			idMap[oldID] = item.ID
+		}
+	}
+	return idMap, nil
+}
+
+// remapSubscriptionLabels 把恢复后的任务标签里 subscription:<旧ID> 改写成 subscription:<新ID>。
+//
+// 为什么必须做：恢复流程给订阅重新分配主键（restoreSubscriptions 里 item.ID = 0，
+// 而 deleteAll 只 DELETE FROM 不重置 sqlite_sequence，主键是 AUTOINCREMENT、语义上不复用已删除 ROWID），
+// 把旧 ID 原样写回可能挂到**另一个不相干的订阅**头上；而订阅同步的 autoDelete 分支会对
+// 「认领到但不在候选集里」的任务执行 RemoveJob + 删 task_logs + Delete(&task) —— 是物理删除，
+// 比标签丢失严重得多。
+//
+// 规则：
+//  1. 命中 old→new 映射 → 改写成 subscription:<新ID>；
+//  2. 没命中（订阅没被一起恢复 / 备份里就没有那个订阅 / ID 解析不出来）→ 丢弃该条 subscription: 标签，
+//     绝不保留旧 ID；
+//  3. 非 subscription: 前缀的标签（含 分组: 与用户自定义）一律原样保留；
+//  4. 绝不复用 handler/task_labels.go 的 sanitizeIncomingLabels —— 那是给用户输入用的，会把内部前缀洗掉。
+//
+// 只在 selection.Tasks 时调用：那种情况下 tasks 表已被 deleteAll 清空并重建，
+// 表里的行恰好就是本次恢复出来的任务，所以这里可以直接按 labels 过滤全表。
+func remapSubscriptionLabels(tx *gorm.DB, subscriptionIDMap map[uint]uint) error {
+	// 与 subscriptionTaskLabel 生成的形态一一对应。
+	const labelPrefix = "subscription:"
+
+	// LIKE 只是个粗筛（"my-subscription:foo" 这类用户自建标签也会被捞出来），
+	// 真正的边界判定在下面按标签逐条做前缀匹配。
+	var tasks []model.Task
+	if err := tx.Where("labels LIKE ?", "%"+labelPrefix+"%").Find(&tasks).Error; err != nil {
+		return err
+	}
+
+	for _, task := range tasks {
+		labels := task.GetLabels()
+		remapped := make([]string, 0, len(labels))
+		for _, label := range labels {
+			// GetLabels 只按逗号切分、不做 trim，历史脏数据里可能是 " subscription:1"，
+			// 与 handler 的 hasSubscriptionLabel 对齐，先 TrimSpace 再判前缀。
+			trimmed := strings.TrimSpace(label)
+			if !strings.HasPrefix(trimmed, labelPrefix) {
+				remapped = append(remapped, label)
+				continue
+			}
+			oldID, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(trimmed, labelPrefix)), 10, 64)
+			if err != nil {
+				continue
+			}
+			if newID := subscriptionIDMap[uint(oldID)]; newID != 0 {
+				remapped = append(remapped, subscriptionTaskLabel(newID))
+			}
+		}
+
+		newLabels := strings.Join(remapped, ",")
+		if newLabels == task.Labels {
+			continue
+		}
+		if err := tx.Model(&model.Task{}).Where("id = ?", task.ID).Update("labels", newLabels).Error; err != nil {
 			return err
 		}
 	}

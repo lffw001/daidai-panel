@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { authApi } from '@/api/auth'
+import { resetEditorPreferencesCache } from '@/utils/editorPreferences'
 import router from '@/router'
 import type { GeeTestValidateResult } from '@/utils/geetest'
 
@@ -39,6 +40,11 @@ export const useAuthStore = defineStore('auth', () => {
     user.value = null
     localStorage.removeItem('access_token')
     localStorage.removeItem('refresh_token')
+    // 编辑器偏好是**按用户**存的，退出时必须把「已经拉过服务端」的记忆清掉，
+    // 否则换一个账号登进来会继续吃上一个人的那份缓存。
+    // 只清记忆不清 localStorage 里的值：那份值同时还是本机的离线缓存，
+    // 下次登录会被服务端值覆盖，没必要在这里制造一次闪变。
+    resetEditorPreferencesCache()
   }
 
   async function login(username: string, password: string, totpCode?: string, captcha?: GeeTestValidateResult | null) {

@@ -35,7 +35,20 @@ var (
 	dependencyExportTextFunc = buildDependencyExportText
 )
 
-const dependencyOperationTimeout = 20 * time.Minute
+// defaultDependencyOperationTimeout 是 dependency_install_timeout_minutes 读不出来时的兜底值，
+// 与该配置项的注册默认值保持一致。真正生效的阈值一律走 resolveDependencyOperationTimeout()。
+const defaultDependencyOperationTimeout = 20 * time.Minute
+
+// resolveDependencyOperationTimeout 读取用户配置的依赖操作超时。
+// 配置项注册在 model 层并带 5-720 分钟的区间校验，这里只对「数据库里存着历史越界值」
+// 这一种情况再兜一次底，避免非法值把超时变成 0（等于立刻杀进程）。
+func resolveDependencyOperationTimeout() time.Duration {
+	minutes := model.GetRegisteredConfigInt("dependency_install_timeout_minutes")
+	if minutes < 5 || minutes > 720 {
+		return defaultDependencyOperationTimeout
+	}
+	return time.Duration(minutes) * time.Minute
+}
 
 func getOrCreateBroadcaster(id uint) *depLogBroadcaster {
 	depLogStreamsMu.Lock()
@@ -171,7 +184,43 @@ func (h *DepsHandler) List(c *gin.Context) {
 		data[i] = d.ToDict()
 	}
 
-	response.Success(c, gin.H{"data": data, "total": len(data)})
+	// failed_by_type 是跨类型的失败数汇总，专门给依赖页三个类型页签上的「失败 N」用。
+	//
+	// 【为什么要额外下发，而不是让前端数 data】
+	// 上面的 data 只含当前请求的那个类型（Python 还只含当前版本），前端数出来的失败数
+	// 天然只是「当前标签页」的。而侧栏「依赖管理」角标（server/handler/system_badges.go 的
+	// deps_failed）是不分类型、不分版本的全表 status='failed' 计数，两个数字对不上，
+	// 用户得挨个切三个标签页才能凑出角标那个数。
+	//
+	// 【为什么 Python 不跟着 python_version 过滤】
+	// 同理：只有让 nodejs + python + linux 三个数之和恰好等于全表失败数，页签上的数字
+	// 才能和侧栏角标对上。所以这里刻意不复用上面的版本过滤，Python 跨所有版本一起统计。
+	//
+	// 查询用一条 GROUP BY type 完成，不为每个类型各查一次。
+	failedByType := map[string]int64{
+		model.DepTypeNodeJS: 0,
+		model.DepTypePython: 0,
+		model.DepTypeLinux:  0,
+	}
+	type depFailedCountRow struct {
+		Type  string
+		Total int64
+	}
+	var failedRows []depFailedCountRow
+	database.DB.Model(&model.Dependency{}).
+		Select("type, COUNT(*) AS total").
+		Where("status = ?", model.DepStatusFailed).
+		Group("type").
+		Scan(&failedRows)
+	for _, row := range failedRows {
+		// 只回填三个已知类型，历史脏数据里若有别的 type，忽略即可，
+		// 免得凭空多出一个前端不认识的键。
+		if _, ok := failedByType[row.Type]; ok {
+			failedByType[row.Type] = row.Total
+		}
+	}
+
+	response.Success(c, gin.H{"data": data, "total": len(data), "failed_by_type": failedByType})
 }
 
 func (h *DepsHandler) Create(c *gin.Context) {
@@ -211,6 +260,20 @@ func (h *DepsHandler) Create(c *gin.Context) {
 			if req.Type == model.DepTypePython {
 				if _, exists := service.FindExistingPythonDependency(name, pythonVersion,
 					model.DepStatusInstalled, model.DepStatusInstalling, model.DepStatusQueued); exists {
+					skipped++
+					continue
+				}
+			} else {
+				// nodejs / linux 同样做「先查后插」，但只按「类型 + 名称」精确匹配，
+				// 不套 Python 那套 PEP 503 归一化 —— 各生态的包名归一规则不同（npm 区分大小写、
+				// apt 包名带冒号架构后缀），硬套会把不同的包判成同一个，属于误伤。
+				// 这里也刻意不给 dependencies 加 DB 唯一索引，理由同上。
+				var existingCount int64
+				database.DB.Model(&model.Dependency{}).
+					Where("type = ? AND name = ? AND status IN ?", req.Type, name,
+						[]string{model.DepStatusInstalled, model.DepStatusInstalling, model.DepStatusQueued}).
+					Count(&existingCount)
+				if existingCount > 0 {
 					skipped++
 					continue
 				}
@@ -346,6 +409,17 @@ func (h *DepsHandler) LogStream(c *gin.Context) {
 	sub := b.subscribe()
 	defer b.unsubscribe(sub)
 
+	// pip 现场编译 wheel（例如 opencv）时可以几十分钟一行输出都没有，
+	// 原来的「静默 5 分钟就发 done」会让前端以为任务结束了，而进程其实还在跑。
+	// 改成周期性心跳注释行（SSE 规范里以 : 开头的行会被客户端忽略），只用来保活连接；
+	// 真正的结束仍然只由 \x00DONE 或订阅通道关闭来决定。
+	heartbeat := time.NewTicker(30 * time.Second)
+	defer heartbeat.Stop()
+
+	// 硬上限只是防止 broadcaster 泄漏导致连接永不释放，正常路径不会走到。
+	// 必须比依赖任务本身的超时更长，否则又会退化成「任务还在跑就断流」。
+	hardDeadline := time.After(resolveDependencyOperationTimeout() + 5*time.Minute)
+
 	ctx := c.Request.Context()
 	for {
 		select {
@@ -366,7 +440,10 @@ func (h *DepsHandler) LogStream(c *gin.Context) {
 			c.Writer.Flush()
 		case <-ctx.Done():
 			return
-		case <-time.After(5 * time.Minute):
+		case <-heartbeat.C:
+			fmt.Fprintf(c.Writer, ": ping\n\n")
+			c.Writer.Flush()
+		case <-hardDeadline:
 			fmt.Fprintf(c.Writer, "event: done\ndata: timeout\n\n")
 			c.Writer.Flush()
 			return
@@ -501,7 +578,7 @@ func (h *DepsHandler) PipList(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	pipEnv := service.SanitizePipEnv(os.Environ())
+	pipEnv := service.WritableHomeEnv(service.SanitizePipEnv(os.Environ()))
 	listCmd, err := service.NewPipCommandForPythonVersion(pythonVersion, []string{"list", "--format=json"})
 	if err != nil {
 		response.BadRequest(c, err.Error())
@@ -587,7 +664,11 @@ func (h *DepsHandler) SetDefaultPythonRuntime(c *gin.Context) {
 }
 
 func (h *DepsHandler) NpmList(c *gin.Context) {
-	out, err := exec.Command("npm", "list", "-g", "--json", "--depth=0").Output()
+	// 与安装路径共用同一份 HOME 判定：HOME 不可写时 npm 连 list 都跑不起来
+	// （启动即初始化 $HOME/.npm 的 cache），会变成「装得上却看不到」。
+	listCmd := exec.Command("npm", "list", "-g", "--json", "--depth=0")
+	listCmd.Env = service.WritableHomeEnv(os.Environ())
+	out, err := listCmd.Output()
 	if err != nil {
 		response.InternalError(c, "npm 不可用")
 		return
@@ -681,7 +762,11 @@ func runCmdWithSSE(cmd *exec.Cmd, id uint, successStatus string, deleteOnSuccess
 	}
 	cmd.Stderr = cmd.Stdout
 
-	ctx, cancel := context.WithTimeout(context.Background(), dependencyOperationTimeout)
+	// 阈值只在任务启动时读一次并存下来，保证下面日志里写的数字就是本次实际生效的数字；
+	// 中途用户改配置不影响已经跑起来的任务。
+	operationTimeout := resolveDependencyOperationTimeout()
+
+	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
 	registerDepOperation(id, cancel)
 	defer func() {
 		cancel()
@@ -734,7 +819,7 @@ func runCmdWithSSE(cmd *exec.Cmd, id uint, successStatus string, deleteOnSuccess
 		logDirty = false
 	}
 
-	appendLine(fmt.Sprintf("[依赖任务已启动，超时阈值：%s]", dependencyOperationTimeout.Truncate(time.Second)), true)
+	appendLine(fmt.Sprintf("[依赖任务已启动，超时阈值：%s，可在「系统设置 - 依赖安装超时(分钟)」调整]", operationTimeout.Truncate(time.Second)), true)
 
 	scanDone := make(chan struct{})
 	go func() {
@@ -766,10 +851,15 @@ func runCmdWithSSE(cmd *exec.Cmd, id uint, successStatus string, deleteOnSuccess
 			service.KillProcessGroup(cmd.Process)
 		}
 		waitErr = <-waitCh
-		if ctx.Err() == context.DeadlineExceeded {
+		switch {
+		case waitErr == nil:
+			// 临界情况：进程恰好在超时/取消的同一瞬间正常退出，杀进程没杀到活的。
+			// 命令本身是成功的，不能因为抢跑了 ctx.Done() 就把成功记成失败。
+			appendLine("[依赖任务在超时/取消触发的同时已正常结束，按成功处理]", true)
+		case ctx.Err() == context.DeadlineExceeded:
 			appendLine("[依赖任务已超时，进程已终止]", true)
 			status = model.DepStatusFailed
-		} else {
+		default:
 			appendLine("[依赖任务已取消]", true)
 			status = model.DepStatusCancelled
 		}
@@ -812,13 +902,28 @@ func buildDependencyFailureHint(logText string) string {
 		strings.Contains(lower, "unable to lock database") ||
 		strings.Contains(lower, "another app is currently holding the yum lock"):
 		return "[检测到系统包管理器锁冲突，请稍后重试，或先确认没有其他 apt/yum/dnf/apk 任务正在运行]"
+	// DNS 解析失败必须与「网络/镜像源不可达」分开报。
+	// 这两类的排查方向完全相反：解析失败时宿主机往往一切正常（宿主走系统 DNS，
+	// 容器走自己的 /etc/resolv.conf），此时让用户去「检查宿主机网络连通性」
+	// 只会让他反复确认一个本来就没问题的东西，真正坏掉的那条线索反而被抹掉。
+	// 模块版 Debian 容器的装依赖失败就长这样，之前一直被归到下面那条里误诊。
 	case strings.Contains(lower, "temporary failure resolving") ||
+		strings.Contains(lower, "temporary failure in name resolution") ||
 		strings.Contains(lower, "could not resolve") ||
-		strings.Contains(lower, "connection timed out") ||
+		strings.Contains(lower, "name or service not known"):
+		return "[检测到容器内 DNS 解析失败：域名解析不出来，这与宿主机能否上网是两回事——" +
+			"容器用的是自己的 /etc/resolv.conf。请在容器内执行 getent hosts mirrors.nju.edu.cn 复现，" +
+			"并确认 /etc/resolv.conf 里的 nameserver 在当前网络下可用（校园网/企业网强制 DNS、" +
+			"公共 Wi-Fi 登录门户、运营商屏蔽对外 53 端口都会导致这种失败）；" +
+			"若 root 能解析而 apt 仍失败，则是 apt 降权用户 _apt 被限制联网，" +
+			"需在 /etc/apt/apt.conf.d/ 下配置 APT::Sandbox::User \"root\"]"
+	case strings.Contains(lower, "connection timed out") ||
+		strings.Contains(lower, "connection refused") ||
 		strings.Contains(lower, "failed to fetch"):
-		return "[检测到网络或镜像源异常，请检查 Linux 镜像源配置、代理设置和宿主机网络连通性]"
+		return "[检测到镜像源不可达或网络中断（域名能解析但连不上/下载失败），" +
+			"请检查 Linux 镜像源配置、代理设置和网络连通性，必要时更换镜像源后重试]"
 	case isAlpineGlibcIncompatible(lower):
-		return "[当前容器使用 Alpine 镜像（musl libc），该依赖需要 glibc 环境，无法在 Alpine 上安装。请切换到 Debian 版镜像（如 linzixuan/daidai-panel:debian）后重试]"
+		return "[当前容器使用 Alpine 镜像（musl libc），该依赖需要 glibc 环境，无法在 Alpine 上安装。请切换到 Debian 版镜像（如 linzixuanzz/daidai-panel:debian）后重试]"
 	default:
 		return ""
 	}
@@ -962,7 +1067,15 @@ func uninstallDependency(id uint, depType, name, pythonVersion string) {
 
 		cmd, err = buildLinuxPackageCommand(manager, "remove", name, false)
 		if err != nil {
-			database.DB.Delete(&model.Dependency{}, id)
+			// 这里【不能】删记录。容器配了 PUID/PGID 降权之后，这条路会因为
+			// 「apk/apt 需要 root」直接返回错误；删掉记录的话前端看到行消失，
+			// 等同于「卸载成功」，而包其实还在系统里，那段专门写的中文说明
+			// 也一个字都不会显示出来。改成与上面 NodeJS / Python 两个分支一致：
+			// 标记 failed 并把原因写进日志。
+			database.DB.Model(&model.Dependency{}).Where("id = ?", id).Updates(map[string]interface{}{
+				"status": model.DepStatusFailed,
+				"log":    err.Error(),
+			})
 			return
 		}
 	default:
@@ -1008,7 +1121,32 @@ func forceUninstallDependency(depType, name, pythonVersion string) {
 	default:
 		return
 	}
-	cmd.CombinedOutput()
+
+	// 强制卸载时依赖行已经被删掉了，没有 id 可以注册取消函数，前端也没有入口去点取消。
+	// 但它照样持有 apt / npm 的包锁（上面的 linuxPackageOperationMu、LockNodePackageOperation），
+	// 卡死就会把后续所有依赖任务一起堵住，所以这里必须有超时兜底。
+	service.SetPgid(cmd)
+
+	ctx, cancel := context.WithTimeout(context.Background(), resolveDependencyOperationTimeout())
+	defer cancel()
+
+	if err := cmd.Start(); err != nil {
+		return
+	}
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	select {
+	case <-waitCh:
+	case <-ctx.Done():
+		if cmd.Process != nil {
+			service.KillProcessGroup(cmd.Process)
+		}
+		<-waitCh
+	}
 }
 
 func (h *DepsHandler) RegisterRoutes(r *gin.RouterGroup) {

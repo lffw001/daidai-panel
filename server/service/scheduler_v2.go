@@ -35,6 +35,13 @@ type ExecutionRequest struct {
 	LogID       string
 	TaskLogID   uint
 	CommandPlan *CommandExecutionPlan
+	// DelayResolved 标记本次请求已经完成过随机延迟判定。
+	// 延迟等待通过“重新入队”实现，这个标记用于防止重新入队后再次延迟。
+	DelayResolved bool
+
+	// taskLog / tinyLog 由 OnTaskExecuting 准备、交给 RunTask 使用，只在包内流转。
+	taskLog *model.TaskLog
+	tinyLog *TinyLog
 }
 
 type ExecutionResult struct {
@@ -47,11 +54,21 @@ type ExecutionResult struct {
 
 type SchedulerEventHandler interface {
 	OnTaskScheduled(req *ExecutionRequest)
+	// ResolveExecutionDelay 返回本次执行在占用并发槽位之前需要等待的时长（0 表示无需等待）。
+	ResolveExecutionDelay(req *ExecutionRequest) time.Duration
+	// OnTaskExecuting 只做执行前准备（依赖检查、解析命令、建立日志记录），不得阻塞到任务结束。
 	OnTaskExecuting(req *ExecutionRequest) error
 	OnTaskStarted(req *ExecutionRequest)
+	// RunTask 同步执行任务直到结束（含全部重试），worker 以此实现真正的并发上限。
+	RunTask(req *ExecutionRequest)
 	OnTaskCompleted(req *ExecutionRequest, result *ExecutionResult)
 	OnTaskFailed(req *ExecutionRequest, err error)
 }
+
+// workerResizeSignalBuffer 是「并发数被调小」唤醒信号的缓冲长度。
+// 信号只是让空闲 worker 回到循环顶部重新判断一次，多发少发都不影响正确性，
+// 缓冲满了直接丢弃即可，绝不能阻塞调用方。
+const workerResizeSignalBuffer = 128
 
 type SchedulerV2 struct {
 	config       SchedulerConfig
@@ -68,6 +85,19 @@ type SchedulerV2 struct {
 	runningLock  sync.RWMutex
 	stopOnce     sync.Once
 	stopped      atomic.Bool
+
+	// worker 数量可以在运行期调整，用于让「定时任务最大并发数」保存后立刻生效。
+	// desiredWorkers / liveWorkers 用普通 int 加一把小锁保护，刻意不用 atomic：
+	// 「超编就退休」是典型的 check-then-act，用 atomic 会让两个超编 worker 同时
+	// 判定自己该退出，最终退得比该退的多。这里的操作频率极低，锁开销可以忽略。
+	workerLock         sync.Mutex
+	desiredWorkers     int
+	liveWorkers        int
+	workerSeq          int
+	workersInitialized bool
+	// resizeCh 负责把「并发数被调小」的消息推给空闲 worker——
+	// 它们本来一直阻塞在 taskQueue 上，不叫醒就发现不了自己已经超编。
+	resizeCh chan struct{}
 }
 
 func NewSchedulerV2(config SchedulerConfig, handler SchedulerEventHandler) *SchedulerV2 {
@@ -91,22 +121,126 @@ func NewSchedulerV2(config SchedulerConfig, handler SchedulerEventHandler) *Sche
 		stopCh:       make(chan struct{}),
 		handler:      handler,
 		runningTasks: make(map[uint][]int64),
+		resizeCh:     make(chan struct{}, workerResizeSignalBuffer),
 	}
 
 	return s
 }
 
 func (s *SchedulerV2) Start() {
-	for i := 0; i < s.config.WorkerCount; i++ {
-		s.wg.Add(1)
-		go s.worker(i)
+	s.workerLock.Lock()
+	// 只在从未设置过时才用构造参数播种，这样「Start 之前就调过 SetWorkerCount」不会被覆盖。
+	if !s.workersInitialized {
+		s.workersInitialized = true
+		s.desiredWorkers = s.config.WorkerCount
 	}
+	desired := s.desiredWorkers
+	s.spawnWorkersLocked()
+	s.workerLock.Unlock()
 
 	s.cron.Start()
-	log.Printf("scheduler v2 started: %d workers, queue size %d", s.config.WorkerCount, s.config.QueueSize)
+	log.Printf("scheduler v2 started: %d workers, queue size %d", desired, s.config.QueueSize)
 }
 
+// SetWorkerCount 在运行期调整并发上限（即 worker 数量），返回调整前后的目标值。
+// 调大立刻补齐 worker；调小只是把多余的 worker 标记为超编，它们会在两次任务之间自行退出，
+// 绝不会打断正在执行的任务。n < 1 会被钳到 1。
+func (s *SchedulerV2) SetWorkerCount(n int) (previous int, applied int) {
+	if s == nil {
+		return 0, 0
+	}
+	if n < 1 {
+		n = 1
+	}
+
+	s.workerLock.Lock()
+	previous = s.desiredWorkers
+	s.workersInitialized = true
+	s.desiredWorkers = n
+	s.spawnWorkersLocked()
+	surplus := s.liveWorkers - s.desiredWorkers
+	s.workerLock.Unlock()
+
+	// 空闲 worker 阻塞在 taskQueue 上，不叫醒它们就得等到下一个任务进来才会发现自己该退休；
+	// 队列长期空闲时，调小并发数会一直不生效。非阻塞发送：channel 满了也无所谓，
+	// worker 回到循环顶部本来就会重新判断一次。
+	for i := 0; i < surplus; i++ {
+		select {
+		case s.resizeCh <- struct{}{}:
+		default:
+		}
+	}
+
+	return previous, n
+}
+
+// GetWorkerCount 返回当前存活的 worker 数量，也就是真实生效的并发上限。
+// 调小并发数之后，它会随着多余 worker 陆续收工逐步降到目标值。
+func (s *SchedulerV2) GetWorkerCount() int {
+	if s == nil {
+		return 0
+	}
+
+	s.workerLock.Lock()
+	defer s.workerLock.Unlock()
+	return s.liveWorkers
+}
+
+// spawnWorkersLocked 把存活 worker 补到 desiredWorkers，必须在持有 workerLock 时调用。
+func (s *SchedulerV2) spawnWorkersLocked() {
+	if s.stopped.Load() {
+		// 已经在关停流程里就不要再补 worker，否则可能和 WaitWorkers 里的 wg.Wait 撞车。
+		return
+	}
+
+	for s.liveWorkers < s.desiredWorkers {
+		s.liveWorkers++
+		id := s.workerSeq
+		s.workerSeq++
+		s.wg.Add(1)
+		go s.worker(id)
+	}
+}
+
+// retireWorkerIfSurplus 在同一把锁内完成「判断自己是否超编 + 注销自己」。
+// 这两步必须原子：先判断后减计数的话，多个超编 worker 会同时判定该退出，退得比该退的多。
+func (s *SchedulerV2) retireWorkerIfSurplus() bool {
+	s.workerLock.Lock()
+	defer s.workerLock.Unlock()
+
+	if s.liveWorkers <= s.desiredWorkers {
+		return false
+	}
+	s.liveWorkers--
+	return true
+}
+
+// releaseWorkerSlot 用于「退休」之外的退出路径（调度器关停、goroutine 异常退出）。
+func (s *SchedulerV2) releaseWorkerSlot() {
+	s.workerLock.Lock()
+	defer s.workerLock.Unlock()
+
+	if s.liveWorkers > 0 {
+		s.liveWorkers--
+	}
+}
+
+// Stop 保留为“不再接新活 + 等待 worker 收工”的组合，方便一次性关停。
+// 关机流程需要在两步之间插入“中断执行中的进程”，请改用 SignalStop + WaitWorkers。
 func (s *SchedulerV2) Stop() {
+	if s == nil {
+		return
+	}
+
+	s.SignalStop()
+	if !s.WaitWorkers(5 * time.Second) {
+		log.Println("scheduler v2 stop timed out; continuing shutdown")
+	}
+	log.Println("scheduler v2 stopped")
+}
+
+// SignalStop 停掉 cron、关闭 stopCh 并拒绝新的入队，但不等待正在执行的任务。
+func (s *SchedulerV2) SignalStop() {
 	if s == nil {
 		return
 	}
@@ -122,34 +256,62 @@ func (s *SchedulerV2) Stop() {
 		if s.stopCh != nil {
 			close(s.stopCh)
 		}
-
-		done := make(chan struct{})
-		go func() {
-			s.wg.Wait()
-			close(done)
-		}()
-
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			log.Println("scheduler v2 stop timed out; continuing shutdown")
-		}
-
-		log.Println("scheduler v2 stopped")
 	})
 }
 
+// WaitWorkers 等待所有 worker 退出，返回是否在超时前完成。timeout <= 0 表示一直等。
+func (s *SchedulerV2) WaitWorkers(timeout time.Duration) bool {
+	if s == nil {
+		return true
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	if timeout <= 0 {
+		<-done
+		return true
+	}
+
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 func (s *SchedulerV2) worker(id int) {
-	defer s.wg.Done()
+	// 退休路径会在锁内自己把计数减掉，其余任何退出路径（含 panic 逃逸）都由这里兜底归还名额，
+	// 保证 liveWorkers 始终等于真实存活的 worker 数。
+	retired := false
+	defer func() {
+		if !retired {
+			s.releaseWorkerSlot()
+		}
+		s.wg.Done()
+	}()
 
 	for {
 		if s.stopped.Load() {
+			return
+		}
+		// 退休判断只发生在「取下一个任务之前」，因此调小并发数不会打断正在执行的任务。
+		if s.retireWorkerIfSurplus() {
+			retired = true
+			log.Printf("scheduler v2 worker %d retired: concurrency limit was lowered", id)
 			return
 		}
 
 		select {
 		case <-s.stopCh:
 			return
+		case <-s.resizeCh:
+			// 并发数刚被调小：回到循环顶部重新判断自己是否超编。
+			continue
 		case req := <-s.taskQueue:
 			if s.stopped.Load() {
 				return
@@ -162,58 +324,102 @@ func (s *SchedulerV2) worker(id int) {
 			if s.stopped.Load() {
 				return
 			}
+			// 随机延迟必须在占用并发槽位之前完成，否则 max_concurrent_tasks 会被空等吃满。
+			if s.deferForExecutionDelay(req) {
+				continue
+			}
 			s.executeTask(req)
 		}
 	}
 }
 
+// deferForExecutionDelay 处理执行前的随机延迟：
+// 需要等待时把请求交给 EnqueueDelayed 稍后重新入队，worker 立刻返回去取下一个请求，不占用并发槽位。
+// 返回 true 表示本次请求已被推迟，调用方不应继续执行它。
+func (s *SchedulerV2) deferForExecutionDelay(req *ExecutionRequest) bool {
+	if req == nil || req.DelayResolved || s.handler == nil {
+		return false
+	}
+
+	// 无论是否真的需要等待，都只判定一次，避免重新入队后反复延迟。
+	req.DelayResolved = true
+
+	delay := s.handler.ResolveExecutionDelay(req)
+	if delay <= 0 {
+		return false
+	}
+
+	log.Printf("task %d: delaying execution by %s before taking a concurrency slot", req.TaskID, delay)
+	s.EnqueueDelayed(delay, func() *ExecutionRequest { return req })
+	return true
+}
+
+// executeTask 阻塞到任务真正结束（含全部重试）才返回，worker 因此成为真实的并发闸门。
 func (s *SchedulerV2) executeTask(req *ExecutionRequest) {
-	if !s.checkConcurrency(req) {
-		log.Printf("task %d: concurrency limit reached, skipping", req.TaskID)
+	if req == nil || req.Task == nil {
 		return
 	}
 
-	goid := getGoroutineID()
-	s.addRunningTask(req.TaskID, goid)
+	goid, ok := s.acquireRunningSlot(req)
+	if !ok {
+		// 最大并发数现在靠 worker 阻塞实现，只会让请求排队、不会丢弃；
+		// 走到这里的唯一原因是「不允许多实例」。日志必须说清是哪条规则，
+		// 否则用户会误以为是并发数把任务吃掉了。
+		log.Printf("任务 %d 本次触发被跳过：%s", req.TaskID, SkipReasonSingleInstance)
+		// 这条分支是整个调度链路上唯一一处「返回正常、却既不执行也不留任何痕迹」的地方，
+		// 用户看到的就是「点了运行提示已启动 / 到点了却什么都没发生」+ 日志一片空白。
+		// 所以必须留一条看得见的记录，否则只能靠翻面板日志才知道原因。
+		recordSkippedTrigger(req, SkipReasonSingleInstance)
+		// 本次触发已经在生产端被置成「排队中」，这里不执行就必须放回去，
+		// 否则任务会一直停在排队中假象上。
+		releaseQueuedTaskStatus(req)
+		return
+	}
 	defer s.removeRunningTask(req.TaskID, goid)
 
-	if s.handler != nil {
-		s.handler.OnTaskScheduled(req)
-	}
-
-	err := s.handler.OnTaskExecuting(req)
-	if err != nil {
-		if s.handler != nil {
-			s.handler.OnTaskFailed(req, err)
+	// worker 阻塞化之后，它不再只是“派发线程”，而是一个并发名额。
+	// 准备阶段（OnTaskScheduled / OnTaskExecuting / OnTaskStarted，内含多次 DB 调用与命令解析）
+	// 一旦 panic 就会打穿 worker goroutine，那个名额将永久消失且无法恢复；
+	// max_concurrent_tasks=1 时等于整个调度器直接停摆，只能重启面板。
+	// runTask 内部已有自己的 recover，这里兜的是它之外的所有阶段。
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("task %d: scheduler stage panicked, worker recovered: %v", req.TaskID, r)
+			if s.handler != nil {
+				s.handler.OnTaskFailed(req, fmt.Errorf("任务调度阶段异常: %v", r))
+			}
 		}
+	}()
+
+	if s.handler == nil {
 		return
 	}
 
-	if s.handler != nil {
-		s.handler.OnTaskStarted(req)
-	}
-}
+	s.handler.OnTaskScheduled(req)
 
-func (s *SchedulerV2) checkConcurrency(req *ExecutionRequest) bool {
-	if req.Task.AllowMultipleInstances {
-		return true
+	if err := s.handler.OnTaskExecuting(req); err != nil {
+		s.handler.OnTaskFailed(req, err)
+		return
 	}
 
-	s.runningLock.RLock()
-	defer s.runningLock.RUnlock()
-
-	goids, exists := s.runningTasks[req.TaskID]
-	return !exists || len(goids) == 0
+	s.handler.OnTaskStarted(req)
+	s.handler.RunTask(req)
 }
 
-func (s *SchedulerV2) addRunningTask(taskID uint, goid int64) {
+// acquireRunningSlot 在同一把写锁内完成“多实例检查 + 登记运行中”。
+// 两步必须原子，否则两个 worker 可能同时通过检查、把不允许多实例的任务跑成两份。
+// 返回的标识用于任务结束时精确移除自己的登记。
+func (s *SchedulerV2) acquireRunningSlot(req *ExecutionRequest) (int64, bool) {
 	s.runningLock.Lock()
 	defer s.runningLock.Unlock()
 
-	if s.runningTasks[taskID] == nil {
-		s.runningTasks[taskID] = []int64{}
+	if !req.Task.AllowMultipleInstances && len(s.runningTasks[req.TaskID]) > 0 {
+		return 0, false
 	}
-	s.runningTasks[taskID] = append(s.runningTasks[taskID], goid)
+
+	goid := getGoroutineID()
+	s.runningTasks[req.TaskID] = append(s.runningTasks[req.TaskID], goid)
+	return goid, true
 }
 
 func (s *SchedulerV2) removeRunningTask(taskID uint, goid int64) {
@@ -246,14 +452,75 @@ func (s *SchedulerV2) Enqueue(req *ExecutionRequest) error {
 	}
 }
 
+// EnqueueDelayed 等待 delay 后重新入队；等待期间调度器被关停则直接放弃。
 func (s *SchedulerV2) EnqueueDelayed(delay time.Duration, reqFunc func() *ExecutionRequest) {
+	if s == nil || reqFunc == nil {
+		return
+	}
+
 	go func() {
-		time.Sleep(delay)
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+
+		select {
+		case <-s.stopCh:
+			return
+		case <-timer.C:
+		}
+
 		req := reqFunc()
-		if req != nil {
-			s.Enqueue(req)
+		if req == nil {
+			return
+		}
+		if err := s.Enqueue(req); err != nil {
+			log.Printf("任务 %d 随机延迟结束后重新入队失败（本次不会执行）: %v", req.TaskID, err)
+			// 生产端在首次入队成功时已经把任务置为「排队中」。
+			// 延迟到期后重新入队失败意味着这次触发不会再被执行，
+			// 必须把状态放回去，否则任务会一直停在 queued 假象上。
+			releaseQueuedTaskStatus(req)
 		}
 	}()
+}
+
+// releaseQueuedTaskStatus 把「不会再被执行的排队请求」对应的任务状态从 queued 放回空闲状态。
+// 只更新仍然停在 queued 的行，避免覆盖任务已经被其它触发跑起来后的真实状态。
+func releaseQueuedTaskStatus(req *ExecutionRequest) {
+	if req == nil || req.TaskID == 0 || database.DB == nil {
+		return
+	}
+
+	if err := database.DB.Model(&model.Task{}).
+		Where("id = ? AND status = ?", req.TaskID, model.TaskStatusQueued).
+		Update("status", ResolveTaskInactiveStatus(req.Task)).Error; err != nil {
+		log.Printf("task %d reset queued status failed: %v", req.TaskID, err)
+	}
+}
+
+// SkipReasonSingleInstance 是「上一次还在跑、本次触发被多实例闸门拦下」的原因文案。
+// 面板列表、任务详情和文档都引用这句话，改动时要一起改。
+const SkipReasonSingleInstance = "上一次执行仍在进行中，且该任务未开启「允许多实例」，本次触发没有执行"
+
+// recordSkippedTrigger 把「到点了但这次没执行」的原因记在任务行上。
+//
+// 刻意**不**建 task_logs 行，尽管那样在日志页里更显眼：
+//   - 跳过意味着压根没执行，建成日志会一并混进仪表板的「已终止」统计与耗时统计；
+//   - 跳过记录的时间比它所阻塞的那次执行更晚，会顶掉「最近一次日志」，
+//     用户点开日志看到的是「本次触发被跳过」，而不是真正的执行输出；
+//   - 每分钟触发一次的任务撞上长跑任务，一次阻塞期能被拦几百次，还得额外做去重。
+//
+// 记成任务上的两个字段就没有这些问题：天然幂等（同一个任务反复写同一行）、
+// 不需要去重、不进任何统计，列表与任务详情直接展示。
+func recordSkippedTrigger(req *ExecutionRequest, reason string) {
+	if req == nil || req.TaskID == 0 || database.DB == nil {
+		return
+	}
+
+	if err := database.DB.Model(&model.Task{}).Where("id = ?", req.TaskID).Updates(map[string]interface{}{
+		"last_skip_at":     time.Now(),
+		"last_skip_reason": reason,
+	}).Error; err != nil {
+		log.Printf("任务 %d 记录跳过原因失败: %v", req.TaskID, err)
+	}
 }
 
 func (s *SchedulerV2) AddJob(task *model.Task) error {
@@ -269,7 +536,20 @@ func (s *SchedulerV2) AddJob(task *model.Task) error {
 		delete(s.entryMap, task.ID)
 	}
 
-	if task.Status != model.TaskStatusEnabled {
+	// 只有「真正被禁用」才不再注册。
+	// 刻意不写成 `!= TaskStatusEnabled`：排队中(0.5) 与 运行中(2) 是启用态任务的瞬时状态，
+	// 而上面已经无条件把旧 entry 摘掉了 —— 一旦在这两个瞬间走到这里就直接 return，
+	// 这个任务从此再也不会被 cron 触发，而且列表里依然显示「已启用 + 有下次运行时间」，
+	// 用户完全无从察觉。编辑任务保存（handler/task_mutate.go 重载真实状态后调 UpdateJob）、
+	// 订阅同步、备份恢复的 ReloadAllJobs 都可能正好撞上这两个瞬间。
+	// 更坏的是复合后果：entry 没了 -> HasJob 为 false -> 本次跑完时 ResolveTaskInactiveStatus
+	// 会把「运行中 + 没有 job」判成已禁用，等于编辑一次正在跑的任务就把它静默关掉了。
+	//
+	// 「运行中被禁用、等这次跑完再生效」的任务同样不能挂回去：它的 status 还停在运行中，
+	// 但用户的意图已经是禁用。漏掉这一条的话，只要中途有任何一次 AddJob（编辑保存、订阅同步、
+	// 备份恢复的全量重载）把条目加回来，这个任务就会带着活着的 cron 条目落成「已禁用」，
+	// 之后一直按点被触发执行 —— 比原来的缺陷更糟。
+	if task.Status == model.TaskStatusDisabled || hasPendingDisable(task) {
 		return nil
 	}
 	if !task.UsesCronSchedule() {
@@ -303,7 +583,7 @@ func (s *SchedulerV2) AddJob(task *model.Task) error {
 				RetryIndex:  0,
 			}
 			if err := s.Enqueue(req); err != nil {
-				log.Printf("task %d enqueue failed: %v", taskID, err)
+				log.Printf("任务 %d 定时触发入队失败（本次不会执行）: %v", taskID, err)
 				return
 			}
 			database.DB.Model(&model.Task{}).Where("id = ? AND status != ?", taskID, model.TaskStatusRunning).Update("status", model.TaskStatusQueued)
@@ -428,6 +708,26 @@ func (s *SchedulerV2) HasJob(taskID uint) bool {
 	return exists
 }
 
+// ScheduledEntryCount 返回该任务当前在 cron 里真正挂了几个触发条目。
+// 和 HasJob 的区别很关键：非 cron 类型的任务也会在 entryMap 里留一个空切片（见 AddJob），
+// HasJob 对它返回 true，但它一个 cron entry 都没有、永远不会自动触发。
+// 任务列表用这个数来判断「显示着下次运行时间、实际却不会跑」的静默失联状态。
+// 返回 -1 表示这个任务压根不在调度器里（从未注册或已被 RemoveJob 摘掉）。
+func (s *SchedulerV2) ScheduledEntryCount(taskID uint) int {
+	if s == nil {
+		return -1
+	}
+
+	s.entryLock.RLock()
+	defer s.entryLock.RUnlock()
+
+	entryIDs, exists := s.entryMap[taskID]
+	if !exists {
+		return -1
+	}
+	return len(entryIDs)
+}
+
 func (s *SchedulerV2) RunNow(taskID uint) error {
 	var task model.Task
 	if err := database.DB.First(&task, taskID).Error; err != nil {
@@ -492,7 +792,7 @@ func (s *SchedulerV2) EnqueueStartupTasks() int {
 			RetryIndex:  0,
 		}
 		if err := s.Enqueue(req); err != nil {
-			log.Printf("startup task %d enqueue failed: %v", task.ID, err)
+			log.Printf("开机任务 %d 入队失败（本次不会执行）: %v", task.ID, err)
 			continue
 		}
 
@@ -512,27 +812,37 @@ func (s *SchedulerV2) EnqueueStartupTasks() int {
 }
 
 func (s *SchedulerV2) ReloadAllJobs() {
-	s.entryLock.Lock()
-	for taskID, entryIDs := range s.entryMap {
-		for _, entryID := range entryIDs {
-			if entryID != 0 {
-				s.cron.Remove(entryID)
-			}
-		}
-		delete(s.entryMap, taskID)
-	}
-	s.entryLock.Unlock()
-
 	var tasks []model.Task
-	database.DB.Where("status = ?", model.TaskStatusEnabled).Find(&tasks)
+	// 与 AddJob 的早退条件保持同一口径：排队中/运行中的任务也要重新注册，
+	// 否则备份恢复恰好撞上有任务在跑时，那条任务会连 entry 一起丢掉。
+	database.DB.Where("status <> ?", model.TaskStatusDisabled).Find(&tasks)
 
+	// 刻意不先清空 entryMap 再逐条重建：AddJob 本来就会先摘掉这个任务的旧条目再挂新的，
+	// 提前清空只会多出一个「所有任务都查不到条目」的空窗口 ——
+	// 恰好在这期间刷新任务列表，整屏都会误报「未注册到调度器」。
+	// 改成先逐条重建、最后再摘掉这次没出现的（已删除 / 已禁用），中间任何一刻都不会出现空窗。
+	reloaded := make(map[uint]struct{}, len(tasks))
 	for i := range tasks {
+		reloaded[tasks[i].ID] = struct{}{}
 		if err := s.AddJob(&tasks[i]); err != nil {
-			log.Printf("reload job failed for task %d: %v", tasks[i].ID, err)
+			log.Printf("任务 %d 重新注册调度失败: %v", tasks[i].ID, err)
 		}
 	}
 
-	log.Printf("scheduler reloaded: %d jobs", len(tasks))
+	s.entryLock.RLock()
+	stale := make([]uint, 0, len(s.entryMap))
+	for taskID := range s.entryMap {
+		if _, ok := reloaded[taskID]; !ok {
+			stale = append(stale, taskID)
+		}
+	}
+	s.entryLock.RUnlock()
+
+	for _, taskID := range stale {
+		s.RemoveJob(taskID)
+	}
+
+	log.Printf("scheduler reloaded: %d jobs, %d stale removed", len(tasks), len(stale))
 }
 
 func getGoroutineID() int64 {

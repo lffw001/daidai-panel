@@ -57,6 +57,12 @@ func SendNotificationWithOptions(title, content string, options NotificationDisp
 	if len(channels) == 0 {
 		if len(options.ChannelIDs) > 0 {
 			log.Printf("notification skipped: no enabled channels matched ids=%v", options.ChannelIDs)
+		} else {
+			// 广播 0 命中在这之前是完全静默的：这条分支上的调用方（资源告警、登录通知、
+			// 静默更新结果、未绑定渠道的任务通知）全都不看返回值，也没有任何日志。
+			// 加了 bound 语义后，用户只要把所有渠道都设成「绑定推送」，系统通知就会全部人间蒸发
+			// 且零线索，所以这里必须留一行 warn 作为唯一可查的痕迹。
+			log.Printf("warn: notification broadcast skipped: no channel with push_scope=default is enabled (title=%q)", title)
 		}
 		return
 	}
@@ -79,9 +85,10 @@ func SendNotificationSyncWithOptions(title, content string, options Notification
 	}
 	if len(channels) == 0 {
 		if len(options.ChannelIDs) > 0 {
+			// 这句被 handler 的回归测试逐字断言，改文案会挂，也会让老客户端的错误匹配失效。
 			return result, fmt.Errorf("未找到已启用的通知渠道")
 		}
-		return result, fmt.Errorf("暂无已启用的通知渠道")
+		return result, fmt.Errorf("暂无参与广播的默认推送渠道")
 	}
 
 	for _, ch := range channels {
@@ -103,11 +110,26 @@ func dispatchNotificationToChannel(ch model.NotifyChannel, title, content string
 	}
 }
 
+// loadEnabledNotificationChannels 是全后端唯一的渠道筛选点，两种语义在这里分叉：
+//
+//   - 定向（channelIDs 非空）：按 ID 精确命中，**完全忽略 push_scope**。
+//     「绑定推送」渠道存在的意义就是只在被显式指定时才推，这里再叠一层 push_scope 过滤
+//     会让它永远发不出去，等于把功能做废。
+//   - 广播（channelIDs 为空）：只命中「默认推送」渠道。
 func loadEnabledNotificationChannels(channelIDs []uint) ([]model.NotifyChannel, error) {
 	var channels []model.NotifyChannel
 	query := database.DB.Where("enabled = ?", true)
 	if ids := uniqueNotificationChannelIDs(channelIDs); len(ids) > 0 {
 		query = query.Where("id IN ?", ids)
+	} else {
+		// 必须写「不等于 bound」而不是「等于 default」。
+		// 这一列的语义是「空即默认」，只有明确写着 bound 才排除出广播。
+		// 老库补列、手工改库、以及未来任何忘了填这一列的写入路径，都可能留下空串或 NULL；
+		// 写成等值比较，这些行会静默退出广播，表现成「升级之后突然一条通知都收不到」，
+		// 而且没有任何报错可查 —— 方向反了的默认值是这类功能最贵的 bug。
+		// 用 COALESCE 兜住 NULL：SQL 里 `NULL <> 'bound'` 求值为 NULL（不成立），
+		// 不兜的话 NULL 行照样会被漏掉。
+		query = query.Where("COALESCE(push_scope, '') <> ?", model.NotifyPushScopeBound)
 	}
 	if err := query.Order("created_at DESC, id DESC").Find(&channels).Error; err != nil {
 		return nil, err
@@ -231,11 +253,29 @@ func sendToChannel(ch model.NotifyChannel, title, content string, context map[st
 	return nil
 }
 
+// notifyResultCheck 判断厂商是否在 HTTP 200 里返回了业务失败。
+//
+// 大部分推送服务在参数错误、额度不足、渠道未开通时仍然回 200，只在响应体里带一个业务
+// 错误码。面板以前只看 HTTP 状态码，这类失败会被一律显示成「发送成功」。
+//
+// 口径刻意保守：只有能【确定】是失败时才返回 error。响应体不是 JSON 对象、
+// 缺少约定字段、或字段类型对不上时一律放行，保证这层校验不会把本来能用的渠道改红。
+// 只给已经核对过官方响应契约的渠道挂校验器，没核对过的保持原样。
+type notifyResultCheck func(body []byte) error
+
 func httpPost(url string, body interface{}, headers map[string]string) error {
 	return httpPostWithClient(NewHTTPClient(10*time.Second), url, body, headers)
 }
 
 func httpPostWithClient(client *http.Client, url string, body interface{}, headers map[string]string) error {
+	return httpPostCheckedWithClient(client, url, body, headers, nil)
+}
+
+func httpPostChecked(url string, body interface{}, headers map[string]string, check notifyResultCheck) error {
+	return httpPostCheckedWithClient(NewHTTPClient(10*time.Second), url, body, headers, check)
+}
+
+func httpPostCheckedWithClient(client *http.Client, url string, body interface{}, headers map[string]string, check notifyResultCheck) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -256,12 +296,127 @@ func httpPostWithClient(client *http.Client, url string, body interface{}, heade
 	}
 	defer resp.Body.Close()
 
+	// 限长读取：推送接口的响应体都很小，这里既避免异常大响应吃内存，
+	// 也让连接能被正常复用（原来成功路径完全不读 body）。
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
 	if resp.StatusCode >= 400 {
-		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+	if check != nil {
+		return check(respBody)
 	}
 	return nil
 }
+
+// parseNotifyResponseObject 只接受 JSON 对象；纯文本、数组、空响应一律当作「无法判定」。
+func parseNotifyResponseObject(body []byte) (map[string]interface{}, bool) {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, false
+	}
+	payload := map[string]interface{}{}
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		return nil, false
+	}
+	return payload, true
+}
+
+// notifyResponseNumber 兼容错误码被写成字符串的情况（部分服务返回 "code": "0"）。
+func notifyResponseNumber(value interface{}) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
+}
+
+func notifyResponseMessage(payload map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if text, ok := payload[key].(string); ok {
+			if trimmed := strings.TrimSpace(text); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
+// checkNotifyCodeField 适用于「HTTP 200 + JSON 里一个数字业务码」的响应。
+func checkNotifyCodeField(codeKey string, successValues []float64, messageKeys ...string) notifyResultCheck {
+	return func(body []byte) error {
+		payload, ok := parseNotifyResponseObject(body)
+		if !ok {
+			return nil
+		}
+		raw, exists := payload[codeKey]
+		if !exists {
+			return nil
+		}
+		code, ok := notifyResponseNumber(raw)
+		if !ok {
+			return nil
+		}
+		for _, success := range successValues {
+			if code == success {
+				return nil
+			}
+		}
+		if message := notifyResponseMessage(payload, messageKeys...); message != "" {
+			return fmt.Errorf("推送服务返回失败（%s=%v）：%s", codeKey, raw, message)
+		}
+		return fmt.Errorf("推送服务返回失败（%s=%v）", codeKey, raw)
+	}
+}
+
+// combineNotifyChecks 依次执行，返回第一个确定的失败。
+// 用于同一个厂商存在多种响应体形态的情况（例如飞书的 code 与 StatusCode 两代字段）。
+func combineNotifyChecks(checks ...notifyResultCheck) notifyResultCheck {
+	return func(body []byte) error {
+		for _, check := range checks {
+			if err := check(body); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// checkTelegramResult：Telegram Bot API 固定返回 {"ok":true|false,"description":"..."}。
+func checkTelegramResult(body []byte) error {
+	payload, ok := parseNotifyResponseObject(body)
+	if !ok {
+		return nil
+	}
+	okValue, exists := payload["ok"].(bool)
+	if !exists || okValue {
+		return nil
+	}
+	if message := notifyResponseMessage(payload, "description"); message != "" {
+		return fmt.Errorf("Telegram 返回失败：%s", message)
+	}
+	return fmt.Errorf("Telegram 返回失败")
+}
+
+var (
+	// errcode 是微信系（企业微信机器人 / 企业微信应用 / 钉钉）统一的业务码字段。
+	checkWecomStyleResult = checkNotifyCodeField("errcode", []float64{0}, "errmsg")
+	// 飞书自定义机器人新老两代响应字段并存，两个都查。
+	checkFeishuResult = combineNotifyChecks(
+		checkNotifyCodeField("code", []float64{0}, "msg"),
+		checkNotifyCodeField("StatusCode", []float64{0}, "StatusMessage"),
+	)
+	checkPushplusResult   = checkNotifyCodeField("code", []float64{200}, "msg")
+	checkServerchanResult = checkNotifyCodeField("code", []float64{0}, "message", "msg")
+	checkBarkResult       = checkNotifyCodeField("code", []float64{200}, "message")
+)
 
 func sendWebhook(cfg map[string]string, title, content string) error {
 	webhookURL := cfg["url"]
@@ -408,7 +563,7 @@ func sendTelegram(cfg map[string]string, title, content string) error {
 				body["message_thread_id"] = threadID
 			}
 		}
-		if err := httpPostWithClient(client, apiURL, body, nil); err != nil {
+		if err := httpPostCheckedWithClient(client, apiURL, body, nil, checkTelegramResult); err != nil {
 			return err
 		}
 	}
@@ -451,7 +606,7 @@ func sendDingtalk(cfg map[string]string, title, content string) error {
 			},
 		}
 	}
-	return httpPost(webhook, body, nil)
+	return httpPostChecked(webhook, body, nil, checkWecomStyleResult)
 }
 
 func sendWecom(cfg map[string]string, title, content string) error {
@@ -522,7 +677,7 @@ func sendWecomWithContext(cfg map[string]string, title, content string, context 
 		return fmt.Errorf("不支持的企业微信机器人消息类型: %s", msgType)
 	}
 
-	return httpPost(webhook, body, nil)
+	return httpPostChecked(webhook, body, nil, checkWecomStyleResult)
 }
 
 func sendWecomApp(cfg map[string]string, title, content string) error {
@@ -779,7 +934,7 @@ func sendBarkWithContext(cfg map[string]string, title, content string, context m
 	if jumpURL != "" {
 		body["url"] = jumpURL
 	}
-	return httpPost(apiURL, body, nil)
+	return httpPostChecked(apiURL, body, nil, checkBarkResult)
 }
 
 func sendPushplus(cfg map[string]string, title, content string) error {
@@ -787,7 +942,10 @@ func sendPushplus(cfg map[string]string, title, content string) error {
 	if token == "" {
 		return fmt.Errorf("PushPlus Token 为空")
 	}
-	apiURL := "http://www.pushplus.plus/send"
+	// 走 https：同一个请求分别打 https 和 http 实测过，两边都是 HTTP 200 且响应体逐字节相同
+	// （{"code":903,...}），说明 https 通道可用。而 http 会让用户的 PushPlus token 明文过网，
+	// 没有任何理由继续用。
+	apiURL := "https://www.pushplus.plus/send"
 	body := map[string]string{
 		"token":   token,
 		"title":   title,
@@ -799,7 +957,18 @@ func sendPushplus(cfg map[string]string, title, content string) error {
 	if v := cfg["template"]; v != "" {
 		body["template"] = v
 	}
-	return httpPost(apiURL, body, nil)
+	// channel 留空时不发这个参数，由 PushPlus 按账号默认渠道（微信公众号）处理，
+	// 保证老渠道配置的行为与新增该字段之前完全一致。
+	if v := cfg["channel"]; v != "" {
+		body["channel"] = v
+	}
+	// option 是 PushPlus 对原 webhook 参数的改名，含义随 channel 变：webhook 渠道填 webhook 编码，
+	// cp 渠道填企业微信自定义应用编码，qq 渠道填目标 QQ 群的配置编码（发给个人时留空）。
+	// 其余渠道不需要。
+	if v := cfg["option"]; v != "" {
+		body["option"] = v
+	}
+	return httpPostChecked(apiURL, body, nil, checkPushplusResult)
 }
 
 func sendServerchan(cfg map[string]string, title, content string) error {
@@ -809,7 +978,7 @@ func sendServerchan(cfg map[string]string, title, content string) error {
 		"title": title,
 		"desp":  content,
 	}
-	return httpPost(apiURL, body, nil)
+	return httpPostChecked(apiURL, body, nil, checkServerchanResult)
 }
 
 func sendFeishu(cfg map[string]string, title, content string) error {
@@ -829,7 +998,7 @@ func sendFeishu(cfg map[string]string, title, content string) error {
 		body["timestamp"] = fmt.Sprintf("%d", timestamp)
 		body["sign"] = sign
 	}
-	return httpPost(webhook, body, nil)
+	return httpPostChecked(webhook, body, nil, checkFeishuResult)
 }
 
 func sendGotify(cfg map[string]string, title, content string) error {

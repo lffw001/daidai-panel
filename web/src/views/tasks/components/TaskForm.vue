@@ -1,20 +1,25 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import CronInput from './CronInput.vue'
+import CronInput, { DEFAULT_CRON_DAILY_MIDNIGHT, DEFAULT_CRON_EVERY_MINUTE } from './CronInput.vue'
 import StopScheduleInput from './StopScheduleInput.vue'
 import { mergeTaskLabels, splitTaskLabels } from '../taskLabels'
 import { useResponsive } from '@/composables/useResponsive'
 import type { PythonRuntimeInfo } from '@/api/deps'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   visible: boolean
   task?: any
   prefill?: any
   defaultPythonVersion?: string
   pythonRuntimes?: PythonRuntimeInfo[]
-  notificationChannels?: { id: number; name: string; type: string; enabled: boolean }[]
-}>()
+  notificationChannels?: { id: number; name: string; type: string; enabled: boolean; push_scope?: string }[]
+  // 提交在途标记：父组件创建/更新请求期间置位。
+  // 弹窗要等请求成功才关，不锁按钮的话连点就会建出多条重复任务。
+  submitting?: boolean
+}>(), {
+  submitting: false
+})
 
 const emit = defineEmits<{
   'update:visible': [value: boolean]
@@ -25,7 +30,9 @@ const form = ref({
   name: '',
   command: '',
   python_version: '3.12',
-  cron_expression: '0 0 * * *',
+  // 这只是 ref 的声明初值：弹窗每次打开都会走下面的 watch 把整个 form 重置一遍，
+  // 所以它实际上看不到。取值口径见 CronInput.vue 顶部那两个导出常量。
+  cron_expression: DEFAULT_CRON_DAILY_MIDNIGHT,
   task_type: 'cron',
   timeout: 0,
   success_exit_codes: '0',
@@ -103,7 +110,7 @@ watch(() => props.visible, (val) => {
       name: props.task.name || '',
       command: props.task.command || '',
       python_version: props.task.python_version || getDefaultPythonVersion(),
-      cron_expression: props.task.cron_expression || '* * * * *',
+      cron_expression: props.task.cron_expression || DEFAULT_CRON_EVERY_MINUTE,
       task_type: props.task.task_type || 'cron',
       timeout: props.task.timeout ?? 0,
       success_exit_codes: props.task.success_exit_codes || '0',
@@ -129,7 +136,8 @@ watch(() => props.visible, (val) => {
     form.value = {
       name: p?.name || '', command: p?.command || '',
       python_version: p?.python_version || getDefaultPythonVersion(),
-      cron_expression: p?.cron_expression || '* * * * *',
+      // 手动新建（prefill 没带表达式）时预填「每分钟」；从脚本页跳过来的 prefill 带的是「每天 00:00」
+      cron_expression: p?.cron_expression || DEFAULT_CRON_EVERY_MINUTE,
       task_type: p?.task_type || 'cron',
       timeout: 0, success_exit_codes: '0', random_delay_seconds: null, max_retries: 0, retry_interval: 60,
       notify_on_failure: false, notify_on_success: false, notification_channel_id: null, labels: [], depends_on: null,
@@ -148,7 +156,10 @@ watch([() => props.defaultPythonVersion, () => props.pythonRuntimes], () => {
 
 watch(() => form.value.task_type, (value) => {
   if (value === 'cron' && !form.value.cron_expression) {
-    form.value.cron_expression = '0 0 * * *'
+    // 把「定时类型」切走再切回来（且中途把表达式清空了）时的兜底，取值与改动前一致。
+    // 刻意保持「每天 00:00」而不是跟手动新建的「每分钟」统一：切回来是个顺手动作，
+    // 用户很可能不会再看一眼定时规则就保存，兜底值给「每分钟」等于给他挖坑。
+    form.value.cron_expression = DEFAULT_CRON_DAILY_MIDNIGHT
   }
 })
 
@@ -179,6 +190,10 @@ function removeLabel(label: string) {
 }
 
 function handleSubmit() {
+  // 上一发还在路上时直接忽略，避免重复提交
+  if (props.submitting) {
+    return
+  }
   if (!form.value.name || !form.value.command) {
     ElMessage.warning('请填写任务名称和执行命令')
     return
@@ -351,18 +366,19 @@ function handleSubmit() {
                 v-model="form.notification_channel_id"
                 clearable
                 filterable
-                placeholder="留空则发送到全部启用渠道"
+                placeholder="留空则发送到全部默认推送渠道"
                 style="width: 100%"
               >
                 <el-option
                   v-for="channel in (props.notificationChannels || [])"
                   :key="channel.id"
-                  :label="channel.enabled ? `${channel.name} (${channel.type})` : `${channel.name} (${channel.type}，已禁用)`"
+                  :label="`${channel.name} (${channel.type}${channel.enabled ? '' : '，已禁用'}${channel.push_scope === 'bound' ? '，仅绑定' : ''})`"
                   :value="channel.id"
                 />
               </el-select>
               <div style="font-size: 12px; color: var(--el-text-color-secondary); margin-top: 4px">
-                可绑定单个通知渠道；留空时仍按全部已启用渠道发送。
+                可绑定单个通知渠道；留空时按广播发送，也就是只发到「默认推送」渠道。
+                设为「绑定推送」的渠道不参与广播，必须在这里选中才会收到本任务的通知。
               </div>
             </div>
           </el-form-item>
@@ -381,12 +397,34 @@ function handleSubmit() {
           <div class="hooks-help">
             当前任务专属的 shell 脚本。前置脚本会在目标脚本执行前运行，后置脚本会在目标脚本结束后运行；如果任务命令传入了参数，这里也可以通过 $1、$2 等读取同一份参数。
           </div>
+          <div class="hooks-help">
+            <strong>前置脚本里 export 的环境变量，会对随后的目标脚本生效。</strong>
+            全局 <code>task_before.sh</code> 同样参与，按执行顺序依次合并；合并结果还会一并交给
+            <code>task_after.sh</code>、<code>extra.sh</code> 和后置脚本。后置脚本自身的 export 不回传。
+            三条限制请务必留意：
+            <ol class="hooks-help-list">
+              <li>
+                只支持<strong>新增和覆盖</strong>，<strong>unset 不会传导</strong>。想让某个变量变空请写
+                <code>export VAR=</code>，不要用 <code>unset VAR</code>。
+              </li>
+              <li>
+                <code>TZ</code> 和所有 <code>DAIDAI_</code> 开头的变量属于面板运行时契约（面板时区、通知渠道绑定、脚本令牌等），
+                在前置脚本里改了不会生效，任务日志里会写明被忽略了哪些。
+              </li>
+              <li>
+                <strong>任务命令用了 desi / conc，就别在前置脚本里改同名变量。</strong>
+                账号收窄发生在前置脚本<strong>之后</strong>，撞车时 desi / conc 会赢，
+                你会遇到「明明 export 了单个值，结果还是全跑」。只想跑第 N 个账号，正规写法是
+                <code>task 脚本.py desi 变量名 3</code>（序号从 1 开始，也支持 <code>2 3</code>、<code>1,3</code>、<code>2-5</code>）。
+              </li>
+            </ol>
+          </div>
           <el-form-item label="前置脚本">
             <el-input
               v-model="form.task_before"
               type="textarea"
               :rows="4"
-              placeholder="任务执行前运行，例如设置代理、准备环境变量、创建临时目录；可用 $1、$2 读取任务参数"
+              placeholder="任务执行前运行，例如设置代理、准备环境变量、创建临时目录；这里 export 的变量会传给目标脚本；可用 $1、$2 读取任务参数"
             />
           </el-form-item>
           <el-form-item label="后置脚本">
@@ -394,7 +432,7 @@ function handleSubmit() {
               v-model="form.task_after"
               type="textarea"
               :rows="4"
-              placeholder="任务执行后运行，例如清理临时文件、输出收尾日志、恢复环境；可用 $1、$2 读取任务参数"
+              placeholder="任务执行后运行，例如清理临时文件、输出收尾日志、恢复环境；这里 export 的变量不会回传；可用 $1、$2 读取任务参数"
             />
           </el-form-item>
         </el-form>
@@ -403,7 +441,7 @@ function handleSubmit() {
 
     <template #footer>
       <el-button @click="emit('update:visible', false)">取消</el-button>
-      <el-button type="primary" @click="handleSubmit">{{ task ? '更新' : '创建' }}</el-button>
+      <el-button type="primary" :loading="submitting" :disabled="submitting" @click="handleSubmit">{{ task ? '更新' : '创建' }}</el-button>
     </template>
   </el-dialog>
 </template>
@@ -439,11 +477,24 @@ function handleSubmit() {
   margin: 0 0 14px;
   padding: 10px 12px;
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
+  // 弹窗内的说明区块 → surface 档
+  border-radius: var(--dd-radius-surface);
   background: var(--el-fill-color-lighter);
   color: var(--el-text-color-regular);
   font-size: 13px;
   line-height: 1.7;
+}
+
+.hooks-help code {
+  padding: 0 4px;
+  background: var(--el-fill-color-dark);
+  font-family: var(--el-font-family-mono, monospace);
+  font-size: 12px;
+}
+
+.hooks-help-list {
+  margin: 6px 0 0;
+  padding-left: 20px;
 }
 
 @media (max-width: 768px) {

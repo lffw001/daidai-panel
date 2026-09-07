@@ -12,13 +12,14 @@ export interface ApiEndpoint {
   path: string
   title: string
   description: string
-  auth?: 'jwt' | 'open_api' | 'none'
+  auth?: 'jwt' | 'open_api' | 'none' | 'ticket'
   pathParams?: ApiParam[]
   queryParams?: ApiParam[]
   bodyParams?: ApiParam[]
   helperExamples?: Record<string, string>
   responseExample?: string
   responseFields?: ApiParam[]
+  responseContentType?: string
 }
 
 export interface ApiCategory {
@@ -90,12 +91,13 @@ export const apiCategories: ApiCategory[] = [
         method: 'GET',
         path: '/api/envs',
         title: '查找环境变量',
-        description: '通过关键字搜索环境变量，用于判断变量是否已存在。插件通常通过 keyword 参数按变量名搜索，然后遍历结果匹配 remarks 中的用户标识来定位具体变量。',
+        description: '通过关键字搜索环境变量，用于判断变量是否已存在。插件通常通过 keyword 参数按变量名搜索，然后遍历结果匹配 remarks 中的用户标识来定位具体变量。也可以直接用 names 参数按变量名精确匹配，省掉「模糊结果再过滤一遍」这一步。完整的筛选参数见「环境变量 → 获取所有环境变量」。',
         auth: 'jwt',
         queryParams: [
-          { name: 'keyword', type: 'string', description: '搜索关键字（按变量名或备注模糊匹配）', example: 'sfsyUrl' },
+          { name: 'keyword', type: 'string', description: '搜索关键字（按变量名 / 变量值 / 备注 / 分组模糊匹配，四者是 OR）', example: 'sfsyUrl' },
+          { name: 'names', type: 'string', description: '按变量名【精确】筛选，多个用逗号分隔或重复传 names=A&names=B。比 keyword 更适合插件定位：keyword 是模糊匹配，会把 sfsyUrl2 一起带出来，names 是精确相等。与 keyword 之间是 AND', example: 'sfsyUrl' },
           { name: 'page', type: 'integer', description: '页码，默认 1', example: '1' },
-          { name: 'page_size', type: 'integer', description: '每页数量，建议设为 100 以获取完整列表', example: '100' },
+          { name: 'page_size', type: 'integer', description: '每页数量，建议设为 100 以获取完整列表（上限就是 100，超过会回落成 20；要一次拿全请改用 all=1）', example: '100' },
         ],
         responseExample: JSON.stringify({
           data: [{
@@ -277,7 +279,7 @@ panel.add_or_update_env(
         method: 'GET',
         path: '/docs/plugin-notes',
         title: '注意事项与常见问题',
-        description: 'Token 管理：access_token 有效期 24 小时，过期后重新调用 POST /api/open-api/token 获取新 Token（无 refresh_token 机制）。收到 401 错误即表示 Token 过期，需重新获取。错误格式：{"error": "错误信息"} + HTTP 状态码（400/401/403/404/500）。最佳实践：1. 不需要对 value 进行 URL 编码 2. 建议设置 10 秒超时 3. 建议实现 401 自动重新获取 Token 4. 在 remarks 中存储用户标识便于查找 5. 查询时设置较大的 page_size（如 100）减少请求次数。',
+        description: 'Token 管理：access_token 有效期 24 小时，过期后重新调用 POST /api/open-api/token 获取新 Token（无 refresh_token 机制）。在 Open API 的鉴权接口上收到 401 即表示 Token 过期，需重新获取。⚠️ 这条约定不适用于 POST /api/auth/login：登录接口的 401 还可能承载两步验证 / 人机验证挑战（响应体带 two_factor_required 或 captcha_required 及 code 字段），不能一律当成 Token 过期去续期，更不能在 401 时直接抛异常丢掉响应体。错误格式：{"error": "错误信息"} + HTTP 状态码（400/401/403/404/500），登录相关失败额外带机器可读的 code 字段。最佳实践：1. 不需要对 value 进行 URL 编码 2. 建议设置 10 秒超时 3. 建议对「已鉴权接口」实现 401 自动重新获取 Token，但登录接口要先读响应体再判断 4. 在 remarks 中存储用户标识便于查找 5. 查询时设置较大的 page_size（如 100）减少请求次数。',
         auth: 'none',
         responseExample: JSON.stringify({
           '差异对比': {
@@ -290,10 +292,19 @@ panel.add_or_update_env(
             'Value编码': '青龙: 需要 URL 编码 → 呆呆: 不需要编码',
           },
           '错误响应格式': { error: '错误信息' },
-          'HTTP状态码': { '200': '成功', '400': '参数错误', '401': 'Token 过期或无效', '403': '应用已禁用', '404': '不存在', '500': '服务器错误' },
+          'HTTP状态码': {
+            '200': '成功',
+            '400': '参数错误',
+            '401': '已鉴权接口：Token 过期或无效；/api/auth/login：凭据错误，或需要两步验证 / 人机验证（先读响应体的 code 字段）',
+            '403': '应用已禁用',
+            '404': '不存在',
+            '429': '请求过于频繁，或账号已被锁定（code = account_locked）',
+            '500': '服务器错误',
+          },
         }, null, 2),
         responseFields: [
-          { name: 'Token 过期', type: 'tip', description: '收到 401 时重新调用 POST /api/open-api/token 获取新 Token' },
+          { name: 'Token 过期', type: 'tip', description: '已鉴权接口收到 401 时，重新调用 POST /api/open-api/token 获取新 Token' },
+          { name: '登录接口的 401', type: 'tip', description: 'POST /api/auth/login 的 401 不是 Token 过期。它可能是凭据错误，也可能是两步验证 / 人机验证挑战（two_factor_required / captcha_required）。请按响应体的 code 字段分支，不要在 401 时直接抛异常丢掉响应体' },
           { name: '应用禁用', type: 'tip', description: '收到 403 表示应用已被禁用，需在面板 Open API 页面重新启用' },
           { name: 'Value 编码', type: 'tip', description: '不需要 URL 编码，直接传原始值' },
           { name: '批量操作', type: 'tip', description: '暂不支持批量，需循环调用单个接口' },
@@ -312,21 +323,57 @@ panel.add_or_update_env(
         method: 'POST',
         path: '/api/auth/login',
         title: '用户登录',
-        description: '使用用户名和密码登录，获取 JWT Token',
+        description: '使用用户名和密码登录，获取 JWT Token。⚠️ 本接口的 401 不等于「Token 过期」：账号开启两步验证或人机验证时，登录挑战同样用 401 承载，响应体里带 two_factor_required / captcha_required 与稳定的 code 字段。客户端必须先读响应体再决定下一步，不能把 401 一律当成需要续期而把响应体丢掉——若 HTTP 客户端（如 dio 的 validateStatus、axios 的 validateStatus）在 401 时直接抛异常，用户会看到「请输入两步验证码」却没有任何可输入的地方。收到 two_factor_required 时，请带上 totp_code 重发本接口；若同时带回 captcha_required=true，第二次请求还需重新完成人机验证。',
         auth: 'none',
         bodyParams: [
           { name: 'username', type: 'string', required: true, description: '用户名', example: 'admin' },
           { name: 'password', type: 'string', required: true, description: '密码', example: 'admin123' },
+          { name: 'totp_code', type: 'string', required: false, description: '两步验证动态码（6 位）。仅在上一次请求返回 two_factor_required 时需要携带', example: '123456' },
+          { name: 'captcha', type: 'object', required: false, description: '人机验证载荷（极验 4），字段：lot_number / captcha_output / pass_token / gen_time。仅在返回 captcha_required 时需要携带' },
         ],
         responseExample: JSON.stringify({
-          access_token: 'eyJhbGciOi...',
-          refresh_token: 'eyJhbGciOi...',
-          user: { id: 1, username: 'admin', role: 'admin' },
+          '登录成功 (200)': {
+            access_token: 'eyJhbGciOi...',
+            refresh_token: 'eyJhbGciOi...',
+            user: { id: 1, username: 'admin', role: 'admin' },
+          },
+          '需要两步验证码 (401)': {
+            error: '请输入两步验证码',
+            code: 'two_factor_required',
+            two_factor_required: true,
+            captcha_required: false,
+            captcha_id: '',
+            captcha_threshold: 0,
+            require_after_failures: 0,
+          },
+          '两步验证码错误 (401)': {
+            error: '两步验证码错误',
+            code: 'invalid_totp',
+            two_factor_required: true,
+          },
+          '用户名或密码错误 (401)': {
+            error: '用户名或密码错误',
+            code: 'invalid_credentials',
+            failed_attempts: 1,
+          },
+          '账号已锁定 (429)': {
+            error: '账号已锁定，请 15 分钟后重试',
+            code: 'account_locked',
+            locked: true,
+            remaining_seconds: 900,
+          },
         }, null, 2),
         responseFields: [
-          { name: 'access_token', type: 'string', description: 'JWT 访问令牌' },
-          { name: 'refresh_token', type: 'string', description: 'JWT 刷新令牌' },
-          { name: 'user', type: 'object', description: '用户信息' },
+          { name: 'access_token', type: 'string', description: 'JWT 访问令牌（仅登录成功时返回）' },
+          { name: 'refresh_token', type: 'string', description: 'JWT 刷新令牌（仅登录成功时返回）' },
+          { name: 'user', type: 'object', description: '用户信息（仅登录成功时返回）' },
+          { name: 'code', type: 'string', description: '登录失败的稳定机器可读标识，取值：two_factor_required / invalid_totp / invalid_credentials / captcha_required / account_locked。建议客户端按 code 分支，不要匹配中文文案' },
+          { name: 'error', type: 'string', description: '失败原因的中文提示，可直接展示给用户' },
+          { name: 'two_factor_required', type: 'boolean', description: '为 true 表示需要两步验证码，请带 totp_code 重发本接口' },
+          { name: 'captcha_required', type: 'boolean', description: '为 true 表示本次登录需要完成人机验证；两步验证挑战同样会回带该字段' },
+          { name: 'captcha_id', type: 'string', description: '极验 4 的 Captcha ID，前端初始化验证码组件时使用' },
+          { name: 'require_after_failures', type: 'number', description: '触发人机验证所需的失败次数，0 表示每次登录都需要' },
+          { name: 'failed_attempts', type: 'number', description: '当前 IP + 用户名累计的连续失败次数' },
         ],
       },
       {
@@ -362,6 +409,116 @@ panel.add_or_update_env(
         ],
         responseExample: JSON.stringify({ message: '密码修改成功' }, null, 2),
       },
+      {
+        id: 'auth-preferences-get',
+        method: 'GET',
+        path: '/api/auth/preferences',
+        title: '获取当前用户的界面偏好',
+        description: '读取当前登录用户自己的界面偏好，目前只有编辑器（脚本编辑 / 日志查看）那一组开关。⚠️ 这是【按用户】的偏好，不是全面板配置：每个账号各存一份、互不影响，也不在 /api/configs 里。鉴权只要求 JWTAuth、不限角色——operator / viewer 同样能读写自己那份，改自己的编辑器开关不该要管理员权限（对比 /api/configs 那组是管理员独占）。从没存过偏好的用户直接返回下面这份默认值，不会 404，但会带上 stored=false（见响应字段，这是升级路径的关键）。⚠️ 编辑器引擎（CodeMirror / Monaco）刻意【不在】这里：它带着设备自适应语义（触摸设备与窄屏硬回落 CodeMirror），只存在浏览器本地——引擎跟设备走，偏好跟人走。',
+        auth: 'jwt',
+        responseExample: JSON.stringify({
+          editor: {
+            word_wrap: 'on',
+            minimap: false,
+            indent_guides: true,
+            whitespace: 'selection',
+            indent_width: 'auto',
+          },
+          stored: false,
+        }, null, 2),
+        responseFields: [
+          { name: 'editor.word_wrap', type: 'string', description: '自动换行，取值 on / off，默认 on' },
+          { name: 'editor.minimap', type: 'boolean', description: '缩略图开关，JSON 布尔，默认 false。只对 Monaco 引擎生效（CodeMirror 没有缩略图）' },
+          { name: 'editor.indent_guides', type: 'boolean', description: '缩进参考线开关，JSON 布尔，默认 true' },
+          { name: 'editor.whitespace', type: 'string', description: '空白符显示，取值 none（从不）/ selection（仅选中）/ all（始终），默认 selection' },
+          { name: 'editor.indent_width', type: 'string', description: '缩进宽度，取值 auto / 2 / 4 / 6 / 8，默认 auto（按文件内容自动检测）。⚠️ 传输层是字符串，是 "4" 不是 4' },
+          { name: 'stored', type: 'boolean', description: '服务端是否真的存过这个用户的偏好。判定口径：有这个用户的记录 且 记录里的偏好能解析成 JSON 对象 → true；没有记录 / 空串 / 脏 JSON 一律 false（后两种当成「没存过」）。⚠️ 它是给客户端做升级路径判断用的：stored=false 说明服务端还没有这个用户的记录，此时客户端应当把【本机】那份偏好一次性 PUT 上去做上行迁移，而不是拿下面 editor 里这套默认值去覆盖本机——照着覆盖的话，老用户升级到有服务端偏好的版本时，本机调好的开关会在首屏被静默冲掉。stored=true 才允许拿 editor 的值写回本地。注意 editor 字段本身不受 stored 影响：无论 stored 是什么都下发一整套可用的值，不认得 stored 的老客户端行为与加这个字段之前逐字一致' },
+        ],
+      },
+      {
+        id: 'auth-preferences-update',
+        method: 'PUT',
+        path: '/api/auth/preferences',
+        title: '更新当前用户的界面偏好',
+        description: '更新当前登录用户自己的界面偏好。⚠️ 字段级合并：body 里只放要改的键，没传的键保持原值、不会被重置成默认值——面板自己就是这么用的（改一个开关只提交那一个键），两个标签页各改各的开关不会互相覆盖。鉴权同 GET：JWTAuth、不限角色，改的永远是调用者自己那份，没有「替别人改」的入口。任一字段取值非法返回 400，不做静默纠正。响应体是合并之后的完整偏好，与 GET 逐字同形。',
+        auth: 'jwt',
+        bodyParams: [
+          { name: 'editor', type: 'object', required: true, description: '编辑器偏好，取下面 5 个键的任意子集', example: '{ "whitespace": "all" }' },
+          { name: 'editor.word_wrap', type: 'string', description: '自动换行，取值 on / off', example: 'on' },
+          { name: 'editor.minimap', type: 'boolean', description: '缩略图开关（只对 Monaco 引擎生效）。写入时是 JSON 布尔——面板前端提交的就是布尔；另外也接受 "on" / "off" / "true" / "false" 字符串，那是留给 APP 与历史客户端的。读出来统一是 JSON 布尔', example: 'false' },
+          { name: 'editor.indent_guides', type: 'boolean', description: '缩进参考线开关。写入时是 JSON 布尔（面板前端提交的就是布尔），同样兼容 "on" / "off" / "true" / "false" 字符串以照顾 APP 与历史客户端。读出来统一是 JSON 布尔', example: 'true' },
+          { name: 'editor.whitespace', type: 'string', description: '空白符显示，字符串，取值 none / selection / all', example: 'all' },
+          { name: 'editor.indent_width', type: 'string', description: '缩进宽度，字符串，取值 auto / 2 / 4 / 6 / 8。⚠️ 传输层是字符串，要传 "4" 不是 4', example: 'auto' },
+        ],
+        responseExample: JSON.stringify({
+          editor: {
+            word_wrap: 'on',
+            minimap: false,
+            indent_guides: true,
+            whitespace: 'all',
+            indent_width: 'auto',
+          },
+          stored: true,
+        }, null, 2),
+        responseFields: [
+          { name: 'editor', type: 'object', description: '合并之后的完整偏好，字段说明见「获取当前用户的界面偏好」' },
+          { name: 'stored', type: 'boolean', description: '恒为 true——写完这一次，服务端必然已经有这个用户的记录了。含义与 GET 的 stored 相同（有记录且能解析 → true），客户端据此判断「服务端还没有这个用户的记录」并决定要不要做本机偏好上行迁移；PUT 之后这个判断的答案只可能是「已经有了」' },
+        ],
+      },
+      {
+        id: 'auth-2fa-status',
+        method: 'GET',
+        path: '/api/security/2fa/status',
+        title: '查询两步验证状态',
+        description: '查询当前登录用户是否已启用两步验证（TOTP）',
+        auth: 'jwt',
+        responseExample: JSON.stringify({ data: { enabled: true } }, null, 2),
+        responseFields: [
+          { name: 'data.enabled', type: 'boolean', description: '是否已启用两步验证' },
+        ],
+      },
+      {
+        id: 'auth-2fa-setup',
+        method: 'POST',
+        path: '/api/security/2fa/setup',
+        title: '生成两步验证密钥',
+        description: '为当前登录用户生成新的 TOTP 密钥并返回 otpauth 链接。此时两步验证仍处于「未启用」状态，需要再调用 /api/security/2fa/verify 输入动态码确认后才真正生效。重复调用会覆盖上一次尚未确认的密钥。',
+        auth: 'jwt',
+        responseExample: JSON.stringify({
+          data: {
+            secret: 'JBSWY3DPEHPK3PXP',
+            uri: 'otpauth://totp/DaiDaiPanel:admin?secret=JBSWY3DPEHPK3PXP&issuer=DaiDaiPanel&digits=6&period=30',
+          },
+        }, null, 2),
+        responseFields: [
+          { name: 'data.secret', type: 'string', description: 'Base32 编码的 TOTP 密钥，可手动录入验证器 App' },
+          { name: 'data.uri', type: 'string', description: 'otpauth 链接，用于生成二维码；6 位动态码、30 秒周期' },
+        ],
+      },
+      {
+        id: 'auth-2fa-verify',
+        method: 'POST',
+        path: '/api/security/2fa/verify',
+        title: '确认并启用两步验证',
+        description: '输入验证器 App 当前显示的动态码，确认密钥已正确录入后启用两步验证。启用后再次登录会先收到 401 + two_factor_required 挑战。',
+        auth: 'jwt',
+        bodyParams: [
+          { name: 'code', type: 'string', required: true, description: '验证器当前显示的 6 位动态码', example: '123456' },
+        ],
+        responseExample: JSON.stringify({ message: '2FA 已启用' }, null, 2),
+      },
+      {
+        id: 'auth-2fa-disable',
+        method: 'DELETE',
+        path: '/api/security/2fa',
+        title: '关闭两步验证',
+        description: '关闭当前登录用户的两步验证。必须提供当前动态码——仅凭一个被劫持的会话不足以摘掉两步验证。若验证器已丢失，可在服务器上执行 ddp disable-2fa <用户名> 兜底。',
+        auth: 'jwt',
+        bodyParams: [
+          { name: 'code', type: 'string', required: true, description: '验证器当前显示的 6 位动态码', example: '123456' },
+        ],
+        responseExample: JSON.stringify({ message: '2FA 已禁用' }, null, 2),
+      },
     ],
   },
   {
@@ -373,12 +530,15 @@ panel.add_or_update_env(
         method: 'GET',
         path: '/api/tasks',
         title: '获取任务列表',
-        description: '获取所有定时任务，支持关键字搜索和分页',
+        description: '获取所有定时任务，支持关键字搜索和分页。每行可能多带一个 schedule_hint（string）：它只在「这条任务其实不会自动触发」时才出现，正常任务上这个 key 完全不存在。取值只有两种：「该任务类型不会自动触发，只能手动运行」（手动运行/开机运行类型）、「未注册到调度器，重新保存一次任务即可恢复」（cron 任务但调度器里没有它的触发条目）。已禁用的任务一律不带；面板没起调度器时不下发第二种。默认排序（不传 sort_rules 时）依次是：置顶 → 状态分组（启用/排队中/运行中一组、禁用一组、其余一组）→ 运行中优先 → 拖拽顺序（list_order）→ 手工顺序（sort_order）→ 创建时间倒序 → ID 倒序，其中「运行中优先」的边界见下方 sort_rules 的说明',
         auth: 'jwt',
         queryParams: [
           { name: 'keyword', type: 'string', description: '搜索关键字' },
           { name: 'page', type: 'integer', description: '页码，默认 1', example: '1' },
           { name: 'page_size', type: 'integer', description: '每页数量，默认 20', example: '20' },
+          { name: 'label', type: 'string', description: '按标签模糊匹配（labels LIKE %值%）。分组要连前缀一起传，例如「分组:日常」，只传「日常」会把普通标签也捞进来' },
+          { name: 'filters', type: 'string', description: '任务视图的筛选规则，JSON 字符串数组 [{field,operator,value}]。field 可选 command / name / cron_expression / status / labels / subscription；operator 可选 contains / not_contains / equals / not_equals；匹配一律先 trim 再转小写、不是正则；多条之间是 AND。status 的 value 用 1（已启用）/ 0（已禁用）/ 2（运行中）/ 0.5（排队中）。value 为空的规则会被整条丢弃，JSON 解析失败则静默降级为不筛选', example: '[{"field":"command","operator":"contains","value":"jd"}]' },
+          { name: 'sort_rules', type: 'string', description: '任务视图的排序规则，JSON 字符串数组 [{field,direction}]。field 可选 name / command / cron_expression / status / labels / subscription / created_at / last_run_at / next_run_at；direction 只认 desc，其它一律按 asc。⚠️ 置顶与状态分组【压在排序规则之上】，排序规则只在同一分区内生效：先按置顶分区（置顶的整体在前），再按状态分区（启用/排队中/运行中一组、禁用一组、其余一组），所以「按最后运行倒序」不会把置顶任务冲散、也不会把禁用任务混进启用任务中间。⚠️ 状态分区有一条【豁免】：当 sort_rules 的【第一条】规则 field = "status" 时，状态分区不生效，整份列表按 status 值原样排序（置顶分区仍然生效，不受影响）。理由是状态分区本身就是按 status 分的，再按 status 排一次等于自相矛盾——用户显式点了「按状态排序」，拿到的却是被状态分区钉死的固定组序。只看第一条是因为它才代表用户的主排序意图，第二条起是 tie-break。分区内多条规则按先后做 tie-break，全平手再回落默认排序：运行中优先 > 拖拽顺序（list_order）> 手工顺序（sort_order）> 创建时间。⚠️「运行中优先」与上面的置顶 / 状态分区【不是同一层】，别混为一谈：置顶与状态分区压在【所有】排序规则之上，而运行中优先只是默认排序链里的一环 —— 不传 sort_rules 时它把 status=2（运行中）的任务提到【本区】最前，传了 sort_rules 时只有规则全部打平才轮得到它。所以用户显式点了「名称 A→Z」，运行中不会越过他的规则插到前面。这一层只认 2（运行中），不认 0.5（排队中）——排队是几秒钟就过去的瞬时态，一并提上来只会让同一次运行多跳一次；任务跑完自动回到原位，list_order 不会被改写（拖拽顺序不受影响，PUT /api/tasks/sort 的「区」划分也不受影响）。last_run_at（最后运行）与 next_run_at（下次运行）是任务列表页两列的点击排序：next_run_at 不是数据库列，是按 cron 现算的快照，只能在内存里排；这两个字段的空值（从未运行、已禁用或非 cron 因而没有下次运行）在各自分区内一律排最后，不随 asc/desc 翻转。未知 field 静默回落默认排序，不报 400', example: '[{"field":"next_run_at","direction":"asc"}]' },
         ],
         responseExample: JSON.stringify({
           data: [{
@@ -414,7 +574,7 @@ panel.add_or_update_env(
           { name: 'notify_on_failure', type: 'boolean', description: '失败时通知', example: 'true' },
           { name: 'notify_on_success', type: 'boolean', description: '成功时通知', example: 'false' },
           { name: 'notify_on_abort', type: 'boolean', description: '主动终止时通知', example: 'false' },
-          { name: 'notification_channel_id', type: 'integer', description: '指定通知渠道 ID，留空则发送到全部启用渠道', example: '3' },
+          { name: 'notification_channel_id', type: 'integer', description: '指定通知渠道 ID，留空则发送到全部「默认推送」渠道（push_scope=default）', example: '3' },
         ],
         responseExample: JSON.stringify({ message: '创建成功', data: { id: 1, name: '签到任务' } }, null, 2),
       },
@@ -437,7 +597,7 @@ panel.add_or_update_env(
           { name: 'notify_on_failure', type: 'boolean', description: '失败时通知' },
           { name: 'notify_on_success', type: 'boolean', description: '成功时通知' },
           { name: 'notify_on_abort', type: 'boolean', description: '主动终止时通知' },
-          { name: 'notification_channel_id', type: 'integer', description: '指定通知渠道 ID，设为 null 则恢复全部启用渠道' },
+          { name: 'notification_channel_id', type: 'integer', description: '指定通知渠道 ID，设为 null 则恢复为发送到全部「默认推送」渠道' },
         ],
         responseExample: JSON.stringify({ message: '更新成功' }, null, 2),
       },
@@ -471,6 +631,88 @@ panel.add_or_update_env(
         pathParams: [{ name: 'id', type: 'integer', required: true, description: '任务 ID' }],
         responseExample: JSON.stringify({ message: '任务已停止' }, null, 2),
       },
+      {
+        id: 'tasks-sort',
+        method: 'PUT',
+        path: '/api/tasks/sort',
+        title: '调整任务列表顺序',
+        description: '任务列表页的拖拽排序，需要 operator 及以上角色。把 source_id 挪到 target_id 前面（position=after 时挪到后面）；不传 target_id 表示移到本区末尾。这里改的是 list_order（列表展示顺序），不是 sort_order（开机运行任务的执行顺序），两者互不影响。只允许同一「区」内互拖：区 = 置顶状态相同 且 状态分组相同（启用/运行中/排队中算一组、禁用一组），跨区返回 400「置顶任务与普通任务、启用与禁用任务请分别排序，跨区移动请用置顶 / 启用按钮」。兄弟任务取的是整个区（不是当前页），所以跨页拖拽同样有效；一次调用会把该区整体按 10 的步长重编号，其它区的值不动。注意 GET /api/tasks 带了 sort_rules 时，区的划分不变（排序规则同样只在分区内生效），但区内顺序由排序规则决定，list_order 只在规则全平手时才兜底，此时拖拽多半看不出效果。唯一的例外是 sort_rules 第一条规则 field = "status"：那种情况下列表侧的状态分区不生效（详见 GET /api/tasks 的 sort_rules 说明），但本接口的「区」定义不受影响 —— 能不能拖仍然按置顶 + 状态分组判定。',
+        auth: 'jwt',
+        bodyParams: [
+          { name: 'source_id', type: 'integer', required: true, description: '被拖动的任务 ID', example: '12' },
+          { name: 'target_id', type: 'integer', description: '落点任务 ID；不传表示移到本区末尾', example: '34' },
+          { name: 'position', type: 'string', description: '相对落点的位置，只认 after（插到目标之后），其余一律按 before', example: 'before' },
+        ],
+        responseExample: JSON.stringify({ message: '排序更新成功' }, null, 2),
+      },
+      {
+        id: 'task-views-list',
+        method: 'GET',
+        path: '/api/tasks/views',
+        title: '获取任务视图列表',
+        description: '任务视图就是任务页顶部那排可点的页签，每个视图带一组筛选与排序规则。视图本身只是规则的容器，真正生效是把它的 filters / sort_rules 原样作为 query 参数传给 GET /api/tasks。按 sort_order 升序返回，hidden=true 的视图仍会返回，由调用方决定要不要渲染。注意 task_views 表没有 user_id，视图是全站共享的，不是「我的视图」。',
+        auth: 'jwt',
+        responseExample: JSON.stringify([
+          { id: 1, name: '京东', filters: '[{"field":"command","operator":"contains","value":"jd"}]', sort_rules: '[]', hidden: false, sort_order: 1 },
+        ], null, 2),
+      },
+      {
+        id: 'task-views-create',
+        method: 'POST',
+        path: '/api/tasks/views',
+        title: '创建任务视图',
+        description: '创建一个任务视图，需要 operator 及以上角色。name 是唯一索引，重名返回 400「同名任务视图已存在」。filters / sort_rules 传的是 JSON 字符串（不是数组），服务端不校验它们的 JSON 合法性——写坏了不会报错，只会在读列表时静默降级成「不筛选」，即点了这个视图却出来全部任务。不传 sort_order（或传 0）时自动排到末尾。',
+        auth: 'jwt',
+        bodyParams: [
+          { name: 'name', type: 'string', required: true, description: '视图名称，全局唯一', example: '京东' },
+          { name: 'filters', type: 'string', description: '筛选规则的 JSON 字符串，字段与取值同 GET /api/tasks 的 filters；留空按 "[]" 处理', example: '[{"field":"command","operator":"contains","value":"jd"}]' },
+          { name: 'sort_rules', type: 'string', description: '排序规则的 JSON 字符串；留空按 "[]" 处理', example: '[]' },
+          { name: 'sort_order', type: 'integer', description: '排序值，不传或传 0 时自动取当前最大值 +1', example: '0' },
+        ],
+        responseExample: JSON.stringify({ id: 1, name: '京东', filters: '[]', sort_rules: '[]', hidden: false, sort_order: 1 }, null, 2),
+      },
+      {
+        id: 'task-views-update',
+        method: 'PUT',
+        path: '/api/tasks/views/:viewId',
+        title: '更新任务视图',
+        description: '更新指定视图，需要 operator 及以上角色。所有字段都可选，只改传了的那些。注意 name / filters / sort_rules 传空字符串等于「不修改」，所以要清空规则必须传 "[]" 而不是 ""。改名撞上别的视图返回 400「同名任务视图已存在」，视图不存在返回 404「视图不存在」。',
+        auth: 'jwt',
+        pathParams: [{ name: 'viewId', type: 'integer', required: true, description: '视图 ID' }],
+        bodyParams: [
+          { name: 'name', type: 'string', description: '视图名称；传空串等于不修改' },
+          { name: 'filters', type: 'string', description: '筛选规则的 JSON 字符串；传空串等于不修改，清空要传 "[]"' },
+          { name: 'sort_rules', type: 'string', description: '排序规则的 JSON 字符串；传空串等于不修改，清空要传 "[]"' },
+          { name: 'hidden', type: 'boolean', description: '是否在页签条里隐藏' },
+          { name: 'sort_order', type: 'integer', description: '排序值' },
+        ],
+        responseExample: JSON.stringify({ id: 1, name: '京东', filters: '[]', sort_rules: '[]', hidden: false, sort_order: 1 }, null, 2),
+      },
+      {
+        id: 'task-views-delete',
+        method: 'DELETE',
+        path: '/api/tasks/views/:viewId',
+        title: '删除任务视图',
+        description: '删除指定视图，需要 operator 及以上角色。只删规则容器，不动任何任务。视图不存在返回 404「视图不存在」。',
+        auth: 'jwt',
+        pathParams: [{ name: 'viewId', type: 'integer', required: true, description: '视图 ID' }],
+        responseExample: JSON.stringify({ message: '已删除' }, null, 2),
+      },
+      {
+        id: 'task-views-reorder',
+        method: 'PUT',
+        path: '/api/tasks/views/reorder',
+        title: '批量调整视图顺序',
+        description: '在一个事务里批量更新视图的 sort_order 与 hidden，需要 operator 及以上角色。payload 里没出现的视图原样不动，所以整份提交和只提交一部分都可以。views 为空数组时直接返回 {"updated": 0}。',
+        auth: 'jwt',
+        bodyParams: [
+          { name: 'views', type: 'array', required: true, description: '[{id, sort_order, hidden?}]，id 必填', example: '[{"id":1,"sort_order":2},{"id":2,"sort_order":1,"hidden":true}]' },
+        ],
+        responseExample: JSON.stringify({
+          updated: 2,
+          views: [{ id: 2, name: '订阅', filters: '[]', sort_rules: '[]', hidden: true, sort_order: 1 }],
+        }, null, 2),
+      },
     ],
   },
   {
@@ -482,16 +724,20 @@ panel.add_or_update_env(
         method: 'GET',
         path: '/api/logs',
         title: '获取日志列表',
-        description: '获取任务执行日志，支持按状态过滤和分页',
+        description: '获取任务执行日志，支持按任务、状态过滤和分页',
         auth: 'jwt',
         queryParams: [
+          { name: 'task_id', type: 'integer', description: '按任务 ID 过滤', example: '1' },
           { name: 'status', type: 'integer', description: '状态过滤：0=成功, 1=失败, 2=运行中, 3=已终止' },
+          { name: 'keyword', type: 'string', description: '按任务名称模糊匹配（子串包含，不是通配符）', example: '签到' },
           { name: 'page', type: 'integer', description: '页码', example: '1' },
-          { name: 'page_size', type: 'integer', description: '每页数量', example: '20' },
+          { name: 'page_size', type: 'integer', description: '每页数量，最大 100，超出或非法时按 20 处理', example: '20' },
         ],
         responseExample: JSON.stringify({
           data: [{ id: 1, task_id: 1, task_name: '签到任务', status: 0, content: '执行成功', duration: 2.5, started_at: '2026-03-10T09:00:00' }],
           total: 1,
+          page: 1,
+          page_size: 20,
         }, null, 2),
       },
       {
@@ -499,22 +745,174 @@ panel.add_or_update_env(
         method: 'GET',
         path: '/api/logs/:id',
         title: '获取日志详情',
-        description: '获取单条日志的详细内容',
+        description: '获取单条日志的详细内容。content 返回的是按终端语义折叠过裸 \\r（回车覆盖）之后的文本，进度条之类的刷新输出会被折叠成最终一帧；需要磁盘上一模一样的原始字节，请改用下面的「原始日志下载」两步接口。log_path 为该日志在日志目录内的相对路径，为 null 表示这条日志的内容只存在数据库里、没有独立的日志文件。task_name / command / task_type / labels 这几个字段来自关联的任务，任务已被删除时不会出现，调用方要按可空处理。',
         auth: 'jwt',
         pathParams: [{ name: 'id', type: 'integer', required: true, description: '日志 ID' }],
         responseExample: JSON.stringify({
-          id: 1, task_id: 1, task_name: '签到任务', status: 0, content: '签到成功\n获得 10 积分', duration: 2.5, started_at: '2026-03-10T09:00:00', ended_at: '2026-03-10T09:00:02',
+          id: 1, task_id: 1, task_name: '签到任务', command: 'task sign.py', status: 0, content: '签到成功\n获得 10 积分', duration: 2.5, log_path: 'task_1_签到/2026-03-10-09-00-00.log', started_at: '2026-03-10T09:00:00', ended_at: '2026-03-10T09:00:02',
         }, null, 2),
+      },
+      {
+        id: 'logs-raw-ticket',
+        method: 'GET',
+        path: '/api/logs/:id/raw-ticket',
+        title: '签发原始日志下载票据',
+        description: '下载原始日志分两步，这是第一步「换票」，不能跳过它直接调 /raw。面板其它日志接口给出的都是按终端语义折叠过裸 \\r 的文本，只有这条链路能拿到磁盘文件的原始字节（含未被折叠的终端控制序列）。本接口的鉴权与 GET /api/logs/:id 完全一致：走正常的 Authorization: Bearer（用户 JWT 或带 logs 权限的 Open API Token，viewer 及以上角色）。校验通过并在磁盘上定位到文件后，签发一张有效期 120 秒、且只对这一条日志生效的票据，返回体里的 url 已经把 ticket 拼好，是一个相对路径，直接接在面板地址后面即可，不要自行改写其中的参数。失败情况：日志 ID 不是数字返回 400「无效的日志ID」；日志记录不存在返回 404「日志不存在」；日志内容只存在数据库里（log_path 为空，这类记录的内容会被压缩后直接写进 content 字段）时没有原始文件可下，返回 404「该日志没有独立的原始日志文件（内容仅存于数据库）」；文件已被清理或路径异常返回 404「原始日志文件不存在或已被清理」；签名失败返回 500「签发下载票据失败」。错误响应体统一为 {"error": "..."}。',
+        auth: 'jwt',
+        pathParams: [{ name: 'id', type: 'integer', required: true, description: '日志 ID' }],
+        responseExample: JSON.stringify({
+          url: '/api/logs/12/raw?ticket=v1.YWRtaW4.1785000120.3Qk8x1r0Zq2m9v7bN4pS6cW8dY0aE2gH5jK7lM9nQ1s',
+          filename: '签到任务-12-raw.log',
+          size: 20480,
+          expires_at: '2026-08-04T12:02:00+08:00',
+          expires_in: 120,
+        }, null, 2),
+        responseFields: [
+          { name: 'url', type: 'string', description: '已拼好票据的下载地址（相对路径），直接接在面板地址后访问即可；请整段照用，改写任何参数都会导致验签失败' },
+          { name: 'filename', type: 'string', description: '建议保存的文件名，格式为 <任务名>-<日志ID>-raw.log；-raw 后缀用于和前端「折叠后」的下载区分' },
+          { name: 'size', type: 'integer', description: '磁盘文件字节数' },
+          { name: 'expires_at', type: 'string', description: '票据过期时间（RFC3339）' },
+          { name: 'expires_in', type: 'integer', description: '票据有效期（秒），当前为 120' },
+        ],
+      },
+      {
+        id: 'logs-raw',
+        method: 'GET',
+        path: '/api/logs/:id/raw',
+        title: '下载原始日志文件',
+        description: '下载原始日志的第二步：凭票据直传文件。这条路由刻意没有挂 JWT 中间件，只认 URL 上的 ticket —— 因为浏览器原生下载（<a download> / window.open）带不上 Authorization 头；反过来也成立：只带 Bearer 而不带 ticket 一样会被拒（401「缺少下载票据」）。票据由上一步的 raw-ticket 签发，HMAC 签名里绑定了具体的日志 ID，挪到另一条日志上用会 401「下载票据无效」；超过 120 秒返回 401「下载票据已过期，请重新发起下载」。票据不落库、不是一次性的，有效期内可重复使用，且只在请求开始时校验一次，传输本身持续多久都不受影响（浏览器断线重试 / Range 续传因此不会失败）。响应是文件流而不是 JSON：Content-Type 为 text/plain; charset=utf-8，服务端按 32KB 分块直传不整体读进内存，并支持 Range 续传；Content-Disposition 同时给出 ASCII 回退名 filename="..." 和 RFC 5987 的 filename*=UTF-8\'\'...（中文文件名不会乱码）。日志被清理时返回 404「原始日志文件不存在或已被清理」。',
+        auth: 'ticket',
+        pathParams: [{ name: 'id', type: 'integer', required: true, description: '日志 ID，必须与换票时的一致' }],
+        queryParams: [
+          { name: 'ticket', type: 'string', required: true, description: '上一步 raw-ticket 签发的票据（已包含在返回的 url 里，正常无需手动拼）', example: 'v1.YWRtaW4.1785000120.3Qk8...' },
+        ],
+        responseContentType: 'text/plain; charset=utf-8（文件流）',
+        responseExample: `HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Content-Length: 20480
+Content-Disposition: attachment; filename="____-12-raw.log"; filename*=UTF-8''%E7%AD%BE%E5%88%B0%E4%BB%BB%E5%8A%A1-12-raw.log
+Accept-Ranges: bytes
+Cache-Control: no-store, no-cache, must-revalidate
+X-Content-Type-Options: nosniff
+
+<磁盘日志文件的原始字节，保留裸 \\r 等终端控制序列，未做任何折叠处理>`,
+      },
+      {
+        id: 'tasks-log-file-raw-ticket',
+        method: 'GET',
+        path: '/api/tasks/:id/log-files/:filename/raw-ticket',
+        title: '签发任务日志文件下载票据',
+        description: '任务日志文件（任务详情里「日志文件」列表中的 .log）原始内容下载的第一步：换票，同样不能跳过它直接调 /raw。鉴权与 GET /api/tasks/:id/log-files/:filename 完全一致（Authorization: Bearer + viewer 及以上角色）。文件定位口径也与日志文件预览 / 删除 / 下载一致：优先取查询参数 path（日志目录内的相对路径），没传或为空时回落到路径参数 filename。票据有效期 120 秒，并绑定「任务 ID + 本次传入的定位参数」，换不到别的任务或别的文件上去用。签发时传了 path，返回的 url 会把它原样带回，请整段照用、不要自己拼。失败情况：任务 ID 不是数字返回 400「无效的任务ID」；文件不存在、首段目录不是该任务的 task_<id>[_label] 目录、或存在路径穿越（../、绝对路径、软链逃逸）一律返回 404「原始日志文件不存在或已被清理」；签名失败返回 500「签发下载票据失败」。',
+        auth: 'jwt',
+        pathParams: [
+          { name: 'id', type: 'integer', required: true, description: '任务 ID' },
+          { name: 'filename', type: 'string', required: true, description: '日志文件名，需 URL 编码；传了 path 时它只作占位', example: '2026-03-10-09-00-00.log' },
+        ],
+        queryParams: [
+          { name: 'path', type: 'string', description: '日志目录内的相对路径，首段必须是该任务的 task_<id>[_label] 目录；同名文件分散在多个任务目录时用它精确定位', example: 'task_1_签到/2026-03-10-09-00-00.log' },
+        ],
+        responseExample: JSON.stringify({
+          url: '/api/tasks/1/log-files/2026-03-10-09-00-00.log/raw?path=task_1_%E7%AD%BE%E5%88%B0%2F2026-03-10-09-00-00.log&ticket=v1.YWRtaW4.1785000120.3Qk8x1r0Zq2m9v7bN4pS6cW8dY0aE2gH5jK7lM9nQ1s',
+          filename: '2026-03-10-09-00-00.log',
+          size: 20480,
+          expires_at: '2026-08-04T12:02:00+08:00',
+          expires_in: 120,
+        }, null, 2),
+        responseFields: [
+          { name: 'url', type: 'string', description: '已拼好 path 与 ticket 的下载地址（相对路径）；path 必须与换票时完全一致，所以请整段照用' },
+          { name: 'filename', type: 'string', description: '建议保存的文件名，取相对路径的最后一段' },
+          { name: 'size', type: 'integer', description: '磁盘文件字节数' },
+          { name: 'expires_at', type: 'string', description: '票据过期时间（RFC3339）' },
+          { name: 'expires_in', type: 'integer', description: '票据有效期（秒），当前为 120' },
+        ],
+      },
+      {
+        id: 'tasks-log-file-raw',
+        method: 'GET',
+        path: '/api/tasks/:id/log-files/:filename/raw',
+        title: '下载任务日志文件原始内容',
+        description: '任务日志文件原始内容下载的第二步：凭票据直传。与 /logs/:id/raw 一样，这条路由没有挂 JWT 中间件、只认 URL 上的 ticket，带 Bearer 而不带 ticket 会被拒（401「缺少下载票据」）。票据绑定的是「任务 ID + 原样的定位参数」，所以 path 必须和换票时一模一样（直接用返回的 url 最稳）：改了 path、换了任务、或者试图用 ../ 穿越，都会先在验签这一关被拒（401「下载票据无效」），根本碰不到磁盘；票据过期返回 401「下载票据已过期，请重新发起下载」。有效期内票据可重复使用，只在请求开始时校验一次。响应是文件流而不是 JSON：Content-Type 为 text/plain; charset=utf-8，支持 Range 续传，Content-Disposition 同时给出 ASCII 回退名和 RFC 5987 的 filename*=UTF-8\'\'...；文件内容保留裸 \\r 等终端控制序列，不做任何折叠。文件已被清理时返回 404「原始日志文件不存在或已被清理」。',
+        auth: 'ticket',
+        pathParams: [
+          { name: 'id', type: 'integer', required: true, description: '任务 ID，必须与换票时的一致' },
+          { name: 'filename', type: 'string', required: true, description: '日志文件名（URL 编码）；传了 path 时它只作占位' },
+        ],
+        queryParams: [
+          { name: 'ticket', type: 'string', required: true, description: '上一步 raw-ticket 签发的票据（已包含在返回的 url 里）', example: 'v1.YWRtaW4.1785000120.3Qk8...' },
+          { name: 'path', type: 'string', description: '必须与换票时传入的值完全一致，否则验签失败；换票时没传就不要传', example: 'task_1_签到/2026-03-10-09-00-00.log' },
+        ],
+        responseContentType: 'text/plain; charset=utf-8（文件流）',
+        responseExample: `HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Content-Length: 20480
+Content-Disposition: attachment; filename="2026-03-10-09-00-00.log"; filename*=UTF-8''2026-03-10-09-00-00.log
+Accept-Ranges: bytes
+Cache-Control: no-store, no-cache, must-revalidate
+X-Content-Type-Options: nosniff
+
+<磁盘日志文件的原始字节，保留裸 \\r 等终端控制序列，未做任何折叠处理>`,
+      },
+      {
+        id: 'tasks-log-archive-ticket',
+        method: 'GET',
+        path: '/api/tasks/:id/log-files/archive-ticket',
+        title: '签发任务日志打包下载票据',
+        description: '把一个任务的日志文件夹一次性打成 zip 下载，分两步，这是第一步「换票」。适用于「一个每 5 分钟跑一次的任务，7 天有 2000+ 个日志文件，逐个下载点不完」的场景。待打包的文件清单直接复用 GET /api/tasks/:id/log-files 那份数据，所以「下载到的 = 列表里看到的」。本接口的鉴权与其它日志文件接口完全一致：Authorization: Bearer（用户 JWT 或带 tasks 权限的 Open API Token，viewer 及以上角色）。收集与上限校验全部在签票时完成（zip 一旦开始写就没法回退成 JSON 错误），返回体里的 url 已经把 ticket 与 start/end 拼好，是一个相对路径，直接接在面板地址后面即可，不要自行改写其中的参数 —— start/end 参与票据签名，改任何一个都会导致下载时 401。失败情况：任务 ID 不是数字返回 400「无效的任务ID」；该任务（在给定时间范围内）一个日志文件都没有返回 404「该任务暂无日志文件」；超过 2000 个文件或未压缩总量超过 512MB 返回 400，文案里会带上实际数量与体积并提示改用更小的时间范围；签名失败返回 500「签发下载票据失败」。错误响应体统一为 {"error": "..."}。',
+        auth: 'jwt',
+        pathParams: [{ name: 'id', type: 'integer', required: true, description: '任务 ID' }],
+        queryParams: [
+          { name: 'start', type: 'string', description: '起始时间（RFC3339），按日志文件的磁盘修改时间筛选，也就是日志文件列表里 created_at 那一列；不传表示不限起点', example: '2026-03-04T00:00:00+08:00' },
+          { name: 'end', type: 'string', description: '结束时间（RFC3339），闭区间；不传表示不限终点。手写 URL 时请把时区里的 + 编码成 %2B，否则会被解析成空格（服务端有容错，但不要依赖）', example: '2026-03-10T23:59:59+08:00' },
+        ],
+        responseExample: JSON.stringify({
+          url: '/api/tasks/1/log-files/archive?end=2026-03-10T23%3A59%3A59%2B08%3A00&start=2026-03-04T00%3A00%3A00%2B08%3A00&ticket=v1.YWRtaW4.1785000120.3Qk8x1r0Zq2m9v7bN4pS6cW8dY0aE2gH5jK7lM9nQ1s',
+          filename: '签到任务-logs-20260310.zip',
+          size: 20971520,
+          file_count: 168,
+          expires_at: '2026-08-04T12:02:00+08:00',
+          expires_in: 120,
+        }, null, 2),
+        responseFields: [
+          { name: 'url', type: 'string', description: '已拼好 start / end / ticket 的下载地址（相对路径）；三个参数都参与验签，请整段照用' },
+          { name: 'filename', type: 'string', description: '建议保存的文件名，格式为 <任务名>-logs-<YYYYMMDD>.zip' },
+          { name: 'size', type: 'integer', description: '本次要打包的【未压缩】总字节数。流式 zip 事先算不出压缩后大小，所以这不是响应体长度' },
+          { name: 'file_count', type: 'integer', description: '本次要打包的文件个数' },
+          { name: 'expires_at', type: 'string', description: '票据过期时间（RFC3339）' },
+          { name: 'expires_in', type: 'integer', description: '票据有效期（秒），当前为 120' },
+        ],
+      },
+      {
+        id: 'tasks-log-archive',
+        method: 'GET',
+        path: '/api/tasks/:id/log-files/archive',
+        title: '下载任务日志压缩包',
+        description: '打包下载的第二步：凭票据直传 zip。这条路由刻意没有挂 JWT 中间件，只认 URL 上的 ticket —— 因为浏览器原生下载带不上 Authorization 头；反过来也成立：只带 Bearer 而不带 ticket 一样会被拒（401「缺少下载票据」）。票据的 HMAC 签名里绑定了任务 ID 与原样的 start/end，挪到另一个任务或改动时间范围都会 401「下载票据无效」；超过 120 秒返回 401「下载票据已过期，请重新发起下载」。验票通过后会把文件清单与上限校验完整重跑一遍（票据有效期内文件可能已被日志清理删掉），再开始写 zip。zip 内的路径就是日志根目录内的相对路径（形如 task_1_签到/2026-03-10-09-00-00.log），任务改过名留下多个 task_<id>_<名字> 目录时层级会完整保留、不会撞名；文件内容是磁盘原始字节，未做任何折叠处理。响应是边压边发的流：没有 Content-Length，也【不支持 Range 断点续传】（不会返回 Accept-Ranges），断线只能整包重来。Content-Disposition 同时给出 ASCII 回退名 filename="..." 和 RFC 5987 的 filename*=UTF-8\'\'...（中文任务名不会乱码）。',
+        auth: 'ticket',
+        pathParams: [{ name: 'id', type: 'integer', required: true, description: '任务 ID，必须与换票时的一致' }],
+        queryParams: [
+          { name: 'ticket', type: 'string', required: true, description: '上一步 archive-ticket 签发的票据（已包含在返回的 url 里，正常无需手动拼）', example: 'v1.YWRtaW4.1785000120.3Qk8...' },
+          { name: 'start', type: 'string', description: '必须与换票时传入的值完全一致，否则验签失败；换票时没传就不要传', example: '2026-03-04T00:00:00+08:00' },
+          { name: 'end', type: 'string', description: '必须与换票时传入的值完全一致，否则验签失败；换票时没传就不要传', example: '2026-03-10T23:59:59+08:00' },
+        ],
+        responseContentType: 'application/zip（流式压缩包）',
+        responseExample: `HTTP/1.1 200 OK
+Content-Type: application/zip
+Content-Disposition: attachment; filename="____-logs-20260310.zip"; filename*=UTF-8''%E7%AD%BE%E5%88%B0%E4%BB%BB%E5%8A%A1-logs-20260310.zip
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+Transfer-Encoding: chunked
+
+<zip 字节流；每个 entry 的路径为 task_<id>[_<任务名>]/<文件名>.log，内容与磁盘完全一致>`,
       },
       {
         id: 'logs-delete',
         method: 'DELETE',
         path: '/api/logs/:id',
         title: '删除日志',
-        description: '删除指定日志记录',
+        description: '删除指定日志记录。日志不存在时返回 404「日志不存在」',
         auth: 'jwt',
         pathParams: [{ name: 'id', type: 'integer', required: true, description: '日志 ID' }],
-        responseExample: JSON.stringify({ message: '删除成功' }, null, 2),
+        responseExample: JSON.stringify({ message: '日志已删除' }, null, 2),
       },
     ],
   },
@@ -585,13 +983,17 @@ panel.add_or_update_env(
         method: 'GET',
         path: '/api/envs',
         title: '获取所有环境变量',
-        description: '获取环境变量列表，支持搜索和分页；带 all=1 时一次返回全部（硬上限 5000）',
+        description: '获取环境变量列表，支持 keyword 模糊搜索与 names / groups / enabled 精确筛选（各条件之间是 AND），支持分页；带 all=1 时一次返回全部（硬上限 5000）',
         auth: 'jwt',
         queryParams: [
-          { name: 'keyword', type: 'string', description: '搜索关键字' },
-          { name: 'page', type: 'integer', description: '页码', example: '1' },
-          { name: 'page_size', type: 'integer', description: '每页数量', example: '20' },
-          { name: 'all', type: 'integer', description: '设为 1 时一次返回全部（最多 5000 条）', example: '1' },
+          { name: 'keyword', type: 'string', description: '搜索关键字：对 变量名 / 变量值 / 备注 / 分组 四个字段做大小写不敏感的模糊匹配（UPPER LIKE %值%），四个字段之间是 OR、无法限定到某一个字段。要按变量名精确匹配请改用 names', example: 'JD_COOKIE' },
+          { name: 'names', type: 'string', description: '按变量名【精确】筛选（name IN (...)），不是 keyword 那种模糊匹配——传 JD_COOKIE 不会把 JD_COOKIE_EXTRA 一起带出来。支持 names=A,B 逗号分隔（中文逗号与分号同样认），也支持重复参数 names=A&names=B，两种写法等价合并并去重；多个变量名之间是 OR，与 keyword / groups / enabled 之间是 AND。传库里不存在的名字就返回空列表，不会回落成「不筛」。可选值由 GET /api/envs/names 提供', example: 'JD_COOKIE,PT_KEY' },
+          { name: 'groups', type: 'string', description: '按分组筛选，分组是【整段精确】匹配而不是模糊匹配（传「京东」不会命中「京东备用」）。支持 groups=A,B 逗号分隔，也支持重复参数 groups=A&groups=B；多个分组之间是 OR，与其它筛选之间是 AND。一条变量可以同时属于多个分组，命中任意一个即算命中。可选值由 GET /api/envs/groups 提供', example: '京东,美团' },
+          { name: 'group', type: 'string', description: 'groups 的单数别名，语义完全一致。两者同时传时是【合并去重后一起生效】，不是互相覆盖', example: '京东' },
+          { name: 'enabled', type: 'boolean', description: '按启用状态筛选：true 只看已启用、false 只看已禁用，不传表示不筛。取值按 Go 的 strconv.ParseBool 解析（1 / t / T / true / TRUE / 0 / f / F / false / FALSE 都认），解析失败时【静默忽略】这个条件、不报 400', example: 'true' },
+          { name: 'page', type: 'integer', description: '页码，默认 1；小于 1 一律按 1 处理', example: '1' },
+          { name: 'page_size', type: 'integer', description: '每页数量，默认 20；小于 1 或大于 100 时【一律回落成 20】，不是截断到 100。带 all=1 时本参数被忽略', example: '20' },
+          { name: 'all', type: 'integer', description: '设为 1（也认 true / yes）时一次返回全部（最多 5000 条），忽略 page / page_size；keyword / names / groups / enabled 等筛选条件仍然生效', example: '1' },
         ],
         responseExample: JSON.stringify({ data: [{ id: 1, name: 'MY_TOKEN', value: 'abc123', enabled: true, remarks: '签到Token' }], total: 1 }, null, 2),
         responseFields: [
@@ -600,6 +1002,20 @@ panel.add_or_update_env(
           { name: 'value', type: 'string', description: '变量值' },
           { name: 'enabled', type: 'boolean', description: '是否启用' },
           { name: 'remarks', type: 'string', description: '备注' },
+        ],
+      },
+      {
+        id: 'envs-names',
+        method: 'GET',
+        path: '/api/envs/names',
+        title: '获取全部变量名',
+        description: '按变量名聚合，返回去重后的变量名与各自的条数，按 name 升序。用途是给「变量名筛选」下拉提供选项：拿到的 name 可以原样塞进 GET /api/envs 的 names 参数。⚠️ count 的口径是【全库同名条数】，刻意不跟随 keyword / groups / enabled 等筛选——它与 PUT /api/envs/by-name 冲突时 409 文案里那句「存在 N 条名为 X 的环境变量」是同一个 N，两处必须对得上；若改成筛选后的条数，同一个变量名会在下拉里和报错里显示两个不同的数字。同名多条是刻意支持的功能（一个变量名下挂多个账号），不是脏数据，所以 count > 1 很常见。空名（name 为空串）不计入；库里一条都没有时返回空数组 [] 而不是 null。鉴权与 GET /api/envs/groups 完全同组。',
+        auth: 'jwt',
+        responseExample: JSON.stringify({ data: [{ name: 'JD_COOKIE', count: 3 }, { name: 'PT_KEY', count: 1 }] }, null, 2),
+        responseFields: [
+          { name: 'data', type: 'array', description: '变量名列表，按 name 升序；库里没有变量时为空数组' },
+          { name: 'data[].name', type: 'string', description: '变量名（已去重）' },
+          { name: 'data[].count', type: 'integer', description: '全库中同名环境变量的条数，不随任何筛选变化' },
         ],
       },
       {
@@ -680,9 +1096,15 @@ panel.add_or_update_env(
           { name: 'url', type: 'string', required: true, description: '仓库 URL（HTTP/HTTPS）' },
           { name: 'branch', type: 'string', description: '分支，默认 main', example: 'main' },
           { name: 'schedule', type: 'string', description: 'Cron 表达式', example: '0 0 * * *' },
-          { name: 'whitelist', type: 'string', description: '白名单 glob（逗号分隔）' },
-          { name: 'blacklist', type: 'string', description: '黑名单 glob（逗号分隔）' },
-          { name: 'target_dir', type: 'string', description: '存放子目录' },
+          { name: 'whitelist', type: 'string', description: '白名单：文件名/路径片段，「子串包含」匹配（非 glob、非正则），多个用 , 或 | 分隔；片段命中目录名时该目录下的全部文件（含多级子目录）都算命中。命中的文件才会检出落盘并建成定时任务；留空表示全部命中', example: 'jd_|jx_|jddj_' },
+          { name: 'blacklist', type: 'string', description: '黑名单：匹配规则同白名单（片段命中目录名时整个目录都被排除）。命中的文件既不检出也不建任务', example: 'backUp' },
+          { name: 'depend_on', type: 'string', description: '依赖规则：对应青龙 ql repo 的第 4 个参数 dependence，匹配规则同白名单（填 utils 会把 utils/ 目录下的文件一并检出）。命中的文件会被检出落盘供主脚本调用，但不会建成定时任务；白名单为空时本字段不生效', example: 'sendNotify|utils' },
+          { name: 'sub_path', type: 'string', description: '只检出仓库内的指定子目录（多个用 , 或 | 分隔），优先级高于白名单' },
+          { name: 'save_dir', type: 'string', description: '脚本存放子目录，留空则按仓库名推导' },
+          { name: 'pre_script', type: 'string', description: '拉取前指令：在 git 拉取之前执行的 Shell 命令，可用 $SUB_DIR / $SCRIPTS_DIR / $QL_DIR 等变量。非 0 退出会中断本次拉取并记为失败', example: 'mount -a' },
+          { name: 'hook_script', type: 'string', description: '拉取后钩子：拉取成功后、同步定时任务之前执行的 Shell 命令，变量与失败语义同 pre_script', example: 'bash $SUB_DIR/copyfiles.sh' },
+          { name: 'overwrite_mode', type: 'string', description: '覆盖拉取策略，仅对 git 仓库订阅生效：inherit=跟随系统设置里的「覆盖拉取（默认）」开关（默认值）、force=强制覆盖本地改动、preserve=拉取前暂存本地改动再恢复。作用域只有脚本文件（git 工作区），不影响任务的名称与定时；首次拉取（本地还没有仓库）不适用。不传或传非法值一律按 inherit 处理', example: 'preserve' },
+          { name: 'full_checkout', type: 'boolean', description: '完整检出，仅对 git 仓库订阅生效：true=放弃 sparse-checkout，拉取整个仓库（源码、资源、文档全部落盘，体积可能很大）；不传或 false=按「指定子目录 / 白名单 / 依赖规则」稀疏检出（默认）。不改变建任务的规则：仍然只有命中白名单的文件会被建成定时任务', example: 'true' },
         ],
         responseExample: JSON.stringify({ message: '创建成功', data: { id: 1 } }, null, 2),
       },
@@ -691,7 +1113,7 @@ panel.add_or_update_env(
         method: 'PUT',
         path: '/api/subscriptions/:id',
         title: '更新订阅',
-        description: '更新指定订阅配置',
+        description: '更新指定订阅配置。请求体为部分更新，字段与「创建订阅」一致（含 whitelist / blacklist / depend_on / sub_path / overwrite_mode / full_checkout），只提交需要修改的字段即可。其中 overwrite_mode 的取值为 inherit / force / preserve，非法值会被归一成 inherit；full_checkout 为布尔值，true 表示拉取整个仓库、false（默认）表示按子目录/白名单/依赖规则稀疏检出。',
         auth: 'jwt',
         pathParams: [{ name: 'id', type: 'integer', required: true, description: '订阅 ID' }],
         responseExample: JSON.stringify({ message: '更新成功' }, null, 2),
@@ -711,7 +1133,7 @@ panel.add_or_update_env(
         method: 'PUT',
         path: '/api/subscriptions/:id/pull',
         title: '手动拉取订阅',
-        description: '立即拉取指定订阅的脚本。拉取时是否覆盖本地修改由订阅设置中的「覆盖拉取」开关控制，本接口不再接收临时覆盖模式参数。',
+        description: '立即拉取指定订阅的脚本。拉取时是否覆盖本地修改由该订阅自己的 overwrite_mode 决定（inherit 时回落到系统设置里的「覆盖拉取（默认）」开关），本接口不接收临时覆盖模式参数。',
         auth: 'jwt',
         pathParams: [{ name: 'id', type: 'integer', required: true, description: '订阅 ID' }],
         responseExample: JSON.stringify({ message: '拉取成功，拉取 5 个文件，新增 3 个任务' }, null, 2),
@@ -729,19 +1151,20 @@ panel.add_or_update_env(
         title: '获取通知渠道列表',
         description: '获取所有通知渠道配置',
         auth: 'jwt',
-        responseExample: JSON.stringify({ data: [{ id: 1, name: '钉钉通知', type: 'dingtalk', config: { token: '***' }, enabled: true }] }, null, 2),
+        responseExample: JSON.stringify({ data: [{ id: 1, name: '钉钉通知', type: 'dingtalk', config: { token: '***' }, push_scope: 'default', enabled: true }] }, null, 2),
       },
       {
         id: 'notify-create',
         method: 'POST',
         path: '/api/notifications',
         title: '创建通知渠道',
-        description: '创建新的通知渠道，支持：webhook / email / telegram(支持 api_host、proxy 单独代理) / dingtalk / wecom(企业微信机器人，支持 text/markdown/markdown_v2/image/news/template_card) / wecom_app(企业微信应用，支持 text/markdown/image/file/video/news/template_card，并支持 base_url 反代基础地址) / bark / pushplus / serverchan / feishu / gotify / pushdeer / pushme / chanify / igot / qmsg / pushover / discord / slack / ntfy / wxpusher(WxPusher / ClawBot(iLink)，支持 url、verify_pay_type) / custom',
+        description: '创建新的通知渠道，支持：webhook / email / telegram(支持 api_host、proxy 单独代理) / dingtalk / wecom(企业微信机器人，支持 text/markdown/markdown_v2/image/news/template_card) / wecom_app(企业微信应用，支持 text/markdown/image/file/video/news/mpnews/template_card，并支持 base_url 反代基础地址) / bark / pushplus(支持 channel 选择发送渠道：wechat/app/extension/webhook/clawbot/cp/qq/mail/sms/voice，webhook、cp 与 qq 需配合 option 填渠道编码；QQ 发给个人时 option 留空，发给群才填群配置编码) / serverchan / feishu / gotify / pushdeer / pushme / chanify / igot / qmsg / pushover / discord / slack / ntfy / wxpusher(WxPusher / ClawBot(iLink)，支持 url、verify_pay_type) / custom',
         auth: 'jwt',
         bodyParams: [
           { name: 'name', type: 'string', required: true, description: '渠道名称' },
           { name: 'type', type: 'string', required: true, description: '渠道类型', example: 'dingtalk' },
           { name: 'config', type: 'object', required: true, description: '渠道配置（各类型字段不同，例如 email 可填 smtp_ssl，telegram 可填 proxy，wecom_app 可填 base_url，wxpusher 可填 url / verify_pay_type）' },
+          { name: 'push_scope', type: 'string', description: '推送范围：default（默认推送，参与广播）/ bound（绑定推送，只有被任务绑定或调用时显式指定才推送）。留空按 default 处理', example: 'default' },
         ],
         responseExample: JSON.stringify({ message: '创建成功', data: { id: 1 } }, null, 2),
       },
@@ -750,9 +1173,15 @@ panel.add_or_update_env(
         method: 'PUT',
         path: '/api/notifications/:id',
         title: '更新通知渠道',
-        description: '更新指定通知渠道',
+        description: '更新指定通知渠道。按键更新：请求里没出现的键不会改动已有值',
         auth: 'jwt',
         pathParams: [{ name: 'id', type: 'integer', required: true, description: '渠道 ID' }],
+        bodyParams: [
+          { name: 'name', type: 'string', description: '渠道名称' },
+          { name: 'type', type: 'string', description: '渠道类型' },
+          { name: 'config', type: 'string', description: '渠道配置 JSON 字符串' },
+          { name: 'push_scope', type: 'string', description: '推送范围：default / bound。不传则保持原值', example: 'bound' },
+        ],
         responseExample: JSON.stringify({ message: '更新成功' }, null, 2),
       },
       {
@@ -780,13 +1209,13 @@ panel.add_or_update_env(
         method: 'POST',
         path: '/api/notifications/send',
         title: '脚本发送通知',
-        description: '供脚本或外部程序主动调用系统通知配置进行推送。支持普通用户 JWT，也支持带 notifications scope 的 Open API Bearer Token。未指定 channel_id / channel_ids 时，会发送到全部已启用通知渠道；任务自带默认通知渠道时，helper 会优先落到该渠道，传 ignore_default_config=true 可跳过默认渠道。面板运行脚本时会统一在脚本根目录提供 notify.py 和 sendNotify.js，不再向每个脚本子目录复制，可直接按青龙风格先收集 notifyStr 再发送。',
+        description: '供脚本或外部程序主动调用系统通知配置进行推送。支持普通用户 JWT，也支持带 notifications scope 的 Open API Bearer Token。未指定 channel_id / channel_ids 时走广播，只会发送到「默认推送」（push_scope=default）且已启用的渠道，设为「绑定推送」的渠道不会收到；显式指定渠道 ID 时按 ID 精确投递，绑定推送渠道同样能收到。一个「默认推送」渠道都没有时不做兜底，直接返回失败。任务自带默认通知渠道时，helper 会优先落到该渠道，传 ignore_default_config=true 可跳过它 —— 注意跳过后就是走广播，也就是只发到「默认推送」渠道，而不是发给所有渠道。面板运行脚本时会统一在脚本根目录提供 notify.py 和 sendNotify.js，不再向每个脚本子目录复制，可直接按青龙风格先收集 notifyStr 再发送。',
         auth: 'jwt',
         bodyParams: [
           { name: 'title', type: 'string', required: true, description: '通知标题', example: '签到脚本通知' },
           { name: 'content', type: 'string', required: true, description: '通知正文，通常传 notifyStr.join(\'\\n\') 或 "\\n".join(notify_lines)', example: '签到成功\\n账号: user01\\n积分: +20' },
-          { name: 'channel_id', type: 'integer', description: '单个通知渠道 ID，可选', example: '3' },
-          { name: 'channel_ids', type: 'array', description: '多个通知渠道 ID，可选', example: '[3,5]' },
+          { name: 'channel_id', type: 'integer', description: '单个通知渠道 ID，可选；传了就必须大于 0，否则返回 400（不再静默退化成广播）', example: '3' },
+          { name: 'channel_ids', type: 'array', description: '多个通知渠道 ID，可选；非空数组里必须至少有一个大于 0 的 ID，否则返回 400。空数组等同不传，按广播处理', example: '[3,5]' },
           { name: 'context', type: 'object', description: '额外模板变量，可选；供 content_template 使用', example: '{"task_name":"签到脚本","status":"success"}' },
         ],
         helperExamples: {
@@ -845,12 +1274,25 @@ if __name__ == '__main__':
         method: 'GET',
         path: '/api/deps',
         title: '获取依赖列表',
-        description: '按类型获取依赖列表',
+        description: '按类型获取依赖列表。响应里的 failed_by_type 是各类型安装失败数的全量汇总，不受 type / python_version 筛选影响。',
         auth: 'jwt',
         queryParams: [
           { name: 'type', type: 'string', required: true, description: '依赖类型：nodejs / python / linux', example: 'python' },
+          { name: 'python_version', type: 'string', description: 'Python 版本，仅在 type=python 时生效；不传则用默认版本', example: '3.12' },
         ],
-        responseExample: JSON.stringify({ data: [{ id: 1, type: 'python', name: 'requests', status: 'installed' }], total: 1 }, null, 2),
+        responseExample: JSON.stringify({
+          data: [{ id: 1, type: 'python', name: 'requests', status: 'installed' }],
+          total: 1,
+          failed_by_type: { nodejs: 2, python: 5, linux: 2 },
+        }, null, 2),
+        responseFields: [
+          { name: 'data', type: 'array', description: '依赖列表，仅包含 type（以及 python_version）筛选命中的记录' },
+          { name: 'total', type: 'integer', description: 'data 的条数' },
+          { name: 'failed_by_type', type: 'object', description: '各类型安装失败的依赖数，nodejs / python / linux 三个键恒定存在（无失败时为 0）。与筛选参数无关，永远是全量统计；其中 python 跨所有 Python 版本汇总，因此三者之和等于侧栏「依赖管理」角标的数字' },
+          { name: 'failed_by_type.nodejs', type: 'integer', description: 'Node.js 依赖中 status=failed 的条数' },
+          { name: 'failed_by_type.python', type: 'integer', description: 'Python 依赖中 status=failed 的条数，含所有 Python 版本' },
+          { name: 'failed_by_type.linux', type: 'integer', description: 'Linux 依赖中 status=failed 的条数' },
+        ],
       },
       {
         id: 'deps-create',
@@ -1016,10 +1458,10 @@ if __name__ == '__main__':
         method: 'GET',
         path: '/api/system/info',
         title: '获取系统信息',
-        description: '获取服务器系统信息（CPU/内存/磁盘/机器码等）',
+        description: '获取服务器系统信息（CPU/内存/磁盘/机器码等）。自 v3.0.4 起同层追加 deployment_type（docker / binary / magisk）与 magisk_shell_version（Magisk 模块外壳版本，非模块版为 0），原有字段位置不变。',
         auth: 'jwt',
         responseExample: JSON.stringify({
-          data: { hostname: 'server', machine_code: 'A1B2C3D4-E5F6-4789-ABCD-1234567890AB', os: 'linux', arch: 'amd64', go_version: 'go1.22.0', num_cpu: 4, cpu_usage: 25.0, memory_total: 8589934592, memory_used: 4294967296, memory_usage: 50.0, disk_total: 107374182400, disk_used: 53687091200, disk_usage: 50.0 },
+          data: { hostname: 'server', machine_code: 'A1B2C3D4-E5F6-4789-ABCD-1234567890AB', os: 'linux', arch: 'amd64', go_version: 'go1.22.0', num_cpu: 4, cpu_usage: 25.0, memory_total: 8589934592, memory_used: 4294967296, memory_usage: 50.0, disk_total: 107374182400, disk_used: 53687091200, disk_usage: 50.0, deployment_type: 'docker', magisk_shell_version: 0 },
         }, null, 2),
       },
       {
@@ -1089,6 +1531,12 @@ export function generateCodeExamples(endpoint: ApiEndpoint): Record<string, stri
   const url = `${getApiBaseOrigin()}${path}`
   const hasBody = bodyParams && bodyParams.length > 0 && method !== 'GET'
 
+  // 票据鉴权的下载接口不能套用通用模板：它没有 Authorization 头，响应也不是 JSON，
+  // 而且必须先调同路径的 -ticket 接口换票，示例要把这两步一起给出来。
+  if (auth === 'ticket') {
+    return generateTicketDownloadExamples(url)
+  }
+
   const bodyObj: Record<string, any> = {}
   if (hasBody) {
     bodyParams!.forEach(p => {
@@ -1134,6 +1582,50 @@ export function generateCodeExamples(endpoint: ApiEndpoint): Record<string, stri
     python += `res = requests.${method.toLowerCase()}("${url}"${auth === 'jwt' ? ', headers=headers' : ''})\n`
   }
   python += `print(res.json())`
+
+  return { Shell: shell, JavaScript: js, Python: python }
+}
+
+function generateTicketDownloadExamples(downloadUrl: string): Record<string, string> {
+  const origin = getApiBaseOrigin()
+  const ticketUrl = `${downloadUrl}-ticket`
+
+  const shell = `# 1. 换票：这一步走正常 Bearer 鉴权
+curl -X GET "${ticketUrl}" \\
+  -H "Authorization: Bearer <TOKEN>"
+# → {"url":"...?ticket=...","filename":"...","size":20480,"expires_in":120}
+
+# 2. 直传下载：票据在 URL 上，这一步不要再带 Authorization
+#    url 是相对路径，拼到面板地址后面即可；-OJ 按 Content-Disposition 存盘
+curl -OJ "${origin}<上一步返回的 url>"`
+
+  const js = `// 1. 换票：这一步走正常 Bearer 鉴权
+const res = await fetch("${ticketUrl}", {
+  headers: {
+    "Authorization": "Bearer <TOKEN>",
+  },
+})
+const ticket = await res.json()
+
+// 2. 直传下载：交给浏览器原生下载，文件不进 JS 内存，也带不上 Authorization 头
+const anchor = document.createElement("a")
+anchor.href = ticket.url
+anchor.download = ticket.filename
+anchor.click()`
+
+  const python = `import requests
+
+BASE = "${origin}"
+
+# 1. 换票：这一步走正常 Bearer 鉴权
+ticket = requests.get("${ticketUrl}", headers={"Authorization": "Bearer <TOKEN>"}).json()
+
+# 2. 直传下载：票据在 URL 上，这一步不要再带 Authorization；响应是文件流，不是 JSON
+with requests.get(BASE + ticket["url"], stream=True) as res:
+    res.raise_for_status()
+    with open(ticket["filename"], "wb") as f:
+        for chunk in res.iter_content(65536):
+            f.write(chunk)`
 
   return { Shell: shell, JavaScript: js, Python: python }
 }

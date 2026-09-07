@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useThemeStore } from '@/stores/theme'
+import { useBadgesStore } from '@/stores/badges'
+import DdBadge from '@/components/ui/DdBadge.vue'
 import { systemApi } from '@/api/system'
 import { loadPanelSettings as loadCachedPanelSettings } from '@/utils/panelSettings'
 import { useResponsive } from '@/composables/useResponsive'
@@ -32,6 +34,7 @@ const router = useRouter()
 const route = useRoute()
 const authStore = useAuthStore()
 const themeStore = useThemeStore()
+const badgesStore = useBadgesStore()
 const { isMobile } = useResponsive()
 const isCollapsed = ref(false)
 const drawerVisible = ref(false)
@@ -39,6 +42,14 @@ const panelTitle = ref('呆呆面板')
 const panelIcon = ref('')
 const panelVersion = ref('')
 const routeCacheMax = 14
+
+// 侧边栏 logo 的兜底图标。
+// 这里不能写死 '/favicon-512.webp'：:src 是 v-bind 表达式，不经过 Vite 的 transformAssetUrls，
+// 构建产物里会原样保留裸绝对路径。面板挂在反代子路径或 GitHub Pages 项目站下时，
+// 这个路径会指到站点根而 404，侧边栏 logo 变破图（这两处 <img> 没有 @error 兜底）。
+// import.meta.env.BASE_URL 结尾恒带 '/'，根路径部署时就是 '/'，行为与改动前一致。
+const defaultPanelIcon = `${import.meta.env.BASE_URL}favicon-512.webp`
+const panelIconSrc = computed(() => panelIcon.value || defaultPanelIcon)
 
 const roleLevel: Record<string, number> = {
   viewer: 1,
@@ -99,6 +110,19 @@ const breadcrumb = computed(() => {
 
 const themeIcon = computed(() => (themeStore.isDark ? Sunny : Moon))
 
+/**
+ * 侧栏菜单角标。
+ *
+ * 只挂在「有事要处理」的菜单上：运行中的任务、今天失败的日志、拉取失败的订阅、
+ * 装失败或正在装的依赖、以及有新版本时的系统设置。数据由 stores/badges.ts 轮询，
+ * 服务端已按角色裁剪，看不到某个菜单的用户拿到的就是 0，这里不必再判权限。
+ *
+ * 刻意【不】给每个菜单都挂数字：角标是打断，全挂满等于全不挂，用户会直接学会忽略它。
+ */
+function badgeOf(path: string) {
+  return badgesStore.menuBadges[path]
+}
+
 onMounted(() => {
   loadPanelSettings()
   loadVersion()
@@ -106,6 +130,14 @@ onMounted(() => {
     authStore.fetchUser()
   }
   scheduleMenuPreload()
+  // 只在布局挂上之后才开始轮询：登录页不该去打受保护的接口
+  badgesStore.start()
+})
+
+onBeforeUnmount(() => {
+  // 退出登录会卸载整个布局。不停表的话定时器会继续打 /system/badges，
+  // 每次都 401，把用户刚跳到的登录页反复推一遍。
+  badgesStore.stop()
 })
 
 watch(isMobile, (mobile) => {
@@ -174,7 +206,7 @@ async function loadVersion() {
       <div class="sidebar-logo" :class="{ 'is-collapsed': isCollapsed }">
         <div class="logo-inner">
           <div class="logo-icon-wrap">
-            <img :src="panelIcon || '/favicon.svg'" alt="logo" class="logo-icon" />
+            <img :src="panelIconSrc" alt="logo" class="logo-icon" />
           </div>
           <template v-if="!isCollapsed">
             <span class="logo-title">{{ panelTitle }}</span>
@@ -199,8 +231,27 @@ async function loadVersion() {
             @mouseenter="preloadPage(item.index)"
             @focusin="preloadPage(item.index)"
           >
-            <el-icon><component :is="item.icon" /></el-icon>
-            <template #title>{{ item.title }}</template>
+            <el-icon>
+              <component :is="item.icon" />
+              <!-- 折叠态的角标：#title 插槽整体不渲染，数字没地方放，退化成图标右上角一个方点。
+                   显隐纯靠 CSS 的 .el-menu--collapse 祖先判断，不用 isCollapsed —— 移动端
+                   isCollapsed 恒为 true，但抽屉里的菜单没传 :collapse，实际是展开的，用 JS 状态会误判。 -->
+              <span
+                v-if="badgeOf(item.index)"
+                class="menu-collapsed-dot"
+                :class="`is-${badgeOf(item.index)!.level}`"
+              />
+            </el-icon>
+            <template #title>
+              <span class="menu-title-text">{{ item.title }}</span>
+              <DdBadge
+                v-if="badgeOf(item.index)"
+                :value="badgeOf(item.index)!.count"
+                :dot="badgeOf(item.index)!.dot"
+                :level="badgeOf(item.index)!.level"
+                :title="item.title"
+              />
+            </template>
           </el-menu-item>
         </el-menu>
 
@@ -222,8 +273,24 @@ async function loadVersion() {
               @mouseenter="preloadPage(item.index)"
               @focusin="preloadPage(item.index)"
             >
-              <el-icon><component :is="item.icon" /></el-icon>
-              <template #title>{{ item.title }}</template>
+              <el-icon>
+                <component :is="item.icon" />
+                <span
+                  v-if="badgeOf(item.index)"
+                  class="menu-collapsed-dot"
+                  :class="`is-${badgeOf(item.index)!.level}`"
+                />
+              </el-icon>
+              <template #title>
+                <span class="menu-title-text">{{ item.title }}</span>
+                <DdBadge
+                  v-if="badgeOf(item.index)"
+                  :value="badgeOf(item.index)!.count"
+                  :dot="badgeOf(item.index)!.dot"
+                  :level="badgeOf(item.index)!.level"
+                  :title="item.title"
+                />
+              </template>
             </el-menu-item>
           </el-menu>
         </template>
@@ -269,7 +336,7 @@ async function loadVersion() {
       <div class="sidebar-logo mobile-logo">
         <div class="logo-inner">
           <div class="logo-icon-wrap">
-            <img :src="panelIcon || '/favicon.svg'" alt="logo" class="logo-icon" />
+            <img :src="panelIconSrc" alt="logo" class="logo-icon" />
           </div>
           <span class="logo-title">{{ panelTitle }}</span>
           <span v-if="panelVersion" class="logo-version">v{{ panelVersion }}</span>
@@ -289,8 +356,27 @@ async function loadVersion() {
             @mouseenter="preloadPage(item.index)"
             @focusin="preloadPage(item.index)"
           >
-            <el-icon><component :is="item.icon" /></el-icon>
-            <template #title>{{ item.title }}</template>
+            <el-icon>
+              <component :is="item.icon" />
+              <!-- 折叠态的角标：#title 插槽整体不渲染，数字没地方放，退化成图标右上角一个方点。
+                   显隐纯靠 CSS 的 .el-menu--collapse 祖先判断，不用 isCollapsed —— 移动端
+                   isCollapsed 恒为 true，但抽屉里的菜单没传 :collapse，实际是展开的，用 JS 状态会误判。 -->
+              <span
+                v-if="badgeOf(item.index)"
+                class="menu-collapsed-dot"
+                :class="`is-${badgeOf(item.index)!.level}`"
+              />
+            </el-icon>
+            <template #title>
+              <span class="menu-title-text">{{ item.title }}</span>
+              <DdBadge
+                v-if="badgeOf(item.index)"
+                :value="badgeOf(item.index)!.count"
+                :dot="badgeOf(item.index)!.dot"
+                :level="badgeOf(item.index)!.level"
+                :title="item.title"
+              />
+            </template>
           </el-menu-item>
         </el-menu>
 
@@ -308,8 +394,24 @@ async function loadVersion() {
               @mouseenter="preloadPage(item.index)"
               @focusin="preloadPage(item.index)"
             >
-              <el-icon><component :is="item.icon" /></el-icon>
-              <template #title>{{ item.title }}</template>
+              <el-icon>
+                <component :is="item.icon" />
+                <span
+                  v-if="badgeOf(item.index)"
+                  class="menu-collapsed-dot"
+                  :class="`is-${badgeOf(item.index)!.level}`"
+                />
+              </el-icon>
+              <template #title>
+                <span class="menu-title-text">{{ item.title }}</span>
+                <DdBadge
+                  v-if="badgeOf(item.index)"
+                  :value="badgeOf(item.index)!.count"
+                  :dot="badgeOf(item.index)!.dot"
+                  :level="badgeOf(item.index)!.level"
+                  :title="item.title"
+                />
+              </template>
             </el-menu-item>
           </el-menu>
         </template>
@@ -394,35 +496,18 @@ async function loadVersion() {
           </router-view>
         </div>
       </main>
-
-      <!-- Footer -->
-      <footer class="layout-footer">
-        <span>© {{ new Date().getFullYear() }} {{ panelTitle }}</span>
-        <span class="footer-sep">·</span>
-        <span>开源自动化任务调度面板</span>
-        <span class="footer-sep">·</span>
-        <a href="javascript:void(0)" class="footer-link">文档中心</a>
-        <span class="footer-sep">·</span>
-        <a href="javascript:void(0)" class="footer-link">使用条款</a>
-        <span class="footer-sep">·</span>
-        <a href="javascript:void(0)" class="footer-link">隐私政策</a>
-      </footer>
     </el-container>
   </el-container>
 </template>
 
 <style scoped lang="scss">
-// ==================== 悬浮圆角外壳 ====================
-// 桌面：在最外层包一层留白 + 圆角 + 阴影 + 描边的「悬浮外壳」，包住侧栏 + 主区。
-// 外壳自身用表面色，留白处露出 #app 的页面底色；overflow: hidden 用于圆角裁切。
-// 注意：内部滚动链（layout-main / route-shell / dd-*-page）保持不动，外壳只在最外层加壳。
+// ==================== 全屏外壳 ====================
+// 桌面与移动端一致：外壳直接铺满视口，无留白、无圆角、无阴影、无外描边。
+// overflow: hidden 用于把内部滚动锁在 layout-main / route-shell 里，不让整页产生滚动条。
+// 注意：内部滚动链（layout-main / route-shell / dd-*-page）保持不动。
 .layout-container {
-  margin: var(--dd-shell-margin);
-  // 高度扣掉上下两侧留白，保证外壳整体在视口内、不溢出
-  height: calc(100dvh - var(--dd-shell-margin) * 2);
-  border-radius: var(--dd-radius-shell);
-  box-shadow: var(--dd-shadow-shell);
-  border: 1px solid var(--el-border-color-light);
+  margin: 0;
+  height: 100dvh;
   background: var(--el-bg-color);
   overflow: hidden;
 }
@@ -430,7 +515,6 @@ async function loadVersion() {
 // ==================== Sidebar ====================
 .layout-aside {
   width: 220px;
-  box-shadow: 8px 0 24px rgba(15, 23, 42, 0.03);
   display: flex;
   flex-direction: column;
   background: var(--el-bg-color);
@@ -453,11 +537,8 @@ async function loadVersion() {
   padding: 8px 10px;
   flex-shrink: 0;
   border-bottom: 1px solid var(--el-border-color-light);
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--el-color-primary-light-9) 48%, white) 0%,
-    var(--el-bg-color) 100%
-  );
+  // 去装饰渐变，用与侧栏一致的纯色底，靠底部 1px 分隔线划分区域
+  background: var(--el-bg-color);
 
   &.is-collapsed {
     justify-content: center;
@@ -470,20 +551,15 @@ async function loadVersion() {
   align-items: center;
   gap: 10px;
   padding: 7px 10px;
-  border-radius: 14px;
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--el-bg-color) 88%, white) 0%,
-    var(--el-bg-color) 100%
-  );
+  border-radius: var(--dd-radius-control);
+  background: var(--el-bg-color);
   border: 1px solid color-mix(in srgb, var(--el-color-primary) 10%, var(--el-border-color-lighter));
-  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.04);
-  transition: box-shadow 0.3s, border-color 0.3s;
+  transition: border-color 0.3s;
   width: 100%;
   min-height: 42px;
 
+  // hover 只加深描边，不再叠阴影
   &:hover {
-    box-shadow: 0 6px 16px rgba(15, 23, 42, 0.06);
     border-color: color-mix(in srgb, var(--el-color-primary) 18%, var(--el-border-color-lighter));
   }
 }
@@ -498,19 +574,14 @@ async function loadVersion() {
 .logo-icon-wrap {
   width: 28px;
   height: 28px;
-  border-radius: 9px;
+  border-radius: var(--dd-radius-control);
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  background: linear-gradient(145deg, var(--el-color-primary-light-8), var(--el-color-primary-light-9));
+  // 纯色底 + 1px 品牌色描边，去掉渐变、内高光与外投影，hover 也不再上浮
+  background: var(--el-bg-color);
   border: 1px solid color-mix(in srgb, var(--el-color-primary) 18%, transparent);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55), 0 4px 10px rgba(64, 158, 255, 0.12);
-  transition: transform 0.3s, box-shadow 0.3s;
-
-  .logo-inner:hover & {
-    transform: translateY(-1px);
-  }
 }
 
 .logo-icon {
@@ -532,7 +603,7 @@ async function loadVersion() {
 .logo-version {
   flex-shrink: 0;
   padding: 3px 8px;
-  border-radius: 999px;
+  border-radius: var(--dd-radius-control);
   font-family: var(--dd-font-mono);
   font-size: 10px;
   font-weight: 700;
@@ -556,7 +627,8 @@ async function loadVersion() {
 
   &::-webkit-scrollbar-thumb {
     background: transparent;
-    border-radius: 3px;
+    // 3px 宽的细 thumb 属于天然胶囊，吃 pill 档：直角模式仍是细方条，圆角模式变胶囊条
+    border-radius: var(--dd-radius-pill);
   }
 
   &:hover::-webkit-scrollbar-thumb {
@@ -571,6 +643,57 @@ async function loadVersion() {
   padding-left: 0;
   padding-right: 0;
   justify-content: center;
+}
+
+// ==================== 菜单角标 ====================
+// 展开态：标题占满剩余宽度，把角标顶到菜单项最右侧对齐成一列。
+// .el-menu-item 本身就是 flex 容器（EP 的默认样式），这里只需要给标题 flex: 1。
+.menu-title-text {
+  flex: 1;
+  min-width: 0;
+  // 菜单标题都很短，正常不会溢出；但面板标题可被用户改，留一手省略而不是撑破侧栏
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+// 收起态：#title 插槽整体不渲染，数字角标跟着消失，只在图标右上角留一个圆点。
+// 定位上下文用 el-icon 自己（下面给它 position: relative），
+// 而不是依赖 .el-menu-tooltip__trigger —— 那是 EP 的内部实现，位置和定位属性都可能变。
+.sidebar-nav :deep(.el-menu-item .el-icon) {
+  position: relative;
+}
+
+.menu-collapsed-dot {
+  // 默认不显示：只有菜单真的处于收起态（EP 给 ul 挂 .el-menu--collapse）才亮出来。
+  // 用 CSS 祖先判断而不是 v-if="isCollapsed"：移动端 isCollapsed 恒为 true，
+  // 但抽屉里的 el-menu 没传 :collapse，实际是展开的——用 JS 状态会在移动端多冒一个点。
+  display: none;
+}
+
+.sidebar-nav :deep(.el-menu--collapse) .menu-collapsed-dot {
+  display: block;
+  position: absolute;
+  // el-icon 是 18px 字号的 24px 方框，贴右上角但留 1px 不要压到图标笔画上
+  top: -1px;
+  right: -3px;
+  width: 7px;
+  height: 7px;
+  // 圆形承载语义：这是「有未读/异常」的状态角标点，圆点是通用可供性，
+  // 方块会被误认成图标本身的一部分。两种圆角模式下都保持圆形，不吃 --dd-radius-* 令牌。
+  border-radius: 50%;
+  background: var(--el-color-danger);
+  // 描边取侧栏底色，让圆点从图标上"浮"出来又不用阴影。
+  // 侧栏底色是 --el-bg-color（见 .layout-aside），暗色下自动跟着变。
+  border: 1.5px solid var(--el-bg-color);
+}
+
+.sidebar-nav :deep(.el-menu--collapse) .menu-collapsed-dot.is-primary {
+  background: var(--el-color-primary);
+}
+
+.sidebar-nav :deep(.el-menu--collapse) .menu-collapsed-dot.is-warning {
+  background: var(--el-color-warning);
 }
 
 .nav-section-label {
@@ -615,7 +738,7 @@ async function loadVersion() {
 .envs-add-btn {
   width: 20px;
   height: 20px;
-  border-radius: 4px;
+  border-radius: var(--dd-radius-control);
   border: 1px solid var(--el-border-color-lighter);
   background: transparent;
   display: flex;
@@ -626,9 +749,7 @@ async function loadVersion() {
   transition:
     background-color var(--dd-motion-fast) var(--dd-ease-standard),
     color var(--dd-motion-fast) var(--dd-ease-standard),
-    border-color var(--dd-motion-fast) var(--dd-ease-standard),
-    transform var(--dd-motion-fast) var(--dd-ease-emphasized),
-    box-shadow var(--dd-motion-fast) var(--dd-ease-standard);
+    border-color var(--dd-motion-fast) var(--dd-ease-standard);
 
   &:hover {
     border-color: var(--el-color-primary);
@@ -649,21 +770,21 @@ async function loadVersion() {
   align-items: center;
   gap: 8px;
   padding: 5px 6px;
-  border-radius: 6px;
+  border-radius: var(--dd-radius-control);
   cursor: pointer;
   transition: background 0.2s;
 
+  // hover 只换底色
   &:hover {
     background: var(--el-fill-color-light);
-    transform: translateY(-1px);
-    box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
   }
 }
 
 .env-dot {
   width: 7px;
   height: 7px;
-  border-radius: 50%;
+  // 7×7 的状态色点属于天然胶囊：pill 档下正好是圆点，直角档保持现有方点观感
+  border-radius: var(--dd-radius-pill);
   flex-shrink: 0;
 }
 
@@ -706,31 +827,13 @@ async function loadVersion() {
   align-items: center;
   gap: 10px;
   padding: 8px 10px;
-  border-radius: 10px;
+  border-radius: var(--dd-radius-control);
   cursor: pointer;
   transition: background 0.2s;
 
+  // hover 只换底色：去掉上浮阴影与顶部白色高光扫过（::after 装饰层已整体移除）
   &:hover {
     background: var(--el-fill-color-light);
-    transform: translateY(-1px);
-    box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
-  }
-
-  &::after {
-    content: "";
-    position: absolute;
-    inset: -50% 0 auto;
-    height: 75%;
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.28), transparent);
-    opacity: 0;
-    transform: translateY(-8px);
-    transition: opacity 180ms ease, transform 180ms ease;
-    pointer-events: none;
-  }
-
-  &:hover::after {
-    opacity: 1;
-    transform: translateY(0);
   }
 
   .is-collapsed & {
@@ -742,7 +845,9 @@ async function loadVersion() {
 .user-avatar {
   width: 32px;
   height: 32px;
-  border-radius: 8px;
+  // 圆形承载语义：头像是用户上传/来自 GitHub 的人像，本身按圆形构图，
+  // 直角硬切会把边缘内容裁掉。两种圆角模式下都保持圆形，不吃 --dd-radius-* 令牌。
+  border-radius: 50%;
   object-fit: cover;
   flex-shrink: 0;
 }
@@ -751,7 +856,7 @@ async function loadVersion() {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, var(--el-color-primary-light-5), var(--el-color-primary));
+  background: var(--el-color-primary);
   color: #fff;
   font-size: 14px;
   font-weight: 700;
@@ -788,7 +893,7 @@ async function loadVersion() {
   gap: 6px;
   height: 40px;
   margin: 4px 12px 10px;
-  border-radius: 8px;
+  border-radius: var(--dd-radius-control);
   border: 1px solid var(--el-border-color-lighter);
   background: transparent;
   cursor: pointer;
@@ -797,14 +902,12 @@ async function loadVersion() {
   transition:
     background-color var(--dd-motion-fast) var(--dd-ease-standard),
     color var(--dd-motion-fast) var(--dd-ease-standard),
-    transform var(--dd-motion-fast) var(--dd-ease-emphasized),
-    box-shadow var(--dd-motion-fast) var(--dd-ease-standard);
+    border-color var(--dd-motion-fast) var(--dd-ease-standard);
 
   &:hover {
     background: var(--el-fill-color-light);
     color: var(--el-color-primary);
     border-color: var(--el-color-primary-light-7);
-    transform: translateY(-1px);
   }
 }
 
@@ -838,9 +941,8 @@ async function loadVersion() {
 
 .header-toggle-btn {
   width: 34px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
   height: 34px;
-  border-radius: 8px;
+  border-radius: var(--dd-radius-control);
   border: 1px solid var(--el-border-color-lighter);
   background: transparent;
   display: flex;
@@ -855,15 +957,13 @@ async function loadVersion() {
     background: var(--el-fill-color-light);
     color: var(--el-color-primary);
     border-color: var(--el-color-primary-light-7);
-    transform: translateY(-1px);
-    box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
   }
 }
 
 .header-breadcrumb {
   display: flex;
   padding: 6px 10px;
-  border-radius: 10px;
+  border-radius: var(--dd-radius-control);
   background: color-mix(in srgb, var(--el-fill-color-light) 76%, transparent);
   align-items: center;
   gap: 6px;
@@ -904,7 +1004,7 @@ async function loadVersion() {
   width: 100%;
   height: 36px;
   padding: 0 14px;
-  border-radius: 10px;
+  border-radius: var(--dd-radius-control);
   background: var(--el-fill-color-light);
   border: 1px solid transparent;
   cursor: pointer;
@@ -933,7 +1033,7 @@ async function loadVersion() {
 .search-kbd {
   flex-shrink: 0;
   padding: 2px 6px;
-  border-radius: 4px;
+  border-radius: var(--dd-radius-control);
   font-size: 11px;
   font-family: var(--dd-font-mono);
   color: var(--el-text-color-placeholder);
@@ -945,7 +1045,7 @@ async function loadVersion() {
 .header-right {
   display: flex;
   padding: 4px 6px;
-  border-radius: 14px;
+  border-radius: var(--dd-radius-control);
   background: color-mix(in srgb, var(--el-fill-color-light) 82%, transparent);
   align-items: center;
   gap: 6px;
@@ -954,7 +1054,7 @@ async function loadVersion() {
 .header-icon-btn {
   width: 34px;
   height: 34px;
-  border-radius: 8px;
+  border-radius: var(--dd-radius-control);
   border: none;
   background: transparent;
   display: flex;
@@ -964,9 +1064,7 @@ async function loadVersion() {
   color: var(--el-text-color-regular);
   transition:
     background-color var(--dd-motion-fast) var(--dd-ease-standard),
-    color var(--dd-motion-fast) var(--dd-ease-standard),
-    transform var(--dd-motion-fast) var(--dd-ease-emphasized),
-    box-shadow var(--dd-motion-fast) var(--dd-ease-standard);
+    color var(--dd-motion-fast) var(--dd-ease-standard);
   position: relative;
 
   &:hover {
@@ -975,22 +1073,11 @@ async function loadVersion() {
   }
 }
 
-.theme-toggle {
-  &:hover {
-    transform: translateY(-1px) scale(1.03);
-  }
-}
+// 主题切换按钮的 hover 反馈与其他 header 图标按钮一致（换底色），不再额外做上浮 + 放大
 
-.notification-dot {
-  position: absolute;
-  top: 7px;
-  right: 7px;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #f56c6c;
-  border: 1.5px solid var(--el-bg-color);
-}
+// `.notification-dot` 已删除：它是零引用的死代码（全库只有这一处样式定义，
+// 模板里从来没用过），而且背景写死 #f56c6c，暗色下不跟随令牌。
+// 菜单角标现在由上面的 .menu-collapsed-dot 承担，取色走 --el-color-danger。
 
 .header-user {
   display: flex;
@@ -999,38 +1086,22 @@ async function loadVersion() {
   align-items: center;
   gap: 8px;
   padding: 5px 10px;
-  border-radius: 8px;
+  border-radius: var(--dd-radius-control);
   cursor: pointer;
   transition: all 0.2s;
   outline: none;
 
+  // hover 只换底色：去掉上浮阴影与顶部白色高光扫过（::after 装饰层已整体移除）
   &:hover {
     background: var(--el-fill-color-light);
-    transform: translateY(-1px);
-    box-shadow: 0 10px 20px rgba(15, 23, 42, 0.08);
-  }
-
-  &::after {
-    content: "";
-    position: absolute;
-    inset: -50% 0 auto;
-    height: 70%;
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.28), transparent);
-    opacity: 0;
-    transform: translateY(-10px);
-    transition: opacity 180ms ease, transform 180ms ease;
-    pointer-events: none;
-  }
-
-  &:hover::after {
-    opacity: 1;
-    transform: translateY(0);
   }
 }
 
 .header-user-avatar {
   width: 28px;
   height: 28px;
+  // 圆形承载语义：同 .user-avatar，头像本身按圆形构图，直角硬切会裁掉边缘内容。
+  // 两种圆角模式下都保持圆形，不吃 --dd-radius-* 令牌。
   border-radius: 50%;
   object-fit: cover;
   flex-shrink: 0;
@@ -1040,7 +1111,7 @@ async function loadVersion() {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, var(--el-color-primary-light-5), var(--el-color-primary));
+  background: var(--el-color-primary);
   color: #fff;
   font-size: 12px;
   font-weight: 700;
@@ -1102,27 +1173,9 @@ async function loadVersion() {
   }
 }
 
-// ==================== Footer ====================
-.layout-footer {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  padding: 12px 20px;
-  font-size: 12px;
-  color: var(--el-text-color-placeholder);
-  background: var(--el-bg-color-page);
-  border-top: 1px solid var(--el-border-color-lighter);
-  flex-wrap: wrap;
-}
-
 @media screen and (max-height: 820px) and (min-width: 769px) {
-  // 矮屏：外壳四周留白收小，给内容腾出更多垂直空间
-  .layout-container {
-    --dd-shell-margin: 10px;
-  }
-
+  // 矮屏：外壳本身已铺满视口，这里只收紧 header / main 的内边距，
+  // 给内容腾出更多垂直空间
   .layout-header {
     height: 52px;
     padding: 0 16px;
@@ -1130,24 +1183,6 @@ async function loadVersion() {
 
   .layout-main {
     padding: 14px 16px;
-  }
-
-  .layout-footer {
-    padding: 8px 16px;
-    font-size: 11px;
-  }
-}
-
-.footer-sep {
-  color: var(--el-border-color);
-}
-
-.footer-link {
-  color: var(--el-text-color-secondary);
-  transition: color 0.2s;
-
-  &:hover {
-    color: var(--el-color-primary);
   }
 }
 
@@ -1202,15 +1237,7 @@ async function loadVersion() {
 
 // ==================== Mobile responsive ====================
 @media screen and (max-width: 768px) {
-  // 移动端：取消悬浮外壳，回到全屏，避免小屏留白浪费；drawer 行为不变
-  .layout-container {
-    margin: 0;
-    height: 100dvh;
-    border-radius: 0;
-    box-shadow: none;
-    border: none;
-  }
-
+  // 外壳在桌面端也已全屏铺满，这里不需要再复位；只调整内部间距与滚动行为，drawer 行为不变
   .layout-header {
     height: 54px;
     padding: 0 12px;
@@ -1250,11 +1277,6 @@ async function loadVersion() {
 
   .header-right {
     gap: 2px;
-  }
-
-  .layout-footer {
-    padding: 10px 12px;
-    font-size: 11px;
   }
 }
 </style>

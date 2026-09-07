@@ -19,6 +19,20 @@ import (
 	"gorm.io/gorm"
 )
 
+// UntimedTaskScriptTokenTTL 是 task.Timeout == 0（DB 默认值，绝大多数任务）时
+// 注入脚本的面板凭据有效期。这不是「预期存活时长」——正常路径下任务一结束就会被吊销——
+// 而是吊销来不及执行时的最坏窗口。
+//
+// 导出是因为 ddp python / ddp shell 也要用同一个窗口：交互式会话同样没有可推导的运行时长，
+// 与「未设超时的任务」是同一类场景。一个常量、一套说法，文档才讲得清。
+const UntimedTaskScriptTokenTTL = 7 * 24 * time.Hour
+
+// runCommandWithPlanFunc 是子进程执行入口的可替换钩子，仅供测试注入
+// （与 runtime_exec.go 里的 warmManagedPythonVenvForVersionFunc 同款做法）。
+// 生产路径永远是 RunCommandWithPlan；测试借它构造"执行中 / 执行崩溃"这类
+// 无法靠真实子进程稳定复现的场景。
+var runCommandWithPlanFunc = RunCommandWithPlan
+
 type TaskExecutor struct {
 	scriptsDir       string
 	logDir           string
@@ -39,6 +53,36 @@ func (e *TaskExecutor) OnTaskScheduled(req *ExecutionRequest) {
 	log.Printf("task %d scheduled: %s", req.TaskID, req.Task.Name)
 }
 
+// ResolveExecutionDelay 计算本次执行需要等待的随机延迟。
+// 调度器会在占用并发槽位之前完成这段等待，因此这里只负责算时长、不负责 sleep。
+func (e *TaskExecutor) ResolveExecutionDelay(req *ExecutionRequest) time.Duration {
+	if e == nil || req == nil || req.Task == nil {
+		return 0
+	}
+	// 随机延迟对定时与开机任务生效；手动执行立即运行，避免用户手点后还要等待。
+	if !shouldApplyRandomDelayForTrigger(req.TriggerType) {
+		return 0
+	}
+
+	plan := req.CommandPlan
+	if plan == nil {
+		parsed, err := ParseCommandExecutionPlan(req.Task.Command, e.scriptsDir)
+		if err != nil {
+			// 解析失败交给 OnTaskExecuting 统一报错，这里只表示“不需要延迟”。
+			return 0
+		}
+		plan = parsed
+	}
+
+	randomDelay := resolveTaskRandomDelaySeconds(req.Task, plan)
+	if randomDelay <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Intn(randomDelay)+1) * time.Second
+}
+
+// OnTaskExecuting 只做执行前准备：依赖检查、解析命令、建立日志记录。
+// 真正的执行在 RunTask 中同步完成，调度器据此实现并发上限。
 func (e *TaskExecutor) OnTaskExecuting(req *ExecutionRequest) error {
 	task := req.Task
 
@@ -57,14 +101,7 @@ func (e *TaskExecutor) OnTaskExecuting(req *ExecutionRequest) error {
 	}
 	req.CommandPlan = plan
 
-	// 随机延迟只对定时(cron)任务生效；手动执行与开机自启立即运行，避免用户手点后还要等待。
-	if shouldApplyRandomDelayForTrigger(req.TriggerType) {
-		randomDelay := resolveTaskRandomDelaySeconds(task, plan)
-		if randomDelay > 0 {
-			delay := rand.Intn(randomDelay) + 1
-			time.Sleep(time.Duration(delay) * time.Second)
-		}
-	}
+	// 随机延迟已经在 ResolveExecutionDelay + 调度器重新入队阶段完成，这里不再 sleep，避免双重延迟。
 
 	now := time.Now()
 	database.DB.Model(task).Updates(map[string]interface{}{
@@ -93,18 +130,43 @@ func (e *TaskExecutor) OnTaskExecuting(req *ExecutionRequest) error {
 	database.DB.Create(taskLog)
 
 	req.TaskLogID = taskLog.ID
-
-	e.runWG.Add(1)
-	go func() {
-		defer e.runWG.Done()
-		e.runTask(req, taskLog, tinyLog)
-	}()
+	req.taskLog = taskLog
+	req.tinyLog = tinyLog
 
 	return nil
 }
 
 func (e *TaskExecutor) OnTaskStarted(req *ExecutionRequest) {
 	log.Printf("task %d started: %s", req.TaskID, req.Task.Name)
+}
+
+// RunTask 同步执行任务直到结束（含全部重试与重试等待），调用方（worker）在此期间一直占用并发槽位。
+func (e *TaskExecutor) RunTask(req *ExecutionRequest) {
+	if e == nil || req == nil {
+		return
+	}
+
+	taskLog := req.taskLog
+	tinyLog := req.tinyLog
+	// 用完即清，避免同一请求对象被重新入队时复用上一次的日志记录。
+	req.taskLog = nil
+	req.tinyLog = nil
+
+	if taskLog == nil {
+		// 正常链路里 OnTaskExecuting 成功后一定有 taskLog，这里只是兜底。
+		// 兜底也必须把已经建好的实时日志收口，否则 TinyLog 会永远留在管理器里泄漏。
+		if tinyLog != nil {
+			tinyLog.Close()
+			GetTinyLogManager().Remove(tinyLog.LogID)
+		}
+		log.Printf("task %d: missing prepared task log, skip execution", req.TaskID)
+		return
+	}
+
+	e.runWG.Add(1)
+	defer e.runWG.Done()
+
+	e.runTask(req, taskLog, tinyLog)
 }
 
 func (e *TaskExecutor) OnTaskCompleted(req *ExecutionRequest, result *ExecutionResult) {
@@ -253,9 +315,12 @@ func (e *TaskExecutor) runTask(req *ExecutionRequest, taskLog *model.TaskLog, ti
 	}
 	envTTL := time.Duration(timeout)*time.Second + time.Hour
 	if timeout == 0 {
-		envTTL = 365 * 24 * time.Hour
+		// 未设超时的任务没有可推导的运行时长，取一个固定兜底窗口。
+		// 主控手段是任务结束时的吊销（见下方 defer），TTL 只在「面板被 kill -9 / 宿主断电，
+		// 吊销压根没机会执行」时兜底。取值不能太短，否则长任务会跑到一半丢掉 API 权限。
+		envTTL = UntimedTaskScriptTokenTTL
 	}
-	envVars, envErr := BuildManagedRuntimeEnvMapForPythonVersion(taskWorkDir, e.scriptsDir, task.NotificationChannelID, envTTL, task.PythonVersion)
+	envVars, scriptToken, envErr := BuildManagedRuntimeEnvMapWithScriptToken(taskWorkDir, e.scriptsDir, task.NotificationChannelID, envTTL, task.PythonVersion)
 	if envErr != nil {
 		log.Printf("prepare task runtime env failed: %v", envErr)
 	}
@@ -269,6 +334,11 @@ func (e *TaskExecutor) runTask(req *ExecutionRequest, taskLog *model.TaskLog, ti
 			exitCode = 1
 			success = false
 		}
+
+		// 任务已经跑完（正常结束、失败、超时被杀、panic 都汇聚到这里），
+		// 注入脚本的那枚 operator 凭据立刻作废，不让它在任务之外继续游荡。
+		// 放在 recover 之后：先保证 panic 被接住，再做吊销。
+		RevokeScriptToken(scriptToken)
 
 		duration := time.Since(startTime).Seconds()
 
@@ -303,6 +373,12 @@ func (e *TaskExecutor) runTask(req *ExecutionRequest, taskLog *model.TaskLog, ti
 		})
 
 		inactiveStatus := ResolveTaskInactiveStatus(task)
+		if inactiveStatus == model.TaskStatusDisabled {
+			// 「运行中被禁用、等这次跑完再生效」的意图到这里就落地了（status 已经写成禁用），
+			// 标记用完即清：它只活在内存里，留着的话万一这个任务 id 被删除后复用，
+			// 新任务会平白继承一个禁用意图。
+			ClearPendingDisable(task.ID)
+		}
 		database.DB.Model(task).Updates(map[string]interface{}{
 			"status":            inactiveStatus,
 			"last_run_status":   runStatus,
@@ -376,12 +452,24 @@ func (e *TaskExecutor) runTask(req *ExecutionRequest, taskLog *model.TaskLog, ti
 
 	onOutput(fmt.Sprintf("=== 开始执行 [%s] ===\n", startTime.Format("2006-01-02 15:04:05")))
 
+	// 前置脚本（任务专属 + 全局 task_before.sh）里 export 的环境变量会按执行顺序
+	// 增量合并回 envVars，供后面的目标脚本、task_after.sh、extra.sh 和后置脚本共用。
+	// 这是青龙 task_before 的语义；细节与保护名单见 task_hook_env.go。
 	if task.TaskBefore != nil && *task.TaskBefore != "" {
 		onOutput("[执行前置脚本]\n")
-		RunInlineScript(*task.TaskBefore, e.scriptsDir, envVars, 60, onOutput, plan.ScriptArgs...)
+		captureHookEnvExports(envVars, onOutput, func(hookEnv map[string]string) {
+			// 前置脚本的错误过去被直接丢弃，bash 找不到、临时文件写不进去、超时，
+			// 用户在任务日志里只能看到「[执行前置脚本]」一行。这里把它说出来，
+			// 但仍然保持「前置脚本失败不中断任务」的既有行为。
+			if err := RunInlineScript(*task.TaskBefore, e.scriptsDir, hookEnv, 60, onOutput, plan.ScriptArgs...); err != nil {
+				onOutput(fmt.Sprintf("[前置脚本执行失败: %s]\n", err.Error()))
+			}
+		})
 	}
 
-	RunHookScript("task_before.sh", e.scriptsDir, envVars, onOutput, plan.ScriptArgs...)
+	captureHookEnvExports(envVars, onOutput, func(hookEnv map[string]string) {
+		RunHookScript("task_before.sh", e.scriptsDir, hookEnv, onOutput, plan.ScriptArgs...)
+	})
 
 	retries := 0
 	var lastExitCode int
@@ -405,7 +493,7 @@ func (e *TaskExecutor) runTask(req *ExecutionRequest, taskLog *model.TaskLog, ti
 		if plan.TimeoutOverride != nil && *plan.TimeoutOverride > 0 {
 			effectiveTimeout = *plan.TimeoutOverride
 		}
-		result, _, err := RunCommandWithPlan(plan, effectiveTimeout, envVars, maxLogSize, onOutputWithCollect, onStart)
+		result, _, err := runCommandWithPlanFunc(plan, effectiveTimeout, envVars, maxLogSize, onOutputWithCollect, onStart)
 		if err != nil {
 			onOutput(fmt.Sprintf("[执行错误: %s]\n", err.Error()))
 			if strings.Contains(err.Error(), "illegal instruction") || strings.Contains(err.Error(), "core dumped") {
@@ -455,9 +543,13 @@ func (e *TaskExecutor) runTask(req *ExecutionRequest, taskLog *model.TaskLog, ti
 
 	exitCode = lastExitCode
 
+	// 后置脚本不参与环境变量回传：它跑完任务就结束了，回写没有消费方。
+	// 但同样要把执行错误说出来，理由与前置脚本一致。
 	if task.TaskAfter != nil && *task.TaskAfter != "" {
 		onOutput("[执行后置脚本]\n")
-		RunInlineScript(*task.TaskAfter, e.scriptsDir, envVars, 60, onOutput, plan.ScriptArgs...)
+		if err := RunInlineScript(*task.TaskAfter, e.scriptsDir, envVars, 60, onOutput, plan.ScriptArgs...); err != nil {
+			onOutput(fmt.Sprintf("[后置脚本执行失败: %s]\n", err.Error()))
+		}
 	}
 
 	RunHookScript("task_after.sh", e.scriptsDir, envVars, onOutput, plan.ScriptArgs...)
@@ -580,9 +672,19 @@ func buildTaskExecutionNotification(task *model.Task, taskLogID uint, runStatus 
 	return title, content, context
 }
 
+// panelMetaLinePrefixes 登记所有「面板自己打进任务日志」的元信息行前缀。
+//
+// isPanelMetaLine 靠它把这些行从成功通知的日志摘录里滤掉。摘录只有 30 行 / 1500 字符，
+// 漏登记一条，它就会顶掉用户真正想看的脚本输出 —— 所以新增任何面板输出行时，
+// 必须同步登记到这里（契约见 quality-guidelines.md）。
 var panelMetaLinePrefixes = []string{
 	"[执行前置脚本]",
 	"[执行后置脚本]",
+	"[前置脚本执行失败:",
+	"[后置脚本执行失败:",
+	// 前置钩子的环境变量回传日志：已生效 / 已忽略受保护变量 / 未采集到回传数据 /
+	// 采集准备失败 / 运行时关键变量被整体覆盖的「注意：」提示，全部共用这个前缀。
+	"[前置脚本环境变量]",
 	"[执行错误:",
 	"[提示]",
 	"[第 ",
@@ -592,6 +694,10 @@ var panelMetaLinePrefixes = []string{
 	"[依赖已安装 ",
 	"[重试启动失败:",
 	"[任务异常崩溃:",
+	// 子进程被信号杀掉时的可诊断提示（#113 排查里补的）。被信号杀必然结算为失败、
+	// 走的是不过滤的 failureExcerpt，所以登记它今天不改变任何行为；
+	// 登记只是守住「面板输出行必须在册」这条契约，免得以后有人把它挪进成功摘录。
+	"[脚本进程被信号终止：",
 }
 
 func isPanelMetaLine(line string) bool {
@@ -697,7 +803,9 @@ func extractRequireESMPackageName(output string) string {
 		if len(matches) < 2 {
 			continue
 		}
-		packageName := normalizeNodeRequireSpecifier(filepath.ToSlash(matches[1]))
+		// 这里处理的是从 Node 报错文本里捕获出来的路径，不是宿主机文件系统路径，
+		// 因此不能用 filepath.ToSlash（它按宿主机分隔符工作，在 Linux 上是空操作）。
+		packageName := normalizeNodeRequireSpecifier(strings.ReplaceAll(matches[1], "\\", "/"))
 		if packageName != "" {
 			return packageName
 		}
@@ -716,7 +824,8 @@ func extractRequireESMPackageName(output string) string {
 }
 
 func normalizeNodeRequireSpecifier(spec string) string {
-	spec = strings.TrimSpace(filepath.ToSlash(spec))
+	// 入参可能来自 Node 报错文本中的 Windows 风格路径，规范化必须与宿主机平台无关。
+	spec = strings.TrimSpace(strings.ReplaceAll(spec, "\\", "/"))
 	if spec == "" ||
 		strings.HasPrefix(spec, ".") ||
 		strings.HasPrefix(spec, "/") ||

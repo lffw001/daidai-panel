@@ -85,6 +85,13 @@ func RunCommandWithPlan(plan *CommandExecutionPlan, timeout int, envVars map[str
 		return nil, nil, err
 	}
 
+	// 放在 desi 收窄之后：desi 只把选中的账号写回变量，按这里的口径统计才是子进程真实要背的量。
+	if onOutput != nil {
+		emitRuntimeEnvLimitWarnings(resolvedEnv, plan.Interpreter, func(line string) {
+			onOutput(line + "\n")
+		})
+	}
+
 	return runSingleCommand(plan, effectiveTimeout, resolvedEnv, maxLogSize, onOutput, onProcessStart...)
 }
 
@@ -575,11 +582,6 @@ func runSingleCommand(plan *CommandExecutionPlan, timeout int, envVars map[strin
 	totalSize := 0
 	truncated := false
 
-	// 不再用 Scanner 按行切，因为终端进度条常用裸 \r 覆盖当前行。
-	// 这里按字节流切片，把 \n / \r / \r\n 都当成边界保留下来，
-	// 让实时日志、历史日志和前端渲染都能还原真实终端语义。
-	reader := bufio.NewReaderSize(stdout, 256*1024)
-
 	emitChunk := func(chunk string) {
 		if truncated {
 			return
@@ -600,90 +602,46 @@ func runSingleCommand(plan *CommandExecutionPlan, timeout int, envVars map[strin
 		}
 	}
 
-	done := make(chan error, 1)
-	go func() {
-		defer close(done)
-		var chunkBuf strings.Builder
-		for {
-			text, err := reader.ReadString('\n')
-			if len(text) > 0 {
-				lastBoundaryIndex := -1
-				for i := 0; i < len(text); i++ {
-					chunkBuf.WriteByte(text[i])
-					if text[i] == '\r' {
-						// 兼容 Windows 风格 \r\n，整对一起作为一个边界发出。
-						if i+1 < len(text) && text[i+1] == '\n' {
-							chunkBuf.WriteByte(text[i+1])
-							i++
-						}
-						emitChunk(chunkBuf.String())
-						chunkBuf.Reset()
-						lastBoundaryIndex = i
-						continue
-					}
-					if text[i] == '\n' {
-						emitChunk(chunkBuf.String())
-						chunkBuf.Reset()
-						lastBoundaryIndex = i
-					}
-				}
-				if lastBoundaryIndex == -1 {
-					// 当前片段里没有换行边界，继续累积，等待后续数据拼完整。
-				}
-			}
-			if err != nil {
-				if chunkBuf.Len() > 0 {
-					emitChunk(chunkBuf.String())
-					chunkBuf.Reset()
-				}
-				done <- err
-				return
-			}
-		}
-	}()
-
-	var timerC <-chan time.Time
-	var timer *time.Timer
+	var timeoutDuration time.Duration
 	if timeout > 0 {
-		timer = time.NewTimer(time.Duration(timeout) * time.Second)
-		timerC = timer.C
-		defer timer.Stop()
+		timeoutDuration = time.Duration(timeout) * time.Second
 	}
 
-	waitCh := make(chan error, 1)
-	go func() {
-		waitErr := cmd.Wait()
-		cleanup()
-		waitCh <- waitErr
-	}()
+	waitErr, timedOut, readErr := pumpAndWait(cmd, stdout, timeoutDuration, emitChunk)
+	cleanup()
 
-	var returnCode int
-	select {
-	case err := <-waitCh:
-		readErr := <-done
-		if err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				returnCode = exitErr.ExitCode()
-			} else {
-				returnCode = 1
-			}
-		}
-		if readErr != nil && readErr != io.EOF && totalSize < maxLogSize && !truncated {
-			if !isBenignProcessPipeReadError(readErr) {
-				emitChunk(fmt.Sprintf("[读取脚本输出失败] %s\n", readErr.Error()))
-			}
-		}
-	case <-timerC:
-		KillProcessGroup(cmd.Process)
-		readErr := <-done
-		<-waitCh
+	returnCode := exitCodeFromWaitError(waitErr)
+	if timedOut {
+		// 超时被杀时进程的退出码没有意义（是信号导致的），沿用原来的约定值 -1
 		returnCode = -1
 		msg := fmt.Sprintf("\n[任务超时，已在 %d 秒后终止]", timeout)
 		outputBuilder.WriteString(msg)
 		if onOutput != nil {
 			onOutput(msg)
 		}
-		if readErr != nil && readErr != io.EOF && totalSize < maxLogSize && !truncated && !isBenignProcessPipeReadError(readErr) {
+	} else if signalName := describeTerminationSignal(waitErr); signalName != "" {
+		// 【进程被信号杀掉时，给用户一个能看懂的解释】
+		// 被信号终止的进程在 Go 里 ExitCode() 恒为 -1，日志里只会留下「退出码 -1」，
+		// 用户完全不知道是内存超限被 OOM Killer 杀了、还是自己点了停止、还是被外部脚本 kill 了。
+		// 这一行就是把这个静默现象变成可诊断的。
+		//
+		// 🔴 【必须先排除 timedOut，顺序不能反】
+		// 超时分支自己会 KillProcessGroup 发 SIGKILL，waitErr 里同样是「被信号终止」。
+		// 不排除的话一次超时会同时打出「任务超时」和「被信号终止」两行互相矛盾的解释，
+		// 而且超时分支已经把退出码硬置成 -1，再解释一遍毫无信息量。
+		//
+		// 写法照抄上面的超时分支（同时写 outputBuilder 和 onOutput），
+		// 所以 conc 模式下它和超时提示形状一致：会被 prefixedOutput 加上 [EnvName#N] 前缀，
+		// 开头那个 \n 让前缀单独占一行 —— 这是既有行为，不在本次改动范围内。
+		// Windows 上 describeTerminationSignal 恒返回空串，这个分支永远不会进。
+		msg := fmt.Sprintf("\n[脚本进程被信号终止：%s（退出码 -1）。常见原因：内存超限被系统 OOM Killer 杀掉、面板或用户手动停止、外部 kill]", signalName)
+		outputBuilder.WriteString(msg)
+		if onOutput != nil {
+			onOutput(msg)
+		}
+	}
+	if readErr != nil && readErr != io.EOF && totalSize < maxLogSize && !truncated {
+		if !isBenignProcessPipeReadError(readErr) {
 			emitChunk(fmt.Sprintf("[读取脚本输出失败] %s\n", readErr.Error()))
 		}
 	}
@@ -695,6 +653,148 @@ func runSingleCommand(plan *CommandExecutionPlan, timeout int, envVars map[strin
 	}, process, nil
 }
 
+// pumpAndWait 把子进程的输出读干净，然后才等待它退出。
+//
+// 🔴 【顺序就是这个函数存在的全部理由，改它之前先读完这段】
+//
+// os/exec 对 StdoutPipe 的约定是：
+//
+//	"Wait will close the pipe after seeing the command exit ... it is incorrect
+//	 to call Wait before all reads from the pipe have completed."
+//
+// 也就是说 cmd.Wait() 看到进程退出后会【关闭管道】。如果此时读协程还没把管道里
+// 剩下的数据读完，那部分输出会连同 fd 一起消失 —— 而且是静默消失：读协程拿到的
+// 是 "file already closed"，恰好落在 isBenignProcessPipeReadError 的良性名单里，
+// 连一行报错都不会留下。
+//
+// 这正是 issue #102「实时日志显示不全、最后几秒不显示」的成因，也解释了用户观察到的
+// 两个现象：「有些脚本能显示全」（输出少、读得快，抢在 Wait 前读完了）、
+// 「脚本末尾加 5 秒延时就能显示全」（延时把 Wait 推后，给了读协程时间）。
+//
+// 正确顺序只有一种：**先等读协程读到 EOF，再调 Wait**。
+// 进程退出后写端关闭，读端必然拿到 EOF，所以这样不会卡死；
+// 超时分支里先 KillProcessGroup 也是同理，杀掉进程就会触发 EOF。
+//
+// 返回值：cmd.Wait() 的原始错误（保留 *exec.ExitError 供调用方断言）、是否因超时被杀、
+// 读取过程中的错误（EOF 视为正常结束，归一成 nil）。
+// 调用方拿到返回值时进程已经结束，可以安全地做 cleanup。
+func pumpAndWait(cmd *exec.Cmd, stdout io.Reader, timeout time.Duration, emit func(string)) (error, bool, error) {
+	// 不用 Scanner 按行切，因为终端进度条常用裸 \r 覆盖当前行。
+	// 这里按字节流切片，把 \n / \r / \r\n 都当成边界保留下来，
+	// 让实时日志、历史日志和前端渲染都能还原真实终端语义。
+	reader := bufio.NewReaderSize(stdout, 256*1024)
+
+	drained := make(chan error, 1)
+	go func() {
+		drained <- pumpTerminalChunks(reader, emit)
+	}()
+
+	type outcome struct {
+		readErr error
+		waitErr error
+	}
+	outcomeCh := make(chan outcome, 1)
+	go func() {
+		// ⚠️ 这两行的先后顺序是本函数的核心契约，不要交换（理由见上方注释）。
+		//
+		// 实测数据（把这两行换回旧顺序、交叉编译成 Linux 版跑真面板）：
+		// 一个输出 2000 行后立刻退出的 Python 脚本，落库的日志只剩 23 行 ——
+		// 丢了 98.85%，而且末尾照样写着「执行结束 退出码 0」，
+		// 用户完全看不出日志被截断过。
+		// 单元测试 TestPumpAndWaitKeepsTailOutput 守着这一条，交换即红。
+		readErr := <-drained
+		waitErr := cmd.Wait()
+		outcomeCh <- outcome{readErr: readErr, waitErr: waitErr}
+	}()
+
+	var timerC <-chan time.Time
+	if timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		timerC = timer.C
+	}
+
+	select {
+	case oc := <-outcomeCh:
+		return oc.waitErr, false, normalizePumpReadError(oc.readErr)
+	case <-timerC:
+		KillProcessGroup(cmd.Process)
+		// 杀掉进程 → 管道写端关闭 → 读协程读到 EOF → drained 有值 → Wait 返回。
+		// 所以这里等 outcomeCh 不会永久阻塞。
+		oc := <-outcomeCh
+		return oc.waitErr, true, normalizePumpReadError(oc.readErr)
+	}
+}
+
+// pumpTerminalChunks 按终端语义把输出切成块交给 emit：
+// \n 落一新行、\r\n 整对作为一个边界、裸 \r 也是边界（进度条覆盖当前行）。
+// 读到结尾时把残留的不完整块也发出去，返回终止读取的那个 error（正常结束是 io.EOF）。
+func pumpTerminalChunks(reader *bufio.Reader, emit func(string)) error {
+	var chunkBuf strings.Builder
+	for {
+		text, err := reader.ReadString('\n')
+		for i := 0; i < len(text); i++ {
+			chunkBuf.WriteByte(text[i])
+			if text[i] == '\r' {
+				// 兼容 Windows 风格 \r\n，整对一起作为一个边界发出。
+				if i+1 < len(text) && text[i+1] == '\n' {
+					chunkBuf.WriteByte(text[i+1])
+					i++
+				}
+				emit(chunkBuf.String())
+				chunkBuf.Reset()
+				continue
+			}
+			if text[i] == '\n' {
+				emit(chunkBuf.String())
+				chunkBuf.Reset()
+			}
+		}
+		if err != nil {
+			// 收尾：没有换行结束的最后一段也要发出去，否则脚本用 print(end='')
+			// 或者进度条结尾不带换行时，最后一块会被吞掉。
+			if chunkBuf.Len() > 0 {
+				emit(chunkBuf.String())
+				chunkBuf.Reset()
+			}
+			return err
+		}
+	}
+}
+
+func exitCodeFromWaitError(err error) int {
+	if err == nil {
+		return 0
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return exitErr.ExitCode()
+	}
+	return 1
+}
+
+// normalizePumpReadError 把「读到结尾」统一成 nil，只把真正的读失败往外传。
+func normalizePumpReadError(err error) error {
+	if err == io.EOF {
+		return nil
+	}
+	return err
+}
+
+// isBenignProcessPipeReadError 判断一个读错误要不要写进用户可见的日志。
+//
+// ⚠️ 这份名单曾经掩盖过一个真 bug（issue #102）。
+//
+// 前两项 "file already closed" / "read |0:" 正是 cmd.Wait() 抢在读协程之前关闭
+// StdoutPipe 时的报错。在 pumpAndWait 把顺序修正之前，它们每次都会命中这里被判成
+// 良性、静默丢弃 —— 于是「日志少了最后几行」这个现象连一条线索都不留。
+//
+// 现在 pumpAndWait 保证「先排空、再 Wait」，正常路径读到的是 io.EOF，
+// 超时路径是先 kill 再读到 EOF，**都不会**再产生这两个错误。
+// 所以如果你在日志里又看到它们被这个函数吞掉，几乎可以断定是有人把那个顺序改回去了，
+// 先去看 TestPumpAndWaitKeepsTailOutput 是不是红的。
+//
+// 名单继续保留是防御性的：进程被外部强杀等边缘情况下，用户看到一行
+// 「[读取脚本输出失败] file already closed」没有任何帮助。
 func isBenignProcessPipeReadError(err error) bool {
 	if err == nil || err == io.EOF {
 		return true
@@ -741,26 +841,46 @@ func runConcurrentCommand(plan *CommandExecutionPlan, timeout int, envVars map[s
 		outputMu.Lock()
 		defer outputMu.Unlock()
 
+		// 【为什么要先算一份 text，两条路径写同一份】
+		// 进来的东西有两种：
+		//   a) conc 自己生成的行（开始执行 / 执行完成 / 执行错误 / 截断标记），末尾【没有】换行；
+		//   b) prefixedOutput 转发的脚本原始输出片段，末尾本来就带 \n 或裸 \r。
+		// 老写法是无条件给 outputBuilder 补一个 "\n"、却完全不给 onOutput 补，两边都不对：
+		//   - 实时流（onOutput）里 a 类行会和紧跟其后的脚本输出粘成一行；
+		//   - 落盘（outputBuilder）里 b 类片段后面又多出一个空行。
+		// 现在统一成「本来就以换行/裸 \r 收尾就不动，否则才补一个 \n」，
+		// 既修掉粘行，也不会写重 \n；裸 \r 保持原样，进度条的覆盖刷新语义不受影响。
+		text := line
+		if !strings.HasSuffix(text, "\n") && !strings.HasSuffix(text, "\r") {
+			text += "\n"
+		}
+
 		if totalSize < maxLogSize {
-			outputBuilder.WriteString(line)
-			outputBuilder.WriteString("\n")
-			totalSize += len(line) + 1
+			outputBuilder.WriteString(text)
+			totalSize += len(text)
 			if onOutput != nil {
-				onOutput(line)
+				onOutput(text)
 			}
 			return
 		}
 
 		if !truncated {
 			truncated = true
-			msg := "[日志已截断，超过最大大小限制]"
+			msg := "[日志已截断，超过最大大小限制]\n"
 			outputBuilder.WriteString(msg)
-			outputBuilder.WriteString("\n")
 			if onOutput != nil {
 				onOutput(msg)
 			}
 		}
 	}
+
+	// conc 会为每个账号各起一个进程，环境只差 EnvName 这一条，
+	// 所以按第一个账号体检一次即可，避免同一段提示刷 N 遍。
+	emitRuntimeEnvLimitWarnings(
+		applyConcurrentAccountEnv(plan, envVars, selections[0]),
+		plan.Interpreter,
+		appendLine,
+	)
 
 	type concurrentResult struct {
 		index      int
@@ -1077,35 +1197,21 @@ func RunInlineScript(content, scriptsDir string, envVars map[string]string, time
 		return err
 	}
 
-	reader := bufio.NewReaderSize(stdout, 256*1024)
-	go func() {
-		for {
-			chunk, err := reader.ReadString('\n')
-			if len(chunk) > 0 && onOutput != nil {
-				onOutput(chunk)
-			}
-			if err != nil {
-				return
-			}
+	// 走统一的 pumpAndWait：原来这里是「读协程完全不同步 + 直接 cmd.Wait()」，
+	// 与 runSingleCommand 是同一个丢尾巴的 bug（见 pumpAndWait 的注释），
+	// 而且更严重 —— 连等读协程结束的 channel 都没有。
+	emit := func(chunk string) {
+		if onOutput != nil {
+			onOutput(chunk)
 		}
-	}()
-
-	timer := time.NewTimer(time.Duration(timeout) * time.Second)
-	defer timer.Stop()
-
-	waitCh := make(chan error, 1)
-	go func() {
-		waitCh <- cmd.Wait()
-	}()
-
-	select {
-	case err := <-waitCh:
-		return err
-	case <-timer.C:
-		KillProcessGroup(cmd.Process)
-		<-waitCh
+	}
+	waitErr, timedOut, _ := pumpAndWait(cmd, stdout, time.Duration(timeout)*time.Second, emit)
+	if timedOut {
 		return fmt.Errorf("钩子脚本超时，已超过 %d 秒", timeout)
 	}
+	// 原样返回 cmd.Wait() 的错误（退出码非 0 时是 *exec.ExitError），
+	// 调用方对钩子失败的判断逻辑不变。
+	return waitErr
 }
 
 func RunHookScript(scriptName, scriptsDir string, envVars map[string]string, onOutput OnOutputFunc, scriptArgs ...string) {
@@ -1142,33 +1248,15 @@ func RunHookScript(scriptName, scriptsDir string, envVars map[string]string, onO
 		return
 	}
 
-	reader := bufio.NewReaderSize(stdout, 256*1024)
-	go func() {
-		for {
-			chunk, err := reader.ReadString('\n')
-			if len(chunk) > 0 && onOutput != nil {
-				onOutput(chunk)
-			}
-			if err != nil {
-				return
-			}
+	// 与上面两处同因：原来读协程不同步、直接 cmd.Wait()，钩子脚本的尾部输出会被吞掉。
+	// 统一走 pumpAndWait（见它的注释）。这个函数本身不返回错误，钩子失败只体现在日志里，
+	// 所以两个错误值都丢弃，但输出必须是完整的。
+	emit := func(chunk string) {
+		if onOutput != nil {
+			onOutput(chunk)
 		}
-	}()
-
-	timer := time.NewTimer(60 * time.Second)
-	defer timer.Stop()
-
-	waitCh := make(chan error, 1)
-	go func() {
-		waitCh <- cmd.Wait()
-	}()
-
-	select {
-	case <-waitCh:
-	case <-timer.C:
-		KillProcessGroup(cmd.Process)
-		<-waitCh
 	}
+	pumpAndWait(cmd, stdout, 60*time.Second, emit)
 }
 
 func cleanProcessArgs(args []string) []string {

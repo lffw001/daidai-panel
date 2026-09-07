@@ -16,24 +16,46 @@
 
     <div class="toolbar">
       <div class="toolbar__left">
+        <!-- 状态分段控件带计数：不用切过去也知道各状态下有几个应用。
+             计数是「统计型」而非「提醒型」，所以开 show-zero ——「已禁用 0」是有信息量的
+             （告诉你确实一个都没有），角标直接消失反而像是没加载出来。
+             level 用 info（描边不实心）：中性计数，不该和真正需要处理的红色角标抢注意力。 -->
         <div class="status-tabs">
           <button
             :class="['status-tab', { active: statusFilter === '' }]"
             @click="statusFilter = ''"
           >
-            全部
+            <span>全部</span>
+            <DdBadge
+              :value="statusCounts.all"
+              level="info"
+              show-zero
+              title="全部应用"
+            />
           </button>
           <button
             :class="['status-tab', { active: statusFilter === 'enabled' }]"
             @click="statusFilter = 'enabled'"
           >
-            已启用
+            <span>已启用</span>
+            <DdBadge
+              :value="statusCounts.enabled"
+              level="info"
+              show-zero
+              title="已启用应用"
+            />
           </button>
           <button
             :class="['status-tab', { active: statusFilter === 'disabled' }]"
             @click="statusFilter = 'disabled'"
           >
-            已禁用
+            <span>已禁用</span>
+            <DdBadge
+              :value="statusCounts.disabled"
+              level="info"
+              show-zero
+              title="已禁用应用"
+            />
           </button>
         </div>
         <el-input
@@ -287,24 +309,24 @@
             }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="180" align="center">
+        <!-- 原来是 4 个 link 按钮平铺、没有容器，间距全靠 EP 自带的
+             `.el-button + .el-button { margin-left: 12px }`，占掉 180px 列宽，
+             而且「删除」和「编辑」并排、字号一样大，误点的代价却完全不同。
+             改成 Split Button：主体是最常用的「编辑」，其余收进菜单，
+             删除标红并用分隔线隔开。列宽 180 → 130。 -->
+        <!-- fixed="right"：这张表列多（应用名/Key/Secret/权限/调用数/状态/创建时间），
+             1249px 视口下实测横向溢出 323px，不固定的话操作列整个被挤出可视区，
+             用户得先横向滚动才点得到。收窄列宽只是把溢出从 373 减到 323，治不了根。 -->
+        <el-table-column label="操作" width="130" align="center" fixed="right">
           <template #default="{ row }">
-            <el-button type="primary" link size="small" @click="editApp(row)"
-              >编辑</el-button
-            >
-            <el-button
-              type="warning"
-              link
+            <DdSplitButton
+              label="编辑"
+              type="primary"
               size="small"
-              @click="resetSecret(row)"
-              >重置</el-button
-            >
-            <el-button type="info" link size="small" @click="showLogs(row)"
-              >日志</el-button
-            >
-            <el-button type="danger" link size="small" @click="deleteApp(row)"
-              >删除</el-button
-            >
+              :items="appActionItems"
+              @click="editApp(row)"
+              @command="(key: string) => onAppAction(key, row)"
+            />
           </template>
         </el-table-column>
       </el-table>
@@ -406,7 +428,13 @@
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="submitForm">确定</el-button>
+        <el-button
+          type="primary"
+          :loading="submitting"
+          :disabled="submitting"
+          @click="submitForm"
+          >确定</el-button
+        >
       </template>
     </el-dialog>
 
@@ -512,6 +540,10 @@ import {
   View,
 } from "@element-plus/icons-vue";
 import { useResponsive } from "@/composables/useResponsive";
+import { formatDateTime } from "@/utils/datetime";
+import DdBadge from "@/components/ui/DdBadge.vue";
+import DdSplitButton from "@/components/ui/DdSplitButton.vue";
+import type { SplitButtonItem } from "@/components/ui/DdSplitButton.vue";
 
 const apps = ref<any[]>([]);
 const loading = ref(false);
@@ -519,6 +551,8 @@ const dialogVisible = ref(false);
 const secretDialogVisible = ref(false);
 const logsDialogVisible = ref(false);
 const editingApp = ref<any>(null);
+// 应用创建/更新的在途锁：连点会连开多个密钥弹窗，必须把整段（含弹密钥）锁在窗口内
+const submitting = ref(false);
 const secretData = ref<any>({});
 const callLogs = ref<any[]>([]);
 const logTotal = ref(0);
@@ -534,6 +568,10 @@ const apiPageSize = 10;
 
 const form = ref({ name: "", scopesList: [] as string[], rate_limit: 0 });
 
+// 这七加一项必须与服务端 middleware.OpenAPIAccess("...") 实际强制的 8 个 scope 一致。
+// 少一项的后果不是报错，而是「这个权限永远勾不上」——建出来的应用调该类接口一律 403，
+// 且界面上看不出少了什么。改这里之前先跑一遍：
+//   grep -rho 'OpenAPIAccess("[a-z]*")' server --include=*.go | sort -u
 const scopeOptions = [
   { label: "任务管理", value: "tasks" },
   { label: "脚本管理", value: "scripts" },
@@ -541,6 +579,7 @@ const scopeOptions = [
   { label: "订阅管理", value: "subscriptions" },
   { label: "日志查看", value: "logs" },
   { label: "系统信息", value: "system" },
+  { label: "通知渠道", value: "notifications" },
   { label: "系统备份", value: "backup" },
 ];
 
@@ -601,28 +640,60 @@ const maskKey = (key: string): string => {
   return key.substring(0, 3) + "***" + key.substring(key.length - 5);
 };
 
-function formatDateTime(value?: string | null) {
-  // 统一输出中文时间，避免不同浏览器环境下格式漂移
-  if (!value) return "-";
-  return new Date(value).toLocaleString("zh-CN", { hour12: false });
+// 时间格式化已收编到 utils/datetime.ts（全站曾有 8 种写法，同一个「创建时间」在不同
+// 页面长得不一样）。这里保留一个同名薄封装是为了不动模板里的 4 处调用点。
+
+/**
+ * 操作列 Split Button 的菜单项。
+ *
+ * 主体是「编辑」——最常用、且点错了也只是打开一个弹窗，代价最小。
+ * 删除必须留在菜单里并加 divided + danger：它是不可撤销操作，
+ * 绝不能出现在「点了就执行」的主体位置上。
+ */
+const appActionItems: SplitButtonItem[] = [
+  { key: "reset", label: "重置密钥" },
+  { key: "logs", label: "调用日志" },
+  { key: "delete", label: "删除", danger: true, divided: true },
+];
+
+function onAppAction(key: string, row: any) {
+  if (key === "reset") resetSecret(row);
+  else if (key === "logs") showLogs(row);
+  else if (key === "delete") deleteApp(row);
 }
 
+// 只应用搜索词、不应用状态筛选的中间层。
+//
+// 拆出这一层是为了让「状态分段控件上的计数」和「切过去之后真正看到的条数」永远一致：
+// 计数的基数必须排除状态筛选自身（否则选中「已启用」时「已禁用」永远显示 0），
+// 但必须保留搜索词（搜完再看计数会和实际条数对不上）。
+// 两个筛选是交集关系，先筛哪个结果都一样，这次调换顺序不改变 filteredApps 的输出。
+const appsMatchingKeyword = computed(() => {
+  const kw = searchKeyword.value.trim().toLowerCase();
+  if (!kw) return apps.value;
+  return apps.value.filter(
+    (a) =>
+      (a.name || "").toLowerCase().includes(kw) ||
+      (a.app_key || "").toLowerCase().includes(kw),
+  );
+});
+
 const filteredApps = computed(() => {
-  let list = apps.value;
-  if (statusFilter.value === "enabled") {
-    list = list.filter((a) => a.enabled);
-  } else if (statusFilter.value === "disabled") {
-    list = list.filter((a) => !a.enabled);
-  }
-  if (searchKeyword.value.trim()) {
-    const kw = searchKeyword.value.trim().toLowerCase();
-    list = list.filter(
-      (a) =>
-        (a.name || "").toLowerCase().includes(kw) ||
-        (a.app_key || "").toLowerCase().includes(kw),
-    );
-  }
+  const list = appsMatchingKeyword.value;
+  if (statusFilter.value === "enabled") return list.filter((a) => a.enabled);
+  if (statusFilter.value === "disabled") return list.filter((a) => !a.enabled);
   return list;
+});
+
+// 状态标签页的计数。
+//
+// 能这么算的前提：本页是【客户端筛选】——openApiApi.list() 一次性把全量应用拿回 apps.value，
+// 状态/搜索/分页全在 computed 里做，点标签只改 statusFilter，不会重新发请求。
+// 所以这里数出来的是真实总数，不是拿当前页冒充。
+const statusCounts = computed(() => {
+  const list = appsMatchingKeyword.value;
+  const enabled = list.filter((a) => a.enabled).length;
+  return { all: list.length, enabled, disabled: list.length - enabled };
 });
 
 const pagedApps = computed(() => {
@@ -690,6 +761,8 @@ const submitForm = async () => {
     scopes: scopesToString(form.value.scopesList),
     rate_limit: form.value.rate_limit,
   };
+  // 名称校验通过后才置位，复位放 finally
+  submitting.value = true;
   try {
     if (editingApp.value) {
       await openApiApi.update(editingApp.value.id, payload);
@@ -704,6 +777,8 @@ const submitForm = async () => {
     loadApps();
   } catch (err: any) {
     ElMessage.error(err?.response?.data?.error || "操作失败");
+  } finally {
+    submitting.value = false;
   }
 };
 
@@ -883,18 +958,25 @@ onMounted(loadApps);
   }
 }
 
-// 状态分段控件：与定时任务页/订阅页一致的胶囊容器 + 选中态白底品牌色 + 卡片阴影令牌
+// 状态分段控件：与定时任务页/订阅页一致的分段容器；选中态靠底色+品牌色文字区分，不再用阴影浮起
 .status-tabs {
   display: inline-flex;
   background: var(--el-fill-color-light);
-  border-radius: var(--dd-radius-sm);
+  // 分段控件的灰底槽属控件类表面 → control 档（与槽内的项同档，两者一致才不会露出内外错位的角）
+  border-radius: var(--dd-radius-control);
   padding: 3px;
   gap: 2px;
 }
 
 .status-tab {
+  // inline-flex + gap：标签文字与计数角标并排，间距交给 gap，不用 margin 拼。
+  // 角标高 18px，与 13px 文字的行盒高度基本齐平，加上去不会把分段控件顶高。
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   padding: 6px 14px;
-  border-radius: 7px;
+  // 分段项属控件类表面 → control 档
+  border-radius: var(--dd-radius-control);
   border: none;
   background: transparent;
   color: var(--el-text-color-secondary);
@@ -903,8 +985,7 @@ onMounted(loadApps);
   cursor: pointer;
   transition:
     color var(--dd-motion-fast) var(--dd-ease-standard),
-    background-color var(--dd-motion-fast) var(--dd-ease-standard),
-    box-shadow var(--dd-motion-fast) var(--dd-ease-standard);
+    background-color var(--dd-motion-fast) var(--dd-ease-standard);
   white-space: nowrap;
   &:hover {
     color: var(--el-text-color-primary);
@@ -912,16 +993,15 @@ onMounted(loadApps);
   &.active {
     background: var(--el-bg-color);
     color: var(--el-color-primary);
-    box-shadow: var(--dd-shadow-card);
     font-weight: 600;
   }
 }
 
-// 表格卡：圆角/阴影/边框全部对齐卡片令牌（本页为滚动页，无需 fixed 高度链）
+// 表格卡：1px 边框划分层次，不再用阴影浮起（本页为滚动页，无需 fixed 高度链）
 .table-card {
   background: var(--el-bg-color);
-  border-radius: var(--dd-card-radius);
-  box-shadow: var(--dd-shadow-card);
+  // 表格容器属容器类表面 → surface 档；overflow:hidden 让内部贴边的表头/行自动被圆角裁角
+  border-radius: var(--dd-radius-surface);
   border: 1px solid var(--el-border-color-lighter);
   overflow: hidden;
 }
@@ -932,6 +1012,7 @@ onMounted(loadApps);
   gap: 10px;
 }
 
+// 应用头像：形状承载语义（圆形=头像/身份标识），两种圆角模式下都固定正圆，不吃 --dd-radius-* 令牌
 .app-avatar {
   width: 34px;
   height: 34px;
@@ -986,7 +1067,8 @@ onMounted(loadApps);
   word-break: break-all;
   background: var(--el-fill-color-light);
   padding: 4px 8px;
-  border-radius: 4px;
+  // 表格内的 key 展示块是行内小型交互块（可复制），归控件类 → control 档
+  border-radius: var(--dd-radius-control);
   border: 1px solid var(--el-border-color-lighter);
   font-family: var(--dd-font-mono);
   flex: 1;
@@ -1049,20 +1131,15 @@ onMounted(loadApps);
 }
 
 .info-card {
-  // 信息卡：色面/边框/阴影统一走令牌，明暗自动适配（原写死白底浅灰会在暗色串色）
+  // 信息卡：1px 边框，色面走令牌明暗自动适配；hover 只加深描边，不上浮
   background: var(--el-bg-color);
-  transition:
-    transform var(--dd-motion-fast) var(--dd-ease-standard),
-    box-shadow var(--dd-motion-fast) var(--dd-ease-standard),
-    border-color var(--dd-motion-fast) var(--dd-ease-standard);
-  border-radius: var(--dd-card-radius);
+  transition: border-color var(--dd-motion-fast) var(--dd-ease-standard);
+  // 信息卡属容器类表面 → surface 档
+  border-radius: var(--dd-radius-surface);
   padding: 24px;
-  box-shadow: var(--dd-shadow-card);
   border: 1px solid var(--el-border-color-lighter);
 
   &:hover {
-    transform: translateY(-2px);
-    box-shadow: var(--dd-shadow-card-hover);
     border-color: color-mix(
       in srgb,
       var(--el-color-primary) 18%,
@@ -1080,7 +1157,8 @@ onMounted(loadApps);
   &__icon {
     width: 40px;
     height: 40px;
-    border-radius: 10px;
+    // 40×40 图标色底属控件类表面 → control 档（不做成正圆，避免与头像混淆）
+    border-radius: var(--dd-radius-control);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1116,7 +1194,8 @@ onMounted(loadApps);
 
 .secret-display-card {
   background: var(--el-fill-color-light);
-  border-radius: 8px;
+  // 弹窗内的密钥展示区块属容器类表面 → surface 档
+  border-radius: var(--dd-radius-surface);
   padding: 20px;
   border: 1px solid var(--el-border-color-lighter);
 }
@@ -1143,7 +1222,8 @@ onMounted(loadApps);
   gap: 8px;
   background: var(--el-fill-color-blank);
   border: 1px solid var(--el-border-color);
-  border-radius: 6px;
+  // 只读取值框（外观等同 input，且卡片有 20px 内边距不贴边）→ control 档
+  border-radius: var(--dd-radius-control);
   padding: 10px 12px;
 }
 
@@ -1238,16 +1318,21 @@ onMounted(loadApps);
   }
 }
 
+// .info-cards 是本页唯一还没入场的卡片级容器（安全建议 / 开发者文档两张说明卡）。
+// 它跟表格卡是同一层级的内容块，漏掉它会让页面下半截显得是「另一张页面拼上来的」。
 .toolbar,
 .table-card,
-.dd-mobile-list {
+.dd-mobile-list,
+.info-cards {
   animation: dd-openapi-rise-in var(--dd-motion-page) var(--dd-ease-decelerate)
     both;
 }
 
-// 轻微错落：工具条先入，表格卡/移动列表略晚
+// 轻微错落：工具条先入，表格卡/移动列表/说明卡略晚。
+// 只分两档、间隔 60ms —— 不给表格每一行做 stagger（行多会卡，且是设计系统硬约束）。
 .table-card,
-.dd-mobile-list {
+.dd-mobile-list,
+.info-cards {
   animation-delay: 60ms;
 }
 </style>
