@@ -87,6 +87,17 @@ if (-not $titleMatch.Success -or [string]::IsNullOrWhiteSpace($titleMatch.Groups
     Fail-Step "release-title marker exists but yields an empty summary; GitHub Release title would fall back to the bare tag."
 }
 Write-Host ("  release title -> {0}：{1}" -f $tagVersion, $titleMatch.Groups['summary'].Value)
+# Release body 里不许出现相对链接。已实测：gh api 取 v3.2.3 的 body，里面是
+# [定时任务不执行 / 没有日志](../task-not-running.md)，而 GitHub Release 页面把它渲染成
+# href="/linzixuanzz/daidai-panel/blob/task-not-running.md" —— 没有 ref、没有目录，是一个 404。
+# 根因是 Release body 没有「源文件路径」这个上下文，`../` 无从解析。
+# 所以从 v3.2.5 起本版 notes 一律写绝对 URL。历史文件不动：它们在仓库里点是对的，
+# 只是在 Release 页面上坏，改它们等于改历史陈述。
+$relativeLinks = [regex]::Matches($releaseNoteText, '\]\((?<target>\.{1,2}/[^)]*)\)')
+if ($relativeLinks.Count -gt 0) {
+    $samples = (($relativeLinks | ForEach-Object { $_.Groups['target'].Value } | Sort-Object -Unique) | Select-Object -First 5) -join ", "
+    Fail-Step "Release notes must use absolute URLs. Found relative link target(s): $samples`nA GitHub Release body has no source-file path context, so [x](../task-not-running.md) is rendered as href=`"/linzixuanzz/daidai-panel/blob/task-not-running.md`" - no ref, no directory, a guaranteed 404 (verified against the v3.2.3 release body).`nWrite https://github.com/linzixuanzz/daidai-panel/blob/main/docs/<file> instead. Historical notes are intentionally left alone."
+}
 $readmeContent = Get-Content -Path (Join-Path $repoRoot "README.md") -Raw -Encoding UTF8
 if (($readmeContent -notmatch [regex]::Escape($tagVersion)) -or ($readmeContent -notmatch [regex]::Escape("./docs/release-notes/$tagVersion.md"))) {
     Fail-Step "README latest version block not synced."

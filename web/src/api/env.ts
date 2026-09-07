@@ -8,8 +8,16 @@ export type EnvPayload = {
   groups?: string[]
 }
 
+/** /envs/names 的一项：变量名 + 全库同名条数（不随当前筛选变化） */
+export type EnvNameOption = {
+  name: string
+  count: number
+}
+
 export const envApi = {
-  list(params?: { keyword?: string; group?: string; groups?: string; enabled?: boolean; page?: number; page_size?: number; all?: 0 | 1 }) {
+  // names 是【精确】匹配的变量名筛选（逗号分隔多值，之间是 OR），与 keyword / groups / enabled 之间是 AND。
+  // 与 keyword 的 LIKE 模糊搜索不是一回事：names=JD_COOKIE 不会带出 JD_COOKIE_EXTRA。
+  list(params?: { keyword?: string; group?: string; groups?: string; names?: string; enabled?: boolean; page?: number; page_size?: number; all?: 0 | 1 }) {
     return request.get('/envs', { params }) as Promise<{ data: any[]; total: number; page: number; page_size: number }>
   },
 
@@ -71,6 +79,10 @@ export const envApi = {
 
   groups() {
     return request.get('/envs/groups') as Promise<{ data: string[] }>
+  },
+
+  names() {
+    return request.get('/envs/names') as Promise<{ data: EnvNameOption[] }>
   },
 
   export(ids?: number[]) {

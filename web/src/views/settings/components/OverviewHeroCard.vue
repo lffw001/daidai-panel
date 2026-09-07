@@ -2,6 +2,7 @@
 import { computed } from 'vue'
 import { MAGISK_STOP_SUPPORTED_SHELL_VERSION, type PanelUpdateStatus } from '@/api/system'
 import { formatDateTime } from '@/utils/datetime'
+import { renderMarkdown } from '@/utils/markdown'
 import UpdateProgressDialog from './UpdateProgressDialog.vue'
 
 const props = defineProps<{
@@ -54,6 +55,21 @@ const canStopPanel = computed(() => isMagiskDeployment.value && magiskShellVersi
 const stopPanelDisabledTip = computed(
   () => `此功能需重新刷入一次模块 ZIP（当前外壳版本 ${magiskShellVersion.value}，需要 ${MAGISK_STOP_SUPPORTED_SHELL_VERSION}）。在线升级只更新面板程序与前端，覆盖不到模块脚本。`
 )
+
+// ---- 更新日志的 markdown 渲染 --------------------------------------------
+// 正文来自 GitHub Release body，也就是 docs/release-notes/vX.Y.Z.md 的逐字副本。
+// 整段套 try/catch：这个弹窗在 has_update 为真时是自动弹出的，渲染器一旦抛异常，
+// 任何人点「检查系统更新」都会看到一块白。出错就回落到下面那个 <pre> 纯文本。
+const releaseNotesHtml = computed(() => {
+  const notes = props.updateInfo?.release_notes
+  if (typeof notes !== 'string' || notes.trim() === '') return ''
+  try {
+    return renderMarkdown(notes)
+  } catch (error) {
+    console.warn('[release-notes] markdown 渲染失败，回落纯文本展示', error)
+    return ''
+  }
+})
 </script>
 
 <template>
@@ -186,7 +202,13 @@ const stopPanelDisabledTip = computed(
         <span v-if="updateInfo.release_name">{{ updateInfo.release_name }}</span>
         <span v-if="updateInfo.published_at">发布时间：{{ formatDateTime(updateInfo.published_at) }}</span>
       </div>
-      <pre class="release-notes-content">{{ updateInfo.release_notes || '当前版本未提供更新日志。' }}</pre>
+      <!-- 渲染成功走富文本；渲染失败或没有更新日志时，原样回落到改动前的 <pre> 纯文本 -->
+      <div
+        v-if="releaseNotesHtml"
+        class="release-notes-content release-notes-content--rendered"
+        v-html="releaseNotesHtml"
+      ></div>
+      <pre v-else class="release-notes-content">{{ updateInfo.release_notes || '当前版本未提供更新日志。' }}</pre>
     </div>
     <template #footer>
       <el-button @click="onCloseReleaseNotes">关闭</el-button>
@@ -364,11 +386,150 @@ const stopPanelDisabledTip = computed(
   border-radius: var(--dd-radius-surface);
   background: var(--el-fill-color-lighter);
   border: 1px solid var(--el-border-color-light);
-  white-space: pre-wrap;
   word-break: break-word;
   line-height: 1.65;
-  font-family: var(--dd-font-mono);
   font-size: 13px;
+}
+
+// 纯文本兜底：markdown 渲染失败、或压根没有更新日志时用它，观感与改动前一致
+pre.release-notes-content {
+  white-space: pre-wrap;
+  font-family: var(--dd-font-mono);
+}
+
+// 渲染态。正文换回界面字体（整块等宽读中文很难受），只有 code / pre 保留等宽。
+// 颜色一律走 Element Plus 的语义变量，明暗两套主题自动跟随，不写死任何色值。
+.release-notes-content--rendered {
+  font-family: var(--dd-font-ui);
+  color: var(--el-text-color-primary);
+
+  :deep(> *:first-child) { margin-top: 0; }
+  :deep(> *:last-child) { margin-bottom: 0; }
+
+  :deep(h1) {
+    font-size: 17px;
+    font-weight: 700;
+    line-height: 1.4;
+    margin: 18px 0 10px;
+  }
+
+  :deep(h2) {
+    font-size: 15px;
+    font-weight: 700;
+    line-height: 1.4;
+    margin: 20px 0 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--el-border-color-lighter);
+  }
+
+  :deep(h3) {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 16px 0 6px;
+  }
+
+  :deep(p) { margin: 8px 0; }
+
+  :deep(ul),
+  :deep(ol) {
+    margin: 8px 0;
+    padding-left: 22px;
+  }
+
+  :deep(li) { margin: 4px 0; }
+
+  :deep(li > ul),
+  :deep(li > ol) { margin: 4px 0; }
+
+  :deep(hr) {
+    height: 0;
+    border: none;
+    border-top: 1px solid var(--el-border-color-light);
+    margin: 16px 0;
+  }
+
+  :deep(blockquote) {
+    margin: 10px 0;
+    padding: 6px 12px;
+    border-left: 3px solid var(--el-border-color);
+    // 只圆右侧两角，左边那条竖线要贴齐
+    border-radius: 0 var(--dd-radius-control) var(--dd-radius-control) 0;
+    background: var(--el-fill-color);
+    color: var(--el-text-color-secondary);
+  }
+
+  :deep(blockquote > *:first-child) { margin-top: 0; }
+  :deep(blockquote > *:last-child) { margin-bottom: 0; }
+
+  :deep(code) {
+    padding: 1px 5px;
+    border-radius: var(--dd-radius-control);
+    background: var(--el-fill-color);
+    color: var(--el-color-primary);
+    font-family: var(--dd-font-mono);
+    font-size: 12px;
+    word-break: break-all;
+  }
+
+  :deep(pre) {
+    margin: 10px 0;
+    padding: 12px;
+    // 代码块不折行，宽了就在自己这一块里横向滚，不撑破弹窗
+    overflow-x: auto;
+    border-radius: var(--dd-radius-surface);
+    background: var(--el-fill-color);
+    border: 1px solid var(--el-border-color-lighter);
+  }
+
+  :deep(pre code) {
+    padding: 0;
+    background: none;
+    color: var(--el-text-color-primary);
+    white-space: pre;
+    word-break: normal;
+  }
+
+  :deep(strong) {
+    font-weight: 700;
+    color: var(--el-text-color-primary);
+  }
+
+  :deep(a) {
+    color: var(--el-color-primary);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  // 表格的横向滚动容器必须套在外层：弹窗只有 720px 宽，
+  // 而历史上有过一版 13 张表（v3.1.0），宽表不给横向滚动会直接把弹窗撑破。
+  :deep(.md-table-wrap) {
+    margin: 10px 0;
+    overflow-x: auto;
+    border: 1px solid var(--el-border-color-light);
+    border-radius: var(--dd-radius-surface);
+  }
+
+  :deep(table) {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12.5px;
+  }
+
+  :deep(th),
+  :deep(td) {
+    padding: 7px 10px;
+    text-align: left;
+    vertical-align: top;
+    border-bottom: 1px solid var(--el-border-color-lighter);
+  }
+
+  :deep(th) {
+    background: var(--el-fill-color);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  :deep(tbody tr:last-child td) { border-bottom: none; }
 }
 
 @media (max-width: 768px) {

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, nextTick, computed, watch, type CSSProperties } from 'vue'
-import { envApi } from '@/api/env'
+import { envApi, type EnvNameOption } from '@/api/env'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { copyText } from '@/utils/clipboard'
 import EnvBatchGroupDialog from './components/EnvBatchGroupDialog.vue'
@@ -37,6 +37,13 @@ const pageSize = ref(initialPageSizeSelection === 'all' ? envAllFetchBatchSize :
 const keyword = ref('')
 const groupFilters = ref<string[]>([])
 const groups = ref<string[]>([])
+// 变量名筛选：与分组筛选并列的一等筛选维度（issue #118 建议 2）。
+// 同名多条是刻意功能（多账号场景，见 server/model/env_var.go），所以「按变量名收敛」是高频诉求，
+// 而搜索框那套四字段模糊 OR 根本限定不了字段。
+const nameFilters = ref<string[]>([])
+// 选项里的 count 是【全库同名条数】（服务端 /envs/names 的口径），不跟随当前筛选：
+// 它与后端 PUT /envs/by-name 冲突时那句「存在 N 条名为 X 的环境变量」是同一个 N。
+const nameOptions = ref<EnvNameOption[]>([])
 const selectedIds = ref<number[]>([])
 const selectedIdSet = computed(() => new Set(selectedIds.value))
 const selectedCountInCurrentPage = computed(() =>
@@ -337,6 +344,8 @@ async function loadData() {
   try {
     const params = {
       keyword: keyword.value || undefined,
+      // 变量名受 ^[A-Za-z_][A-Za-z0-9_]*$ 约束、不含逗号，所以这里可以放心用逗号拼多值。
+      names: nameFilters.value.length > 0 ? nameFilters.value.join(',') : undefined,
       groups: groupFilters.value.length > 0 ? groupFilters.value.join(',') : undefined,
       enabled: statusFilter.value === 'enabled' ? true : statusFilter.value === 'disabled' ? false : undefined
     }
@@ -383,10 +392,22 @@ async function loadGroups() {
   }
 }
 
+// 变量名下拉的选项源。名字与条数只在「新增 / 改名 / 删除 / 导入」后才会变，
+// 所以不跟着翻页、搜索、切筛选一起刷，只在这些真正改动数据的地方补一次。
+async function loadNames() {
+  try {
+    const res = await envApi.names()
+    nameOptions.value = Array.isArray(res.data) ? res.data : []
+  } catch {
+    // ignore
+  }
+}
+
 onMounted(() => {
   queueDesktopTableReady()
   void loadData()
   void loadGroups()
+  void loadNames()
 })
 
 watch(isMobile, () => {
@@ -516,6 +537,23 @@ function handleGroupSelect() {
   void loadData()
 }
 
+function handleNameSelect() {
+  page.value = 1
+  void loadData()
+}
+
+// 名称单元格点一下 = 「只看这个变量名的全部条目」。
+// 这是同名多条场景里最高频的诉求，做成【替换】而不是【追加】：用户点的是「只看这个」，
+// 追加的话原来选中的其它名字还留在结果里，与点击时的心理预期相反。
+// 已经就是这一个名字时直接返回，别白刷一次列表。
+function handleFilterByName(name: string) {
+  if (!name) return
+  if (nameFilters.value.length === 1 && nameFilters.value[0] === name) return
+  nameFilters.value = [name]
+  page.value = 1
+  void loadData()
+}
+
 function handlePageChange(newPage: number) {
   page.value = newPage
   void loadData()
@@ -586,6 +624,8 @@ async function handleSave(data: EnvFormModel | EnvFormModel[]) {
     showEditDialog.value = false
     void loadData()
     void loadGroups()
+    // 新建会多出一条同名记录、编辑可能改掉变量名，两种都会让下拉里的名字或计数过期
+    void loadNames()
   } catch {
     ElMessage.error(editDialogMode.value === 'create' ? '创建失败' : '更新失败')
   } finally {
@@ -630,6 +670,7 @@ async function handleDelete(id: number) {
     await envApi.delete(id)
     ElMessage.success('删除成功')
     void loadData()
+    void loadNames()
   } catch {
     // cancelled
   }
@@ -693,6 +734,7 @@ async function handleBatchDelete() {
     ElMessage.success('批量删除成功')
     clearTableSelection()
     void loadData()
+    void loadNames()
   } catch {
     // cancelled
   }
@@ -717,6 +759,7 @@ async function confirmBatchRename(payload: { name: string }) {
     showBatchRenameDialog.value = false
     clearTableSelection()
     void loadData()
+    void loadNames()
   } catch (err: any) {
     ElMessage.error(err?.response?.data?.error || err?.message || '批量改名失败')
   } finally {
@@ -780,6 +823,7 @@ async function handleImport(payload: { envs: any[]; mode: string }) {
     showImportDialog.value = false
     void loadData()
     void loadGroups()
+    void loadNames()
   } catch {
     ElMessage.error('导入失败')
   } finally {
@@ -896,8 +940,13 @@ function handleStatusFilter(value: '' | 'enabled' | 'disabled') {
            真做交叉淡出会有一段两排控件互相透视的重影，别为了「对称」把 visibility 加进 transition。
            左槽自身的 flex 尺寸全程不变，右区不会被 space-between 甩位；
            更关键的是左槽高度恒等于 max(筛选区高度, 批量区高度)，与当前显示哪一支无关 ⇒ 勾选/取消永不改变工具栏高度。
-           本页两支的换行阈值不一样（筛选区约 724px：3 个 tab + 260px 搜索框 + 220px 分组筛选；
-           批量区 6 个按钮 + 计数且带 flex-wrap），所以窄窗口下【两个方向都可能出现】——
+           本页两支的换行阈值不一样，所以窄窗口下【两个方向都可能出现】——
+           筛选区原来是「3 个 tab + 260px 搜索框 + 220px 分组筛选」≈ 724px 定宽；
+           v3.2.5 加入「变量名筛选」后按定宽算会涨到 ~966px，1280 宽 + 侧栏展开时必然换行，
+           所以三个输入控件改成【可伸缩】：flex-basis 取收缩下限（160/150/150）、max-width 取理想宽（260/220/220），
+           换行阈值 = 230(tabs) + 3×12(gap) + 160 + 150 + 150 ≈ 726px，与加控件之前【几乎不变】；
+           宽屏有余量时再长回 260/220/220，看起来和以前一样。详见样式里 &__search / &__group-filter / &__name-filter 的注释。
+           批量区则是 6 个按钮 + 计数且带 flex-wrap——
            以前只留一支在 DOM 里的话，勾选那一刻左槽忽高忽矮，dd-fixed-page 下 .table-card 是 flex:1 1 0，
            工具栏差多少表格就反向补多少 ⇒ 列表跳一下。换行点又由内容宽决定，而内容宽随侧栏展开/收起漂 156px
            （220px vs 64px），媒体查询锁不住，只能让两支同时参与撑高。
@@ -932,6 +981,27 @@ function handleStatusFilter(value: '' | 'enabled' | 'disabled') {
             @change="handleGroupSelect"
           >
             <el-option v-for="g in groups" :key="g" :label="g" :value="g" />
+          </el-select>
+          <!-- 🔴 filterable 是必须的，不要照抄上面分组筛选那一个：分组通常只有个位数，
+               变量名却可能上百个（同名多条是刻意功能，每个账号一条），不能打字过滤就只能一路滚。
+               标签渲染成「JD_COOKIE (3)」，括号里是全库同名条数，与后端 by-name 冲突文案里的 N 同源。 -->
+          <el-select
+            v-model="nameFilters"
+            placeholder="变量名筛选"
+            multiple
+            filterable
+            collapse-tags
+            collapse-tags-tooltip
+            clearable
+            class="toolbar__name-filter"
+            @change="handleNameSelect"
+          >
+            <el-option
+              v-for="option in nameOptions"
+              :key="option.name"
+              :label="`${option.name} (${option.count})`"
+              :value="option.name"
+            />
           </el-select>
         </div>
         <div class="batch-actions" :class="{ 'is-swapped-out': !(selectedCountInCurrentPage > 0) }">
@@ -1008,7 +1078,21 @@ function handleStatusFilter(value: '' | 'enabled' | 'disabled') {
                       :title="row.enabled ? '已启用' : '已禁用'"
                       :aria-label="row.enabled ? '已启用' : '已禁用'"
                     />
+                    <!-- 与桌面表格同一套结构（同样的类、同样的 handler）：名称文本是 <span>、
+                         「只看这个变量名」由后面那颗图标按钮承担，理由见桌面表格那一处的注释。
+                         触屏这边收益更直接：长按 <span> 才会弹出系统的文本选择/复制浮层，
+                         长按 <button> 不会（而卡片的长按拖拽只绑在 .env-mobile-drag-handle 上，不抢这个手势）。
+                         这里不套 el-tooltip：触屏没有 hover，同卡片里「值」的复制按钮也是裸按钮，保持一致。 -->
                     <span class="env-name">{{ row.name }}</span>
+                    <el-button
+                      class="env-name-filter-btn"
+                      size="small"
+                      link
+                      :aria-label="`只看变量名 ${row.name} 的全部条目`"
+                      @click.stop="handleFilterByName(row.name)"
+                    >
+                      <el-icon :size="14"><Search /></el-icon>
+                    </el-button>
                     <span v-if="isTopPinned(row)" class="pinned-chip">
                       <el-icon><Top /></el-icon>
                       置顶
@@ -1127,11 +1211,14 @@ function handleStatusFilter(value: '' | 'enabled' | 'disabled') {
         style="width: 100%"
       >
         <el-table-column type="selection" width="44" />
-        <!-- min-width 188 → 204：名称前多了一枚 8px 圆点 + 8px gap = 16px。
+        <!-- min-width 188 → 204 → 230，两笔账都记在这里。
              .env-name-wrap 是 flex + gap:8px，多插一个子元素就多出一份 gap，
-             所以净增是「圆点自身 8px」+「新增的那一份 gap 8px」，不是只有圆点的 8px；
-             不补回来的话名称的可见宽度会净减 16px，长变量名的省略号会提前出现。 -->
-        <el-table-column prop="name" label="名称" min-width="204">
+             所以每一笔净增都是「新元素自身宽度」+「新增的那一份 gap 8px」，不是只有元素自身：
+               188 → 204：名称【前】多了一枚 8px 状态圆点 → 8 + 8 = 16px；
+               204 → 230：名称【后】多了一颗「只看这个变量名」图标按钮 →
+                          按钮自身 18px（图标 14 + .env-name-filter-btn 的 padding 2×2）+ 8 = 26px。
+             不补回来的话名称的可见宽度会净减同样多，长变量名的省略号会提前出现。 -->
+        <el-table-column prop="name" label="名称" min-width="230">
           <template #default="{ row }">
             <div class="env-name-wrap">
               <!-- 状态圆点：独立的「状态」列已删除，启用/禁用状态改由这枚圆点表达
@@ -1144,7 +1231,32 @@ function handleStatusFilter(value: '' | 'enabled' | 'disabled') {
                 :title="row.enabled ? '已启用' : '已禁用'"
                 :aria-label="row.enabled ? '已启用' : '已禁用'"
               />
-              <span class="env-name">{{ row.name }}</span>
+              <!-- 🔴 名称文本必须是 <span>，别再改回 <button>：这一列没有常驻复制按钮，
+                   鼠标划选就是复制变量名的唯一路径（想不划选就只剩「打开编辑弹窗从 input 里复制」），
+                   而 <button> 这类表单控件浏览器不从它的 mousedown 起始文本选区，
+                   双击（选词的自然手势）还会连触发两次点击 —— 第一次设筛选、第二次被
+                   handleFilterByName 的等值 guard 挡掉，用户得到的是「列表被筛了」而不是「选中了一个词」。
+                   :title 挂全名：名称超长时这一格只剩省略号，不挂就没有任何办法看到完整变量名
+                   （「值」「备注」两列本来也是这么挂的）。 -->
+              <span class="env-name" :title="row.name">{{ row.name }}</span>
+              <!-- 「点一下 = 只看这个变量名的全部条目」这个入口没有取消，只是从名称文本上外移到这颗独立图标按钮：
+                   入口还在、还是点一下，但它落在名称文本【之外】，划选名称不会再顺带把列表筛掉。
+                   用 el-button（渲染出来的就是 <button>）而不是给 span 挂 @click —— 可点的东西必须能 Tab 聚焦、
+                   能回车触发、能被读屏念成按钮；图标按钮没有可见文字，所以另挂 aria-label 作为无障碍名称
+                   （el-tooltip 只负责鼠标悬停时的可见提示，构不成元素的无障碍名称）。
+                   尺寸 / 配色 / 过渡与「值」列的 .env-copy-btn 逐条对齐，同一张表里的行内图标按钮保持一款。
+                   @click.stop 是防御性的：本行没有行级点击，但拖拽克隆/未来的行点击都可能冒泡上来。 -->
+              <el-tooltip content="只看这个变量名" placement="top">
+                <el-button
+                  class="env-name-filter-btn"
+                  size="small"
+                  link
+                  :aria-label="`只看变量名 ${row.name} 的全部条目`"
+                  @click.stop="handleFilterByName(row.name)"
+                >
+                  <el-icon :size="14"><Search /></el-icon>
+                </el-button>
+              </el-tooltip>
               <span v-if="isTopPinned(row)" class="pinned-chip">
                 <el-icon><Top /></el-icon>
                 置顶
@@ -1421,12 +1533,33 @@ function handleStatusFilter(value: '' | 'enabled' | 'disabled') {
     min-height: 39px;
   }
 
+  // 三个输入控件：定宽 → 可伸缩。
+  //
+  // v3.2.5 加了「变量名筛选」，按原来的定宽（260 + 220 + 新增 220）筛选区自然宽会从 ~724px 涨到 ~966px，
+  // 而 1280 宽 + 侧栏展开时左槽只有约 805px（1280 − 221 侧栏 − 40 页面内边距 − ~202 右区 − 12 gap），
+  // 必然换成两行、白吃掉表格 ~50px 高度。
+  //
+  // 解法是让 flex-basis 取【收缩下限】、max-width 取【理想宽】：
+  // 换行是按 flex-basis（hypothetical main size）算的，所以阈值只由下限决定 ——
+  //   230(tabs) + 3×12(gap) + 160 + 150 + 150 ≈ 726px，和加控件之前的 ~724px 基本持平，换行点没有被推高；
+  // 而有余量时 flex-grow 会把它们长回 260 / 220 / 220，宽屏观感与以前一致。
+  // grow 权重 2:1:1 是刻意的：余量优先补给搜索框，它是最常用、最吃宽度的那个。
+  //
+  // 🔴 不要改回 width：写死宽度换行阈值就重新变成 966px，1280 + 展开侧栏必然两行。
+  // 🔴 也不要只给搜索框设 flex 而让另外两个保持定宽：换行阈值取的是三者 basis 之和，漏一个就白做。
   &__search {
-    width: 260px;
+    flex: 2 1 160px;
+    max-width: 260px;
   }
 
   &__group-filter {
-    width: 220px;
+    flex: 1 1 150px;
+    max-width: 220px;
+  }
+
+  &__name-filter {
+    flex: 1 1 150px;
+    max-width: 220px;
   }
 }
 
@@ -1806,15 +1939,46 @@ function handleStatusFilter(value: '' | 'enabled' | 'disabled') {
   min-width: 0;
 }
 
+// 名称本体是一段【纯文本】（<span>），不是按钮也不是链接：可划选、可复制是硬要求，
+// 详见模板里那条 🔴 注释。所以这里既没有 cursor:pointer 也没有 hover 下划线 ——
+// 名称本身不可点，给它挂可点反馈只会骗人（真正可点的是旁边的 .env-name-filter-btn）。
+// 保留 --el-color-primary 是它一直以来的取色（等宽字 + 主题色 = 标识符强调，不是链接语义）。
+//
+// flex 从 `1`（= 1 1 0%）改成 `0 1 auto`：名称后面新增了 .env-name-filter-btn，
+// 名称若继续【撑满】整格，那颗按钮会被顶到名称列的最右缘、离它要操作的名字十几个字远，
+// 还紧贴着「值」列的文字，看着像是下一列的东西。改成不 grow 之后按钮紧跟在名字后面，
+// 与「值」列「文本 + 复制按钮」的排法一致。
+// 🔴 min-width:0 才是省略号能生效的真正前提（允许 flex 项收缩到 min-content 以下），别删；
+//    flex-shrink 保持默认的 1，所以名字变长时照样收缩出省略号。
+// 🔴 原来靠 flex:1 把「置顶」标签顶到右缘的效果没有丢，改由 .env-name-filter-btn 的
+//    margin-right:auto 承担（见下条规则），两处要一起看。
 .env-name {
   min-width: 0;
-  flex: 1;
+  flex: 0 1 auto;
   font-family: var(--dd-font-mono);
   font-size: 13px;
   color: var(--el-color-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+// 「只看这个变量名」按钮：桌面表格与移动卡片共用这一个类（跟 .env-name 一样两端同源）。
+// 除 margin-right 外，其余声明与「值」列的 .env-copy-btn 逐字相同 —— 同一张表里的行内图标按钮
+// 只有一款外观；padding 2px 也正是名称列 min-width 那笔账里按 18px 计的来源（图标 14 + 2×2），
+// 改动它要回去同步改列宽。
+// 没有 hover/opacity 门控：与 .env-copy-btn 同一条不变量（触屏没有 hover，且透明元素照样进 Tab 焦点序）。
+// 焦点环不用自己写：EP 的 el-button 自带 :focus-visible 样式，不像原来那个裸 <button> 需要手动补。
+.env-name-filter-btn {
+  flex-shrink: 0;
+  // 接手 .env-name 原来那份 flex:1 的活：本格的剩余空间全归这条 auto 边距，
+  // 于是按钮贴着名字、后面的「置顶」标签仍然靠在最右缘（与改动前逐像素一致）。
+  // 没有「置顶」标签的行看不出区别（空白本来就在右边），别当成冗余删掉。
+  margin-right: auto;
+  color: var(--el-text-color-secondary);
+  padding: 2px;
+  // 只留颜色过渡；时长走令牌而不是写死毫秒数，理由同 .env-copy-btn（写死的绕不过 reduced-motion 降级）
+  transition: color var(--dd-motion-fast) var(--dd-ease-standard);
 }
 
 // 置顶标签：纯色底 + 1px 边框（原胶囊渐变与内描边已去掉）
@@ -2106,7 +2270,7 @@ function handleStatusFilter(value: '' | 'enabled' | 'disabled') {
     gap: 10px;
 
     // 竖排下左槽由内容自然撑高：桌面那条 39px 下限是为了对齐单行工具栏，
-    // 这里筛选控件本来就要堆三行，留着只会在批量区那一支下面多出一截空白。
+    // 这里筛选控件本来就要堆四行（状态分段 / 搜索框 / 分组筛选 / 变量名筛选），留着只会在批量区那一支下面多出一截空白。
     // 左槽是 1×1 网格、子项默认就铺满整列宽，align-items 从 start 放回 stretch 让还显示着的那一支填满行高。
     // 注意：这条 min-height:0 与下面那条 display:none 是配套的——藏起来的那一支被拿出流之后，
     // 左槽高度就完全由还显示着的那一支说了算，不该再被 39px 顶着。
@@ -2120,12 +2284,15 @@ function handleStatusFilter(value: '' | 'enabled' | 'disabled') {
       gap: 10px;
     }
 
-    &__search {
+    // 🔴 竖排下必须把 flex 收回 `0 0 auto`：主轴变成【纵向】后，桌面那套
+    // `flex: 2 1 160px` 里的 160px 就变成了【高度】基准，grow 还会把控件按余量拉高，
+    // 三个筛选控件会被撑成一柱高块。max-width 同理要放开，否则 220px 会把满宽控件截短。
+    &__search,
+    &__group-filter,
+    &__name-filter {
+      flex: 0 0 auto;
       width: 100% !important;
-    }
-
-    &__group-filter {
-      width: 100% !important;
+      max-width: none;
     }
 
     &__right {
@@ -2136,7 +2303,7 @@ function handleStatusFilter(value: '' | 'enabled' | 'disabled') {
   // 移动端把藏起来的那一支直接从流里拿掉。
   // 桌面端留着它是为了锁死工具栏高度（dd-fixed-page 是定高 flex 列，工具栏差多少表格就反向补多少），
   // 但 dd-fixed-page 只在 ≥769px 生效，移动端是普通文档流、表格不会被工具栏挤压，
-  // 留着竖排的筛选区（状态分段 + 搜索框 + 分组筛选各占一行）会在批量态白占一大截空高。
+  // 留着竖排的筛选区（状态分段 + 搜索框 + 分组筛选 + 变量名筛选各占一行）会在批量态白占一大截空高。
   // 这条【只能】落在 ≤768px 内：写到外面桌面端就退回今天的跳动。
   .toolbar__filters.is-swapped-out,
   .batch-actions.is-swapped-out {

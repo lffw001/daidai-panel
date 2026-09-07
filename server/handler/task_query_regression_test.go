@@ -82,11 +82,19 @@ func TestTaskListKeepsPinnedDisabledTasksInPinnedArea(t *testing.T) {
 	}
 }
 
-func TestTaskListKeepsStableOrderWhenTaskStatusChangesToRunning(t *testing.T) {
+// 🔴 这条用例自 v1.9.5 起叫 TestTaskListKeepsStableOrderWhenTaskStatusChangesToRunning，
+// 断言的是「任务变成运行中时位置不许变」—— 与现在完全相反。
+// v3.2.5 按 issue #118 有意把这个行为翻转了：运行中的任务在默认排序里提到本区最前，
+// 因为正在跑的那几条是用户此刻唯一想看的，而它们平时散落在几百条任务里。
+// 所以这不是「顺手改了个测试来迁就实现」，是需求本身反向了，用例连名字一起重写。
+//
+// 顺带钉死边界：排队中（0.5）【不】提前。排队是几秒钟就过去的瞬时态，
+// 提上来只会让同一次运行多跳一次 —— 下面 "active third" 是排队中，它必须留在原位。
+func TestTaskListMovesRunningTaskToFrontOfItsGroup(t *testing.T) {
 	testutil.SetupTestEnv(t)
 
 	engine := newProtectedRouter()
-	user := testutil.MustCreateUser(t, "stable-order-operator", "operator")
+	user := testutil.MustCreateUser(t, "running-first-operator", "operator")
 	accessToken := testutil.MustCreateAccessToken(t, user.Username, user.Role)
 
 	tasks := []*model.Task{
@@ -139,14 +147,222 @@ func TestTaskListKeepsStableOrderWhenTaskStatusChangesToRunning(t *testing.T) {
 	}
 
 	wantNames := []string{
-		"active first",
+		// 运行中的那条从第二位提到第一位；
+		// 排队中的 "active third" 与空闲的 "active first" 之间的相对次序一个字节都没变。
 		"active second",
+		"active first",
 		"active third",
 		"disabled last",
 	}
 	for i, want := range wantNames {
 		if gotNames[i] != want {
-			t.Fatalf("expected stable active order %v, got %v", wantNames, gotNames)
+			t.Fatalf("expected running-first order %v, got %v", wantNames, gotNames)
+		}
+	}
+}
+
+// 运行中优先只是【临时】提前，跑完必须原样落回自己的 list_order 位置 ——
+// 否则用户拖出来的顺序会被每一次运行悄悄改写一次。
+func TestTaskListRestoresRunningTaskPositionAfterItFinishes(t *testing.T) {
+	testutil.SetupTestEnv(t)
+
+	engine := newProtectedRouter()
+	user := testutil.MustCreateUser(t, "running-restore-operator", "operator")
+	accessToken := testutil.MustCreateAccessToken(t, user.Username, user.Role)
+
+	// 用 list_order 拉开顺序：它是拖拽序，正是这条用例要保护的东西。
+	tasks := []*model.Task{
+		{Name: "dragged first", Command: "echo one", CronExpression: "0 0 * * *", ListOrder: 10},
+		{Name: "dragged second", Command: "echo two", CronExpression: "0 0 * * *", ListOrder: 20},
+		{Name: "dragged third", Command: "echo three", CronExpression: "0 0 * * *", ListOrder: 30},
+	}
+	for _, task := range tasks {
+		if err := database.DB.Create(task).Error; err != nil {
+			t.Fatalf("create task %q: %v", task.Name, err)
+		}
+		if err := database.DB.Model(task).Update("status", model.TaskStatusEnabled).Error; err != nil {
+			t.Fatalf("set enabled status for %q: %v", task.Name, err)
+		}
+	}
+
+	listTaskNames := func(t *testing.T) []string {
+		t.Helper()
+
+		rec := performRequest(engine, http.MethodGet, "/api/v1/tasks", map[string]string{
+			"Authorization": "Bearer " + accessToken,
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		items, ok := decodeJSONMap(t, rec)["data"].([]interface{})
+		if !ok {
+			t.Fatalf("expected data array, got %#v", rec.Body.String())
+		}
+		names := make([]string, 0, len(items))
+		for _, raw := range items {
+			item, ok := raw.(map[string]interface{})
+			if !ok {
+				t.Fatalf("expected task object, got %#v", raw)
+			}
+			names = append(names, item["name"].(string))
+		}
+		return names
+	}
+
+	assertOrder := func(t *testing.T, stage string, want []string) {
+		t.Helper()
+
+		got := listTaskNames(t)
+		if len(got) < len(want) {
+			t.Fatalf("%s: expected at least %d tasks, got %v", stage, len(want), got)
+		}
+		for i, name := range want {
+			if got[i] != name {
+				t.Fatalf("%s: expected order %v, got %v", stage, want, got)
+			}
+		}
+	}
+
+	assertOrder(t, "运行前", []string{"dragged first", "dragged second", "dragged third"})
+
+	// 中间那条开始运行 → 提到最前。
+	if err := database.DB.Model(tasks[1]).Update("status", model.TaskStatusRunning).Error; err != nil {
+		t.Fatalf("set running status: %v", err)
+	}
+	assertOrder(t, "运行中", []string{"dragged second", "dragged first", "dragged third"})
+
+	// 跑完回到已启用 → 顺序原样退回，拖拽序没被这次运行改写。
+	if err := database.DB.Model(tasks[1]).Update("status", model.TaskStatusEnabled).Error; err != nil {
+		t.Fatalf("restore enabled status: %v", err)
+	}
+	assertOrder(t, "运行后", []string{"dragged first", "dragged second", "dragged third"})
+}
+
+// 🔴 这条钉死「只改默认序」这个边界：运行中优先只写在 defaultTaskListLess / applyDefaultTaskListOrdering，
+// 没写进 sortPreparedTaskListItems 的规则层。用户显式点了「名称 A→Z」，
+// 要的就是纯粹按名称排，运行中不该越过他的规则插到第一行 ——
+// 它只在「用户给的规则全部打平、回落默认序」时才生效。
+func TestTaskListKeepsExplicitSortRulesAboveRunningPriority(t *testing.T) {
+	testutil.SetupTestEnv(t)
+
+	engine := newProtectedRouter()
+	user := testutil.MustCreateUser(t, "running-sort-rule-operator", "operator")
+	accessToken := testutil.MustCreateAccessToken(t, user.Username, user.Role)
+
+	// 运行中的那条名字排最后，一旦运行中优先漏进规则层，它就会冒到第一行。
+	tasks := []*model.Task{
+		{Name: "alpha idle", Command: "echo alpha", CronExpression: "0 0 * * *"},
+		{Name: "beta idle", Command: "echo beta", CronExpression: "0 0 * * *"},
+		{Name: "zulu running", Command: "echo zulu", CronExpression: "0 0 * * *"},
+	}
+	for _, task := range tasks {
+		if err := database.DB.Create(task).Error; err != nil {
+			t.Fatalf("create task %q: %v", task.Name, err)
+		}
+	}
+	for _, task := range tasks[:2] {
+		if err := database.DB.Model(task).Update("status", model.TaskStatusEnabled).Error; err != nil {
+			t.Fatalf("set enabled status for %q: %v", task.Name, err)
+		}
+	}
+	if err := database.DB.Model(tasks[2]).Update("status", model.TaskStatusRunning).Error; err != nil {
+		t.Fatalf("set running status for %q: %v", tasks[2].Name, err)
+	}
+
+	sortJSON := `[{"field":"name","direction":"asc"}]`
+	rec := performRequest(engine, http.MethodGet, "/api/v1/tasks?sort_rules="+url.QueryEscape(sortJSON), map[string]string{
+		"Authorization": "Bearer " + accessToken,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	items, ok := decodeJSONMap(t, rec)["data"].([]interface{})
+	if !ok || len(items) < 3 {
+		t.Fatalf("expected 3 sorted tasks, got %s", rec.Body.String())
+	}
+
+	gotNames := make([]string, 0, 3)
+	for i := 0; i < 3; i++ {
+		item, ok := items[i].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected task object at %d, got %#v", i, items[i])
+		}
+		gotNames = append(gotNames, item["name"].(string))
+	}
+
+	wantNames := []string{"alpha idle", "beta idle", "zulu running"}
+	for i, want := range wantNames {
+		if gotNames[i] != want {
+			t.Fatalf("显式按名称排序时运行中不该越位，expected %v, got %v", wantNames, gotNames)
+		}
+	}
+}
+
+// 置顶区在运行中优先【之上】：置顶是用户主动设置的展示优先级，
+// 普通任务开始运行不该把置顶任务顶下去。运行中优先只在各自的置顶区内部生效。
+func TestTaskListKeepsPinnedAreaAboveRunningTasks(t *testing.T) {
+	testutil.SetupTestEnv(t)
+
+	engine := newProtectedRouter()
+	user := testutil.MustCreateUser(t, "running-pinned-operator", "operator")
+	accessToken := testutil.MustCreateAccessToken(t, user.Username, user.Role)
+
+	tasks := []*model.Task{
+		{Name: "pinned idle", Command: "echo pinned-idle", CronExpression: "0 0 * * *", IsPinned: true, ListOrder: 10},
+		{Name: "pinned running", Command: "echo pinned-running", CronExpression: "0 0 * * *", IsPinned: true, ListOrder: 20},
+		{Name: "normal idle", Command: "echo normal-idle", CronExpression: "0 0 * * *", ListOrder: 30},
+		{Name: "normal running", Command: "echo normal-running", CronExpression: "0 0 * * *", ListOrder: 40},
+	}
+	for _, task := range tasks {
+		if err := database.DB.Create(task).Error; err != nil {
+			t.Fatalf("create task %q: %v", task.Name, err)
+		}
+	}
+	for _, index := range []int{0, 2} {
+		if err := database.DB.Model(tasks[index]).Update("status", model.TaskStatusEnabled).Error; err != nil {
+			t.Fatalf("set enabled status for %q: %v", tasks[index].Name, err)
+		}
+	}
+	for _, index := range []int{1, 3} {
+		if err := database.DB.Model(tasks[index]).Update("status", model.TaskStatusRunning).Error; err != nil {
+			t.Fatalf("set running status for %q: %v", tasks[index].Name, err)
+		}
+	}
+
+	rec := performRequest(engine, http.MethodGet, "/api/v1/tasks", map[string]string{
+		"Authorization": "Bearer " + accessToken,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	items, ok := decodeJSONMap(t, rec)["data"].([]interface{})
+	if !ok || len(items) < 4 {
+		t.Fatalf("expected at least 4 tasks, got %s", rec.Body.String())
+	}
+
+	gotNames := make([]string, 0, 4)
+	for i := 0; i < 4; i++ {
+		item, ok := items[i].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected task object at %d, got %#v", i, items[i])
+		}
+		gotNames = append(gotNames, item["name"].(string))
+	}
+
+	wantNames := []string{
+		// 置顶区内部：运行中的提到最前。
+		"pinned running",
+		// 置顶的空闲任务仍然排在所有非置顶任务之前，包括正在运行的那条。
+		"pinned idle",
+		// 非置顶区内部：运行中的提到最前。
+		"normal running",
+		"normal idle",
+	}
+	for i, want := range wantNames {
+		if gotNames[i] != want {
+			t.Fatalf("expected pinned-above-running order %v, got %v", wantNames, gotNames)
 		}
 	}
 }

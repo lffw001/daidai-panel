@@ -143,6 +143,18 @@ func applyDefaultTaskListOrdering(query *gorm.DB) *gorm.DB {
 		// 置顶是用户主动设置的展示优先级，禁用任务如果已经置顶，也必须继续留在置顶区。
 		Order("is_pinned DESC").
 		Order("CASE WHEN status IN (1, 0.5, 2) THEN 0 WHEN status = 0 THEN 1 ELSE 2 END ASC").
+		// 运行中的任务提到【本区】最前（issue #118）：正在跑的那几条是用户此刻唯一想看的，
+		// 而它们平时散落在几百条任务里，得靠工具栏的「运行中」页签才能捞出来。
+		//
+		// 只提 status = 2（运行中），不提 0.5（排队中）：排队是几秒钟就过去的瞬时态，
+		// 一并提上来只会让同一次运行多跳一次（排队跳一次、转运行再跳一次）。
+		//
+		// 这一层【不能】并进上面的 taskSortGroup：那个函数同时被 task_sort.go 的拖拽落点校验复用，
+		// 一旦把运行中拆成独立的桶，(1) 列表顶部本来就是最常见的落点，跨桶 400 会明显变多；
+		// (2) 桶还会随任务自己起跑/跑完而漂移 —— 用户在原桶里拖拽时看不到正在跑的那条，
+		// 等它跑完回到本桶，list_order 已经是按缺了它的序列重编过的陈旧值。
+		// 排序要分区、拖拽不要分区，语义不同，所以只在排序这一侧多加一层，别顺手统一。
+		Order("CASE WHEN status = 2 THEN 0 ELSE 1 END ASC").
 		// 拖拽顺序插在 sort_order 之前：拖拽是用户对这一列表最直接的表达，
 		// 而 sort_order 是开机执行顺序，只在没拖过的桶里继续兜底。
 		// 存量数据 list_order 全是 0，这一层比较等价于不存在，升级后顺序不变。
@@ -260,6 +272,18 @@ func defaultTaskListLess(left, right model.Task) bool {
 	rightGroup := taskSortGroup(right.Status)
 	if leftGroup != rightGroup {
 		return leftGroup < rightGroup
+	}
+	// 运行中优先，口径与 applyDefaultTaskListOrdering 里那条 CASE WHEN status = 2 逐字对应
+	// （issue #118）：同样排在状态分区之下、list_order 之上，同样只认 2（运行中）不认 0.5（排队中）。
+	// 不并进 taskSortGroup 的理由见 applyDefaultTaskListOrdering 上的注释（拖拽桶会跟着分裂并漂移）。
+	//
+	// 这一层只作用于【默认序】。走内存路径时 defaultTaskListLess 是 sortPreparedTaskListItems
+	// 的兜底比较器，只有用户给的 sort_rules 全部打平才轮得到它 ——
+	// 用户显式点了「名称 A→Z」，运行中就不该越过他的规则插到前面。
+	leftRunning := left.Status == model.TaskStatusRunning
+	rightRunning := right.Status == model.TaskStatusRunning
+	if leftRunning != rightRunning {
+		return leftRunning
 	}
 	// 内存路径的比较口径必须和 applyDefaultTaskListOrdering 的 SQL 完全一致：
 	// list_order 在前、sort_order 在后，两条路径漂了就会出现「带筛选和不带筛选顺序不一样」。

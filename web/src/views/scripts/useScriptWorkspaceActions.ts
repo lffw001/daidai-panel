@@ -2,6 +2,8 @@ import { ref, type ComputedRef, type Ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { scriptApi } from '@/api/script'
+import { taskApi } from '@/api/task'
+import { isTaskRunnableScriptPath, taskCommandMatchesScript } from '@/utils/taskCommandScript'
 import type { ScriptVersionDetail, ScriptVersionRecord } from './types'
 
 interface ScriptWorkspaceActionsOptions {
@@ -271,19 +273,11 @@ export function useScriptWorkspaceActions({
       uploadFileList.value = []
       await loadTree()
 
+      // 多文件上传刻意不问：一次传 N 个文件对应不了一条任务，这里维持原状。
       if (uploadedPaths.length === 1) {
         const targetPath = uploadedPaths[0]
         if (!targetPath) return false
-        try {
-          await ElMessageBox.confirm('是否将此脚本添加到定时任务？', '提示', {
-            confirmButtonText: '确定',
-            cancelButtonText: '取消',
-            type: 'info'
-          })
-          navigateToTaskWithScript(targetPath)
-        } catch {
-          // cancelled
-        }
+        await askAddUploadedScriptToTask(targetPath)
       }
     } catch (err: any) {
       ElMessage.error(err?.response?.data?.error || err?.message || '上传失败')
@@ -312,6 +306,70 @@ export function useScriptWorkspaceActions({
       await handleUpload(uploadFileList.value)
     } finally {
       uploading.value = false
+    }
+  }
+
+  /**
+   * 统计「这个脚本已经有几条定时任务」。
+   * 返回 null = 没查成（网络抖动 / 401 / 后端报错），调用方必须按「不知道」处理，也就是照旧弹窗 ——
+   * 重复问一次只是烦，静默吞掉「上传后加定时任务」这个入口要糟糕得多。
+   */
+  async function countTasksUsingScript(targetPath: string) {
+    try {
+      // keyword 用 basename 不用整路径：keyword 是 name/command 的子串匹配，
+      // 而同一个脚本在库里至少有 8 种合法命令形态（`task "a b/x.py"`、`task a\ b/x.py` …），
+      // 整路径在这些形态里根本不成子串，会漏。宽召回交给下面的逐条解析去收窄。
+      const basename = targetPath.split('/').pop() || targetPath
+      if (!basename) return null
+      // 刻意不传 filters / sort_rules：带上任意一个都会让后端切到内存全表路径
+      // （无 LIMIT 地 Find 出全部匹配行再在内存里筛排），任务多的面板上是实打实的开销。
+      const res = await taskApi.list({ keyword: basename, all: 1 })
+      const rows = Array.isArray(res?.data) ? res.data : []
+
+      let total = 0
+      let disabled = 0
+      for (const row of rows) {
+        const command = typeof row?.command === 'string' ? row.command : ''
+        // 必须整体相等比较，绝不能拿 basename 裸 includes：
+        // `jd/qd.py` 的任务不是 `qd.py` 的任务，误判会把弹窗错误地吞掉。
+        if (!command || !taskCommandMatchesScript(command, targetPath)) continue
+        total++
+        // status=0 是已禁用。它同样占着「这个脚本已经配过任务了」的事实，要算进去，
+        // 但得在文案里点明，否则用户在列表里按默认筛选找不到那几条会以为面板在骗人。
+        if (Number(row?.status) === 0) disabled++
+      }
+      return { total, disabled }
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * 上传单个文件后的「是否加到定时任务」询问，两道前置判断（issue #118 建议 3）：
+   * 1. 扩展名不在 task 能跑的 6 种里 —— 问了也只会生成一条永远跑不起来的 `task config.json`；
+   * 2. 该脚本已经有定时任务 —— 覆盖式重传是最常见的用法，不该每次都拦一下，降级成一条不阻断的提示。
+   * 注意这里只管上传入口；编辑器右上角的「添加任务」按钮保持不拦，
+   * 同一脚本按账号拆 `desi` / `conc` 建多条任务是官方文档推荐的正常用法，那是用户的逃生门。
+   */
+  async function askAddUploadedScriptToTask(targetPath: string) {
+    if (!isTaskRunnableScriptPath(targetPath)) return
+
+    const existing = await countTasksUsingScript(targetPath)
+    if (existing && existing.total > 0) {
+      const disabledNote = existing.disabled > 0 ? `（${existing.disabled} 条已禁用）` : ''
+      ElMessage.info(`该脚本已有 ${existing.total} 条定时任务${disabledNote}，未重复询问`)
+      return
+    }
+
+    try {
+      await ElMessageBox.confirm('是否将此脚本添加到定时任务？', '提示', {
+        confirmButtonText: '确定',
+        cancelButtonText: '取消',
+        type: 'info'
+      })
+      navigateToTaskWithScript(targetPath)
+    } catch {
+      // cancelled
     }
   }
 

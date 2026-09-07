@@ -162,8 +162,14 @@ let dragPointerY = 0
 let dragAutoScrollFrame = 0
 let sortableInitFrame = 0
 
-// 🔴 拖拽期间必须停轮询：这一页有 3 秒一轮的状态轮询，它会整体替换 tasks.value，
-// 正在被拖的那一行会连同 DOM 一起换掉，拖拽当场断在半空（envs 页没有轮询，照抄时最容易漏这条）。
+// 🔴 拖拽期间必须停轮询：这一页有 3 秒一轮的状态轮询，它会改写 tasks.value 里的行 ——
+// 即便已经改成了「就地合并字段」（见 mergeTaskListInPlace），行内容一变 Vue 照样重画，
+// 正在被拖的那一行会断在半空。（envs 页没有轮询，照抄时最容易漏这条。）
+//
+// 与 dragSortDisabledReason 里那条「有任务在跑就不能拖」不矛盾，两者只是碰巧互斥：
+// 轮询要 hasRunningTasks 为真才跑，拖拽要它为假才允许，所以正常路径上「拖拽中还在轮询」已经不会发生，
+// !isDragging 退化成一道兜底闸。**不要因此把它删掉**：它兜的是「先有响应在飞、再开始拖」这类时序，
+// 且以后只要放松了第 4 条禁用规则（比如改成把落点映射回 list_order 序），它立刻又变成必需的。
 const canPollTaskStatus = computed(
   () => hasRunningTasks.value && isPageActive.value && selectedIds.value.length === 0 && !isDragging.value
 )
@@ -306,17 +312,36 @@ function handleTableSortChange(payload: { prop?: string; order?: string | null }
 }
 
 /**
- * 拖拽是否可用。三种情况直接禁掉手柄（并用 tooltip 说明原因）：
+ * 拖拽是否可用。四种情况直接禁掉手柄（并用 tooltip 说明原因）：
  *   1) 正在按列 / 按快捷项排序 —— 展示顺序由排序字段决定，拖出来的位置刷新就弹回去；
  *   2) 当前视图自带排序规则 —— 同上；
- *   3) 列表不足两行 —— 没有可换的位置。
+ *   3) 列表不足两行 —— 没有可换的位置；
+ *   4) 列表里有任务正在运行 —— 落点会算错，见下。
  * 观察者（没有操作权限）连拖拽列都不渲染，这里的判定只是兜底。
+ *
+ * 🔴 第 4 条（有任务在跑就不能拖）的由来：
+ * 前端 onEnd 取的是**视觉上**紧挨落点后面那一行当 target_id，而服务端 handler/task_sort.go 是按
+ * `list_order ASC, sort_order ASC, created_at DESC, id DESC` 重建兄弟序列、把 source 插到 target
+ * 在**这条序列**里的下标前。改造前两边口径是同一个；v3.2.5 加了「运行中提到本区最前」之后，
+ * 展示序变成了 list_order 序的一个**置换**，两边不再等价。
+ * 举例（默认排序、同桶内一条在跑）：A(list_order=10, 空闲)、B(20, 运行中)、C(30, 空闲)，展示序是 [B, A, C]。
+ * 把 A 拖到最上面（即拖到 B 上方）⇒ target=B ⇒ 服务端 filtered=[B(20), C(30)]、insertIndex=0 ⇒
+ * 重编号得 A=10, B=20, C=30，**list_order 一个字没变** ⇒ 刷新后展示序仍是 [B, A, C]，用户等于白拖；
+ * 而松手时是乐观更新，界面上 A 已经在最上面了，要到下一次真刷新才弹回去。把 C 拖到最上面则更糟：C 反而跑到最后一行。
+ * 列表顶部正是最常见的落点，运行中的行现在又恒在顶部，所以命中率不低。
+ *
+ * ⚠️ 为什么选「禁用」而不是「把落点映射回 list_order 序」：运行中的位置本身是**临时**的，
+ * 「把 A 拖到一个临时占位的行上方」这件事在语义上就是未定义的 —— 用户想要的是「排在 B 前面」
+ * 还是「排在这个位置」，谁也说不准。与其猜，不如直接说清楚现在不能拖、什么时候能拖。
+ * 注：状态页签「已启用 / 已禁用」走的是服务端 `status = ?` 精确匹配，运行中（status=2）会被筛掉，
+ * 所以切过去就能拖，tooltip 里给的就是这条出路。
  */
 const dragSortDisabledReason = computed(() => {
   if (!canOperateTasks.value) return '当前账号没有排序任务权限'
   if (quickSort.value) return '当前正在按列排序，先切回「默认排序」再拖拽'
   if (viewSortRules.value.length > 0) return '当前视图自带排序规则，切到不带排序的视图再拖拽'
   if (tasks.value.length < 2) return '至少两条任务才能拖拽排序'
+  if (hasRunningTasks.value) return '运行中的任务被临时排到了最前，此时拖拽的落点会算错；等它跑完再拖，或先切到「已启用」/「已禁用」页签排'
   return ''
 })
 const sortableEnabled = computed(() => dragSortDisabledReason.value === '')
@@ -576,6 +601,85 @@ function buildTaskListParams() {
   return params
 }
 
+/**
+ * 把一次列表响应【按 id 就地合并】进当前 tasks，不动剩余行的顺序；
+ * 这一页的成员关系真的变了就返回 false，由调用方整表替换。
+ *
+ * 🔴 为什么轮询不能重排（issue #118）：v3.2.5 起服务端默认排序把「运行中」提到本区最前，
+ * 如果 3 秒一轮的轮询照旧整表替换，点一次运行这条任务就会当场蹿到列表最上面、跑完又跳回来，
+ * 一次运行跳两次 —— hlt1995 的原话是「手动点击运行，脚本直接跑最上面去了」。
+ * 所以这一页把「顺序」和「状态」拆开：状态 / 上次结果 / 耗时 / 最后运行时间等字段照常每 3 秒刷新，
+ * 顺序只在用户主动刷新、切筛选、搜索、翻页、增删改任务时才按新规则重排（也就是他说的「刷新后生效」）。
+ * ⚠️ 后人别「顺手统一成整表替换」，那等于把这条 issue 原样退回去。
+ *
+ * 三条规则，缺一条就会出人命：
+ *
+ * 1) **响应里出现了当前列表没有的 id ⇒ 直接返回 false，交给调用方整表替换**。
+ *    出现新 id 说明这一页的成员关系真的变了（别处新建、或本页某行被挤到别的页去了），
+ *    此时重排是正确行为 —— 硬留在原地只会让页面停在一份已经不存在的快照上。
+ *
+ * 2) **配不上的行剔除掉**（服务端这一页已经没有它了：跑完被状态页签筛掉、或被别处删了）。
+ *    曾经写成「配不上就原样留着」，结果是「运行中」页签下（轮询带着 status=2 一起发）
+ *    任务跑完后服务端不再返回它、前端却原样留着 ⇒ 它永远挂在「运行中」页签里，
+ *    而且这条陈旧的 status=2 会自锁 hasRunningTasks ⇒ canPollTaskStatus 恒为真 ⇒ 3 秒轮询永远收不掉。
+ *
+ * 3) **只删不插、只删不排**：剩下的行保持原有相对顺序与对象引用。
+ *    插入新行必须给它选一个位置 = 重排，而重排正是 issue #118 要消灭的抖动；
+ *    新任务留到下一次真正的刷新再出现即可。
+ *
+ * ⚠️ 已知代价（结构性，不是这里能消掉的）：v3.2.5 起服务端把运行中的任务提到本区最前，
+ *    所以**在第 2 页及以后点「运行」**，那一行会被提到第 1 页 ⇒ 第 2 页的响应里挤进来一个本页没有的 id
+ *    ⇒ 命中规则 1 整表替换 ⇒ 用户会看到「刚点运行的那条从本页移走了」。
+ *    这是「服务端全局置顶 + 分页」的结构性后果。相比之下，
+ *    「跑完的任务永远卡在运行中页签、轮询永不停止、浏览器一直空转发请求」严重得多，所以选这一边。
+ *    （第 1 页不受影响：置顶只在页内挪动，id 集合没变 ⇒ 就地合并 ⇒ 不跳。）
+ */
+function mergeTaskListInPlace(incoming: any, incomingTotal: number): boolean {
+  const rows: any[] = Array.isArray(incoming) ? incoming : []
+
+  const rowById = new Map<number, any>()
+  for (const row of rows) {
+    rowById.set(Number(row?.id), row)
+  }
+
+  // 规则 1：出现当前列表没有的 id ⇒ 这一页真换内容了，让调用方整表替换（此时重排才是对的）
+  const currentIds = new Set<number>(tasks.value.map(item => Number(item?.id)))
+  for (const row of rows) {
+    if (!currentIds.has(Number(row?.id))) return false
+  }
+
+  // 先整轮配对、再统一落字段。配不上的行不进 pairs = 被剔除（规则 2）
+  const pairs: [any, any][] = []
+  for (const current of tasks.value) {
+    const source = rowById.get(Number(current?.id))
+    if (!source) continue
+    pairs.push([current, source])
+  }
+
+  for (const [current, source] of pairs) {
+    // 服务端只在「有话要说」时才下发 next_run_at / schedule_hint / notification_channel_*
+    // （见 handler/task_query.go 的 prepareTaskListItems），它们不是恒有字段。
+    // 光靠 Object.assign 覆盖不掉「这次没下发」的键，上一轮的旧值会一直挂在行上
+    // （比如任务被禁用后 next_run_at 该消失、警示图标该收回，却还留着），所以先删本次响应里没有的键。
+    for (const key of Object.keys(current)) {
+      if (!(key in source)) delete current[key]
+    }
+    // 再用服务端这条记录整体覆盖，而不是挑几个字段合：漏一个字段的表现是
+    // 「那个字段在轮询里永远不刷新」，而且构建全绿、只有盯着看才发现，所以这里不做白名单。
+    // 保留原对象引用 ⇒ 数组顺序、el-table 的行选中、详情弹窗持有的那份引用都不受影响。
+    Object.assign(current, source)
+  }
+
+  // 规则 3：只删不排 —— 换掉数组引用只是为了让被剔除的行消失，
+  // 剩下的仍是同一批对象、同一个相对顺序。长度没变说明一行都没掉，连数组都不用换。
+  if (pairs.length !== tasks.value.length) {
+    tasks.value = pairs.map(([current]) => current)
+  }
+  // total 必须跟着走：不更新的话「共 N 条数据」和分页器会长期停在旧值
+  total.value = incomingTotal
+  return true
+}
+
 function startStatusPolling() {
   stopStatusPolling()
   statusTimer = setInterval(async () => {
@@ -586,11 +690,15 @@ function startStatusPolling() {
     try {
       const res = await taskApi.list(buildTaskListParams())
       // await 之后必须再判一次：停轮询只清掉了定时器，挡不住**已经在飞**的这一次请求。
-      // 拖拽开始时若上一轮 tick 的响应还在路上，回来后无条件覆盖 tasks.value
-      // 会把正在拖的那一行连同 DOM 一起换掉，onEnd 再按下标取值就取到了新数组的行。
+      // 拖拽开始时若上一轮 tick 的响应还在路上，回来后动 tasks.value
+      // 会把正在拖的那一行重画掉，onEnd 再按下标取值就取到了对不上的数据。
       if (!canPollTaskStatus.value) return
-      tasks.value = res.data
-      total.value = res.total
+      // 优先就地刷字段（顺序纹丝不动），只有这一页的成员关系真变了才整表替换 ——
+      // 两条路各自的理由与代价见 mergeTaskListInPlace 的注释。
+      if (!mergeTaskListInPlace(res.data, res.total)) {
+        tasks.value = res.data
+        total.value = res.total
+      }
       syncStatusPolling()
     } catch {}
   }, 3000)
@@ -974,7 +1082,23 @@ async function runTaskNow(task: any) {
     task.status = 2
     openLogViewer(task)
     syncStatusPolling()
-    void loadTasks()
+    // 🔴 这一次回读【优先只合并字段、不重排】（原来是 loadTasks() 的整表替换）。
+    // 服务端默认排序会把运行中的任务提到本区最前，当场整表替换的话，点一下运行这条任务
+    // 就直接蹿到列表顶（issue #118 hlt1995 反对的现象），3 秒后的轮询再把它放回去 = 一次运行跳两次。
+    // 置顶效果留到用户下次主动刷新 / 切筛选时才体现，理由与轮询同源，见 mergeTaskListInPlace。
+    // 只有这一页的成员关系真变了（典型是在第 2 页点运行、那一行被提到第 1 页）才整表替换，
+    // 这条代价与取舍同样写在 mergeTaskListInPlace 的注释里。
+    try {
+      const res = await taskApi.list(buildTaskListParams())
+      if (!mergeTaskListInPlace(res.data, res.total)) {
+        tasks.value = res.data
+        total.value = res.total
+      }
+      // 与原来 loadTasks() 末尾那次同款：万一服务端已经跑完（秒级任务），要据此把轮询收掉
+      syncStatusPolling()
+    } catch {
+      // 回读失败不影响「已启动」这个结论本身，列表保持原样，3 秒后的状态轮询会再刷一次
+    }
   } catch (err: any) {
     ElMessage.error(err?.response?.data?.error || '启动失败')
   }
@@ -1649,8 +1773,9 @@ async function handleImport(event: Event) {
         <!-- 拖拽列：40px，与环境变量页同宽同形（那边是 .env-drag-col）。
              只对有操作权限的账号渲染 —— 观察者拖不动，也不该白吃这 40px 列宽
              （窄桌面三个弹性列已经在抢像素了）。
-             手柄按 sortableEnabled 置灰：按列排序 / 视图自带排序 / 只有一行时，
-             拖出来的位置刷新就会被排序规则覆盖回去，所以直接禁掉并用 tooltip 说明原因。 -->
+             手柄按 sortableEnabled 置灰：按列排序 / 视图自带排序 / 只有一行 / 有任务正在运行时，
+             拖出来的位置要么刷新就被排序规则覆盖回去，要么落点根本算错（理由见 dragSortDisabledReason），
+             所以直接禁掉并用 tooltip 说明原因与出路。 -->
         <el-table-column v-if="canOperateTasks" width="40" align="center" class-name="task-drag-col">
           <template #default>
             <el-tooltip :content="dragSortHint" placement="top">

@@ -66,6 +66,24 @@ func parseEnvGroupFilter(rawValues ...string) []string {
 	return model.SplitEnvGroups(strings.Join(rawValues, ","))
 }
 
+// parseEnvNameFilter 解析「变量名筛选」参数，套路与 parseEnvGroupFilter 一致。
+// 变量名受 envNamePattern（^[A-Za-z_][A-Za-z0-9_]*$）约束、不可能含逗号，所以逗号分隔在这里是安全的；
+// 复用 SplitEnvGroups 只是借它「切分 + 去空白 + 去重」这套通用逻辑，与分组语义无关。
+// 🔴 「逗号分隔安全」这个前提只对变量名成立，别把同一套解析扩散到 value / remarks 这类自由文本字段上。
+func parseEnvNameFilter(rawValues ...string) []string {
+	return model.SplitEnvGroups(strings.Join(rawValues, ","))
+}
+
+// applyEnvNameFilters 按变量名做【精确】匹配（不是 keyword 那种 LIKE）：
+// 多个变量名之间是 OR（IN），与 keyword / groups / enabled 之间仍是 AND —— 由 GORM 的多次 Where 串成。
+// 传了库里不存在的名字时自然筛出空列表，绝不会回落成「不筛」。
+func applyEnvNameFilters(query *gorm.DB, names []string) *gorm.DB {
+	if len(names) == 0 {
+		return query
+	}
+	return query.Where("name IN ?", names)
+}
+
 func applyEnvGroupFilters(query *gorm.DB, groups []string) *gorm.DB {
 	if len(groups) == 0 {
 		return query
@@ -208,6 +226,8 @@ func reorderEnvWithinSortBucket(tx *gorm.DB, sourceID uint, targetID *uint) erro
 
 func (h *EnvHandler) List(c *gin.Context) {
 	keyword := c.Query("keyword")
+	// names 同时支持 `names=A,B` 和 `names=A&names=B` 两种写法（QueryArray 已经把重复参数收齐）。
+	nameFilters := parseEnvNameFilter(c.QueryArray("names")...)
 	groupFilters := parseEnvGroupFilter(append(c.QueryArray("groups"), c.Query("groups"), c.Query("group"))...)
 	enabledRaw := c.Query("enabled")
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -228,6 +248,7 @@ func (h *EnvHandler) List(c *gin.Context) {
 		like := "%" + keyword + "%"
 		query = query.Where("UPPER(name) LIKE UPPER(?) OR UPPER(remarks) LIKE UPPER(?) OR UPPER(value) LIKE UPPER(?) OR UPPER(\"group\") LIKE UPPER(?)", like, like, like, like)
 	}
+	query = applyEnvNameFilters(query, nameFilters)
 	query = applyEnvGroupFilters(query, groupFilters)
 	if enabledRaw != "" {
 		enabled, err := strconv.ParseBool(enabledRaw)
@@ -828,6 +849,28 @@ func (h *EnvHandler) Groups(c *gin.Context) {
 	response.Success(c, gin.H{"data": groups})
 }
 
+// envNameCount 是 /envs/names 的一项：变量名 + 全库同名条数。
+type envNameCount struct {
+	Name  string `json:"name"`
+	Count int64  `json:"count"`
+}
+
+// Names 按变量名聚合，给前端「变量名筛选」下拉提供选项与条数，形态与 Groups 对齐。
+//
+// 🔴 count 的口径是【全库同名条数】，刻意不跟随当前的 keyword / groups / enabled 筛选：
+// 它与 UpsertByName 冲突文案里那句「存在 N 条名为 'X' 的环境变量」是同一个 N，两处必须对得上。
+// 若改成筛选后的条数，同一个变量名会在下拉里和报错里显示两个不同的数字。
+func (h *EnvHandler) Names(c *gin.Context) {
+	var rows []envNameCount
+	database.DB.Raw(`SELECT name, COUNT(*) AS count FROM env_vars WHERE name != '' GROUP BY name ORDER BY name ASC`).Scan(&rows)
+
+	// Scan 到空结果时 rows 仍是 nil，直接返回会序列化成 null；/envs/groups 空库返回的是 []，
+	// 两个下拉接口的空值形态保持一致。
+	data := make([]envNameCount, 0, len(rows))
+	data = append(data, rows...)
+	response.Success(c, gin.H{"data": data})
+}
+
 func parseEnvExportIDs(raw string) []uint {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -1199,6 +1242,8 @@ func (h *EnvHandler) RegisterRoutes(r *gin.RouterGroup) {
 		envs.PUT("/:id/move-top", h.MoveToTop)
 		envs.PUT("/:id/cancel-top", h.CancelMoveToTop)
 		envs.GET("/groups", h.Groups)
+		// 与 /groups 同理：静态路径优先于上面的 /:id，不会被当成 id 走进 Get。
+		envs.GET("/names", h.Names)
 		envs.GET("/export-all", h.ExportAll)
 		envs.POST("/export-files", h.ExportFiles)
 		envs.POST("/import", h.Import)

@@ -364,6 +364,21 @@ function compareTasksByDefault(left: DemoTask, right: DemoTask): number {
   if (left.is_pinned !== right.is_pinned) return left.is_pinned ? -1 : 1
   const groupDiff = taskSortGroup(left.status) - taskSortGroup(right.status)
   if (groupDiff !== 0) return groupDiff
+  // 运行中的任务提到【本区】最前（issue #118），口径与服务端 applyDefaultTaskListOrdering 的
+  // `CASE WHEN status = 2 THEN 0 ELSE 1 END` 以及 defaultTaskListLess 逐字对应：
+  // 同样压在状态分区之下、list_order 之上，同样只认 2（运行中）不认 0.5（排队中）——
+  // 排队是几秒钟就过去的瞬时态，一并提上来只会让同一次运行多跳一次。
+  //
+  // 🔴 这一层【不能】并进 taskSortGroup：那个函数还被 reorderTask 的 sameBucket 复用，
+  //    一旦把运行中拆成独立的桶，拖拽落点会随任务自己起跑/跑完而漂移。排序要分区、拖拽不要分区。
+  // 🔴 出于同样的理由，reorderTask 枚举整桶时也【不能】复用本函数（它会把运行中位置写进 list_order），
+  //    那里另有一个 compareTasksForReorder，口径对齐服务端 task_sort.go。
+  // 🔴 也【不能】加进 sortTasksByTimeField 的规则层：那里对应服务端的 sortPreparedTaskListItems，
+  //    服务端没在那儿加这一层 —— 用户显式点了「名称 A→Z」，运行中不该越过他的规则插到前面。
+  //    规则全部打平回落到本函数时它才生效，与服务端一致。
+  const leftRunning = left.status === TASK_STATUS_RUNNING
+  const rightRunning = right.status === TASK_STATUS_RUNNING
+  if (leftRunning !== rightRunning) return leftRunning ? -1 : 1
   // list_order（拖拽顺序）插在 sort_order 之前，与服务端一致。
   // 存量数据全是 0 ⇒ 这一步全平手、顺序完全由 sort_order 决定，行为与加这个字段之前一致。
   if (left.list_order !== right.list_order) return left.list_order - right.list_order
@@ -372,7 +387,7 @@ function compareTasksByDefault(left: DemoTask, right: DemoTask): number {
   return right.id - left.id
 }
 
-/** 默认排序：置顶优先 → 启用/运行 在前、禁用在后 → list_order → sort_order → 创建时间倒序 */
+/** 默认排序：置顶优先 → 启用/运行 在前、禁用在后 → 运行中提到本区最前 → list_order → sort_order → 创建时间倒序 */
 export function sortTasks(rows: DemoTask[]): DemoTask[] {
   return [...rows].sort(compareTasksByDefault)
 }
@@ -486,6 +501,25 @@ export function filterTasks(params: Record<string, string>): DemoTask[] {
 }
 
 /**
+ * 拖拽重编号时桶内兄弟的排序，逐字对应服务端 task_sort.go 取兄弟列表的
+ * `Order("list_order ASC, sort_order ASC, created_at DESC, id DESC")`。
+ *
+ * 🔴 这里刻意【不复用】sortTasks / compareTasksByDefault —— 它们含「运行中优先」（issue #118），
+ *    而服务端 task_sort.go 这条查询**没有**这一层。复用它会把「此刻正在运行」这个临时状态
+ *    永久写进 list_order：桶里正在跑的那条被重编号成 10，等它跑完回到已启用，
+ *    它仍然钉在拖拽序第一位再也下不来 —— 真实面板不会这样
+ *    （服务端的 TestTaskListRestoresRunningTaskPositionAfterItFinishes 钉的正是「跑完回原位」）。
+ * 🔴 置顶与状态分组也不用比：调用方已按 sameBucket 过滤过，桶内这两项恒等
+ *    （服务端同理，靠 `is_pinned = ?` 与 taskSortGroup 过滤，ORDER BY 里也没有它们）。
+ */
+function compareTasksForReorder(left: DemoTask, right: DemoTask): number {
+  if (left.list_order !== right.list_order) return left.list_order - right.list_order
+  if (left.sort_order !== right.sort_order) return left.sort_order - right.sort_order
+  if (left.created_at !== right.created_at) return right.created_at.localeCompare(left.created_at)
+  return right.id - left.id
+}
+
+/**
  * 拖拽排序：把 sourceId 插到 targetId 之前（position='after' 时插到之后）；targetId 为空表示移到本区末尾。
  * 复刻 server/handler/task_sort.go。
  *
@@ -514,8 +548,10 @@ export function reorderTask(
     }
   }
 
-  // 兄弟列表取【整桶】而不是当前页，所以跨页拖拽也有效
-  const bucket = sortTasks(current.tasks.filter(sameBucket))
+  // 兄弟列表取【整桶】而不是当前页，所以跨页拖拽也有效。
+  // 排序走 compareTasksForReorder（服务端口径，不含运行中优先），不是列表用的 sortTasks —— 原因见其函数注释。
+  // filter 已经产出新数组，这里就地 sort 不会动到 state.tasks 本身。
+  const bucket = current.tasks.filter(sameBucket).sort(compareTasksForReorder)
   const rest = bucket.filter((task) => task.id !== source.id)
 
   let insertIndex = rest.length
@@ -562,6 +598,11 @@ export function buildLogContent(log: DemoTaskLog): string {
       + `${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`
   }
 
+  // 「已注入 N 项」跟着 envs 现算，不写死数字 —— 本文件开头第 3 条规矩就是「汇总数字一律从事实算」。
+  // 写死过一次就会漂：v3.2.5 给 fixture 加了 3 条 ACCOUNT_TOKEN，原先写死的「19 项」当场和
+  // 环境变量页的 22 条对不上。数的是【启用】的那些，与面板真实只注入启用变量的口径一致。
+  const injectedEnvCount = db().envs.filter((env) => env.enabled).length
+
   const duration = log.duration ?? 0
   const lines: string[] = [
     `[${stamp(0)}] ## 开始执行 ${log.task_name}`,
@@ -573,7 +614,7 @@ export function buildLogContent(log: DemoTaskLog): string {
   switch (log.kind) {
     case 'ok':
       lines.push(
-        `[${stamp(1)}] 环境变量已注入（19 项）`,
+        `[${stamp(1)}] 环境变量已注入（${injectedEnvCount} 项）`,
         `[${stamp(1)}] 开始处理...`,
         // 裸 \r 是终端进度条的覆盖语义，前端的日志渲染会按覆盖处理，不要换成 \n
         `处理进度: 25%\r处理进度: 60%\r处理进度: 88%\r处理进度: 100%`,
@@ -584,7 +625,7 @@ export function buildLogContent(log: DemoTaskLog): string {
       break
     case 'fail': {
       lines.push(
-        `[${stamp(1)}] 环境变量已注入（19 项）`,
+        `[${stamp(1)}] 环境变量已注入（${injectedEnvCount} 项）`,
         `[${stamp(1)}] 开始处理...`,
       )
       // 重试相关的两行只在任务真的配了重试时才出现：
@@ -605,7 +646,7 @@ export function buildLogContent(log: DemoTaskLog): string {
     }
     case 'timeout':
       lines.push(
-        `[${stamp(1)}] 环境变量已注入（19 项）`,
+        `[${stamp(1)}] 环境变量已注入（${injectedEnvCount} 项）`,
         `[${stamp(1)}] 开始处理...`,
         `处理进度: 12%\r处理进度: 34%\r处理进度: 41%`,
         `[${stamp(duration)}] ERROR 任务超过配置的超时时间 ${task?.timeout ?? duration}s，已被面板终止`,
@@ -615,7 +656,7 @@ export function buildLogContent(log: DemoTaskLog): string {
       break
     case 'abort':
       lines.push(
-        `[${stamp(1)}] 环境变量已注入（19 项）`,
+        `[${stamp(1)}] 环境变量已注入（${injectedEnvCount} 项）`,
         `[${stamp(1)}] 开始处理...`,
         `[${stamp(duration)}] 收到停止信号，正在清理临时文件`,
         '',
@@ -624,7 +665,7 @@ export function buildLogContent(log: DemoTaskLog): string {
       break
     case 'running':
       lines.push(
-        `[${stamp(1)}] 环境变量已注入（19 项）`,
+        `[${stamp(1)}] 环境变量已注入（${injectedEnvCount} 项）`,
         `[${stamp(1)}] 开始处理...`,
         `[${stamp(2)}] 正在执行中，实时日志请点「查看实时日志」`,
       )
@@ -938,6 +979,22 @@ export function filterEnvs(params: Record<string, string>): DemoEnvVar[] {
       const groups = splitEnvGroups(env.group)
       return groupFilters.some((group) => groups.includes(group))
     })
+  }
+
+  // 变量名筛选是【精确】匹配（不是 keyword 那种模糊 LIKE），复刻服务端的 applyEnvNameFilters：
+  // 多个变量名之间是 OR，与 keyword / groups / enabled 之间是 AND；传了库里不存在的名字就筛出空列表，
+  // 绝不回落成「不筛」。names=JD_COOKIE 不会带出 JD_COOKIE_EXTRA，这正是它和搜索框的区别。
+  //
+  // 解析同样借 splitEnvGroups 的「切分 + 去空白 + 去重」，与服务端 parseEnvNameFilter 是同一套路：
+  // 变量名受 ENV_NAME_PATTERN（^[A-Za-z_][A-Za-z0-9_]*$）约束、不可能含逗号，逗号分隔在这里是安全的。
+  // 🔴 这个前提只对变量名成立，别把同一套解析扩散到 value / remarks 那种自由文本字段上。
+  //
+  // 服务端还认 `names=A&names=B` 这种重复参数；Demo 这边 ctx.params 是 Record<string, string>，
+  // 重复键只留最后一个 —— 但前端（views/envs/index.vue）发的是逗号拼串，axios 传数组也会被
+  // String() 成逗号串，两条路径都落在逗号分支上，实际行为与服务端一致。
+  const nameFilters = splitEnvGroups(params['names'] ?? '')
+  if (nameFilters.length > 0) {
+    rows = rows.filter((env) => nameFilters.includes(env.name))
   }
 
   const enabledRaw = (params['enabled'] ?? '').trim()

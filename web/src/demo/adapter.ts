@@ -567,14 +567,68 @@ route('GET', '/system/restore/progress', () => ({
 }))
 
 route('GET', '/system/update-status', () => ({ data: { status: 'idle' } }))
+
+/**
+ * 「发现新版本」弹窗的正文样例，逐字摘自 docs/release-notes/v3.0.8.md
+ * （原文第 2、4-14、127-129、137-139、145-154 行，只做跨节裁剪，一个字没改）。
+ *
+ * 挑这一份是因为它把 v3.2.5 新做的 markdown 渲染要覆盖的语法全占齐了：
+ * h2 / h3、`**加粗**`、行内代码、无序列表、引用、`---` 分隔线、GFM 表格、http 链接，
+ * 还带一处 `<transition>`（行内代码里的真标签，用来验证「转义成文本而不是变成真标签」），
+ * 以及开头那条 `<!-- release-title -->` 注释（渲染器该把它吃掉、不显示）。
+ *
+ * 🔴 但演示站【结构上打不开这个弹窗】，所以这段目前是备着的，不是能看到的：
+ *    下面的 has_update 恒为 false，而 OverviewHeroCard.vue 里「查看更新日志」按钮整个包在
+ *    `v-if="updateInfo.has_update"` 里、useSettingsOverview 的 openReleaseNotes() 也是
+ *    `if (updateInfo.value?.has_update)` 才置 visible —— 两道门都锁着。
+ *    为了演示它去把 has_update 改成 true 是不行的：那会在演示站上凭空造出「立即更新」入口。
+ */
+const DEMO_RELEASE_NOTES = [
+  '<!-- release-title: 全站动效交互升级（角标 / 轻提示 / Split Button / 日期范围筛选等七类组件），并修掉三处静默失效的动效缺陷、实时日志丢最后几秒（#102）与 Magisk Debian 版 SSH 连不上（#100） -->',
+  '',
+  '## 版本概览',
+  '',
+  '`v3.0.8` 分两条线：',
+  '',
+  '- **交互体验**：补齐一整套动效交互组件，并铺到全部 15 个页面。同时修掉了三处**构建全绿、控制台无声**的动效缺陷 —— 其中一处让全站 48 个弹窗从来就没有过进出场动画，另一处让「全站直角」这个设计约定从 v3.0.0 起就没真正生效过。',
+  '- **功能修复**：两个来自用户反馈的 issue，实时日志丢最后几秒（[#102](https://github.com/linzixuanzz/daidai-panel/issues/102)）、Magisk Debian 版 SSH 连不上（[#100](https://github.com/linzixuanzz/daidai-panel/issues/100)）。',
+  '',
+  '> ⚠️ **Magisk 用户注意**：#100 的修复动的是**模块外壳脚本**，面板内的一键升级只替换 `daidai-server` / `ddp` / `web`，**覆盖不到**。要拿到这项修复必须**重刷模块 ZIP**。',
+  '> 其余改动（含 #102）随正常更新即可。',
+  '',
+  '---',
+  '',
+  '## 修复：三处静默失效的动效缺陷',
+  '',
+  '这三处的共同点是**构建全绿、控制台无声、类型检查也发现不了**，只能靠浏览器实测才会现形。',
+  '',
+  '### 2. 弹窗动画只在第一次打开时跑',
+  '',
+  '补齐关键帧之后又发现：动画挂在 `.el-dialog` 上，而它**不是** `<transition>` 的作用元素；EP 的 `el-dialog` 默认 `destroy-on-close=false`，第二次打开同一个弹窗时 DOM 被复用，动画不会重放。',
+  '',
+  '### 3. 「全站直角」从 v3.0.0 起就没真正生效过',
+  '',
+  '`:root` 里写了 `--el-border-radius-base: 0`，但 Element Plus 的 `base.css` 里也有一条 `:root { --el-border-radius-base: 4px }` —— **两者特异性完全相同**，而组件样式是随页面按需注入的、必然排在入口样式之后，同特异性后来者赢。',
+  '',
+  '于是那三行圆角归零一直是**死的**，运行时实际值是 `4px`。凡是没有被单独写死 `border-radius: 0` 的地方都在吃这个令牌：',
+  '',
+  '| 命中点 | 实际圆角 |',
+  '|---|---|',
+  '| **全站 `size="small"` 的按钮**（表格操作列的按钮几乎都是） | 3px |',
+  '| 下拉面板 / 下拉菜单 / 日期选择器输入框 | 4px |',
+].join('\n')
+
 route('GET', '/system/check-update', () => ({
   data: {
     current: DEMO_PANEL_VERSION || '0.0.0',
     latest: DEMO_PANEL_VERSION || '0.0.0',
+    // 🔴 恒为 false，别为了演示更新日志弹窗把它改成 true：
+    // 演示站上出现「立即更新」入口是假的功能入口，而 POST /system/update 在下面是被 blocked() 拒的，
+    // 用户点下去只会撞一堵墙。上面 DEMO_RELEASE_NOTES 的注释里写了这个取舍。
     has_update: false,
     auto_update_supported: false,
     update_disabled_reason: '演示环境不支持面板内更新',
-    release_notes: '',
+    release_notes: DEMO_RELEASE_NOTES,
     update_target: { deployment_type: 'docker' },
   },
 }))
@@ -1223,6 +1277,27 @@ route('GET', '/envs/groups', () => {
     for (const group of splitEnvGroups(env.group)) groups.add(group)
   }
   return { data: [...groups].sort() }
+})
+
+// 变量名下拉的选项源，形态与上面的 /envs/groups 对齐（issue #118）。
+// 不补这条的话，前端 loadNames() 的 try/catch 会把 404 静默吞掉：不报错，但「变量名」下拉是空的。
+//
+// 🔴 count 的口径是【全库同名条数】，刻意不跟随当前的 keyword / groups / enabled 筛选 ——
+//    它与 PUT /envs/by-name 冲突文案里那句「存在 N 条名为 X 的环境变量」是同一个 N，两处必须对得上。
+//
+// 排序用裸的 < / > 比大小而不是 localeCompare：服务端是 SQLite 的 `ORDER BY name ASC`（BINARY 排序，
+// 大写全排在小写前面），localeCompare 会把 a 排到 B 前面，两边就漂了。变量名只含 ASCII，逐码元比较即等价。
+// 路由这边不用调注册顺序：静态路径永远优先于 /envs/:id 那条模式路由（见 route() 的注释）。
+route('GET', '/envs/names', () => {
+  const counts = new Map<string, number>()
+  for (const env of db().envs) {
+    if (!env.name) continue
+    counts.set(env.name, (counts.get(env.name) ?? 0) + 1)
+  }
+  const data = [...counts.entries()]
+    .map(([name, count]) => ({ name, count }))
+    .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
+  return { data }
 })
 
 route('GET', '/envs/export', () => {

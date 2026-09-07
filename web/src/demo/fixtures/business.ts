@@ -518,7 +518,15 @@ interface EnvSeed {
 }
 
 /**
- * 19 条环境变量，覆盖 5 个分组 + 凭据类的脱敏样本。
+ * 22 条环境变量（去重后 20 个不同的变量名），覆盖 6 个分组 + 凭据类的脱敏样本。
+ * 分组依次是：通用 4 条、通知 5 条、备份 3 条、多账号 3 条、存储 4 条、监控 3 条
+ * （S3_ENDPOINT / S3_BUCKET 的 group 写成「存储,备份」，同时算进这两个分组，不额外新增分组）。
+ *
+ * 其中 ACCOUNT_TOKEN 刻意重复 3 条（22 与 20 的差就来自这里），
+ * 用于演示 v3.2.5 的「按变量名筛选」—— 少了同名样本，变量名下拉里每一项都是 (1)，
+ * 「同名多条 → 一键收敛」这个功能在演示站上完全看不出存在的理由。
+ *
+ * ⚠️ 增删条目时把上面这几个数字一起改掉：后来人判断「演示数据规模 / 分组覆盖」只有这一处依据。
  *
  * 凭据一律写成「前缀 + 星号」的形态：演示站是公开的，
  * 就算是编的字符串，也不要写成看起来像真 key 的样子。
@@ -538,6 +546,13 @@ const ENV_SEEDS: EnvSeed[] = [
   { name: 'BACKUP_TARGET_DIR', value: '/opt/app/backups', remarks: '本地归档目录', group: '备份' },
   { name: 'BACKUP_RETENTION_DAYS', value: '14', remarks: '本地归档保留天数', group: '备份' },
   { name: 'BACKUP_ENCRYPT_KEY', value: 'bk_live_****************', remarks: '归档加密口令', group: '备份' },
+
+  // 刻意造的三条**同名**变量（多账号场景）。面板允许同名，运行时会按 name 分组用 & 拼给脚本，
+  // v3.2.5 的「按变量名筛选」就是为这种场景做的 —— 少了它们，演示站的变量名下拉全是 (1)，
+  // 「同名多条 → 一键收敛」这个功能存在的理由在 demo 上完全看不出来。
+  { name: 'ACCOUNT_TOKEN', value: 'acc_a_****************', remarks: '主账号', group: '多账号' },
+  { name: 'ACCOUNT_TOKEN', value: 'acc_b_****************', remarks: '备用账号', group: '多账号' },
+  { name: 'ACCOUNT_TOKEN', value: 'acc_c_****************', remarks: '测试账号', group: '多账号', enabled: false },
 
   { name: 'S3_ENDPOINT', value: 'https://s3.example.com', remarks: '对象存储接入点', group: '存储,备份' },
   { name: 'S3_BUCKET', value: 'ops-archive', remarks: '归档桶', group: '存储,备份' },

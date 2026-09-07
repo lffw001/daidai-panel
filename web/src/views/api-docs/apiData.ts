@@ -91,12 +91,13 @@ export const apiCategories: ApiCategory[] = [
         method: 'GET',
         path: '/api/envs',
         title: '查找环境变量',
-        description: '通过关键字搜索环境变量，用于判断变量是否已存在。插件通常通过 keyword 参数按变量名搜索，然后遍历结果匹配 remarks 中的用户标识来定位具体变量。',
+        description: '通过关键字搜索环境变量，用于判断变量是否已存在。插件通常通过 keyword 参数按变量名搜索，然后遍历结果匹配 remarks 中的用户标识来定位具体变量。也可以直接用 names 参数按变量名精确匹配，省掉「模糊结果再过滤一遍」这一步。完整的筛选参数见「环境变量 → 获取所有环境变量」。',
         auth: 'jwt',
         queryParams: [
-          { name: 'keyword', type: 'string', description: '搜索关键字（按变量名或备注模糊匹配）', example: 'sfsyUrl' },
+          { name: 'keyword', type: 'string', description: '搜索关键字（按变量名 / 变量值 / 备注 / 分组模糊匹配，四者是 OR）', example: 'sfsyUrl' },
+          { name: 'names', type: 'string', description: '按变量名【精确】筛选，多个用逗号分隔或重复传 names=A&names=B。比 keyword 更适合插件定位：keyword 是模糊匹配，会把 sfsyUrl2 一起带出来，names 是精确相等。与 keyword 之间是 AND', example: 'sfsyUrl' },
           { name: 'page', type: 'integer', description: '页码，默认 1', example: '1' },
-          { name: 'page_size', type: 'integer', description: '每页数量，建议设为 100 以获取完整列表', example: '100' },
+          { name: 'page_size', type: 'integer', description: '每页数量，建议设为 100 以获取完整列表（上限就是 100，超过会回落成 20；要一次拿全请改用 all=1）', example: '100' },
         ],
         responseExample: JSON.stringify({
           data: [{
@@ -529,7 +530,7 @@ panel.add_or_update_env(
         method: 'GET',
         path: '/api/tasks',
         title: '获取任务列表',
-        description: '获取所有定时任务，支持关键字搜索和分页。每行可能多带一个 schedule_hint（string）：它只在「这条任务其实不会自动触发」时才出现，正常任务上这个 key 完全不存在。取值只有两种：「该任务类型不会自动触发，只能手动运行」（手动运行/开机运行类型）、「未注册到调度器，重新保存一次任务即可恢复」（cron 任务但调度器里没有它的触发条目）。已禁用的任务一律不带；面板没起调度器时不下发第二种',
+        description: '获取所有定时任务，支持关键字搜索和分页。每行可能多带一个 schedule_hint（string）：它只在「这条任务其实不会自动触发」时才出现，正常任务上这个 key 完全不存在。取值只有两种：「该任务类型不会自动触发，只能手动运行」（手动运行/开机运行类型）、「未注册到调度器，重新保存一次任务即可恢复」（cron 任务但调度器里没有它的触发条目）。已禁用的任务一律不带；面板没起调度器时不下发第二种。默认排序（不传 sort_rules 时）依次是：置顶 → 状态分组（启用/排队中/运行中一组、禁用一组、其余一组）→ 运行中优先 → 拖拽顺序（list_order）→ 手工顺序（sort_order）→ 创建时间倒序 → ID 倒序，其中「运行中优先」的边界见下方 sort_rules 的说明',
         auth: 'jwt',
         queryParams: [
           { name: 'keyword', type: 'string', description: '搜索关键字' },
@@ -537,7 +538,7 @@ panel.add_or_update_env(
           { name: 'page_size', type: 'integer', description: '每页数量，默认 20', example: '20' },
           { name: 'label', type: 'string', description: '按标签模糊匹配（labels LIKE %值%）。分组要连前缀一起传，例如「分组:日常」，只传「日常」会把普通标签也捞进来' },
           { name: 'filters', type: 'string', description: '任务视图的筛选规则，JSON 字符串数组 [{field,operator,value}]。field 可选 command / name / cron_expression / status / labels / subscription；operator 可选 contains / not_contains / equals / not_equals；匹配一律先 trim 再转小写、不是正则；多条之间是 AND。status 的 value 用 1（已启用）/ 0（已禁用）/ 2（运行中）/ 0.5（排队中）。value 为空的规则会被整条丢弃，JSON 解析失败则静默降级为不筛选', example: '[{"field":"command","operator":"contains","value":"jd"}]' },
-          { name: 'sort_rules', type: 'string', description: '任务视图的排序规则，JSON 字符串数组 [{field,direction}]。field 可选 name / command / cron_expression / status / labels / subscription / created_at / last_run_at / next_run_at；direction 只认 desc，其它一律按 asc。⚠️ 置顶与状态分组【压在排序规则之上】，排序规则只在同一分区内生效：先按置顶分区（置顶的整体在前），再按状态分区（启用/排队中/运行中一组、禁用一组、其余一组），所以「按最后运行倒序」不会把置顶任务冲散、也不会把禁用任务混进启用任务中间。⚠️ 状态分区有一条【豁免】：当 sort_rules 的【第一条】规则 field = "status" 时，状态分区不生效，整份列表按 status 值原样排序（置顶分区仍然生效，不受影响）。理由是状态分区本身就是按 status 分的，再按 status 排一次等于自相矛盾——用户显式点了「按状态排序」，拿到的却是被状态分区钉死的固定组序。只看第一条是因为它才代表用户的主排序意图，第二条起是 tie-break。分区内多条规则按先后做 tie-break，全平手再回落 拖拽顺序（list_order）> 手工顺序（sort_order）> 创建时间。last_run_at（最后运行）与 next_run_at（下次运行）是任务列表页两列的点击排序：next_run_at 不是数据库列，是按 cron 现算的快照，只能在内存里排；这两个字段的空值（从未运行、已禁用或非 cron 因而没有下次运行）在各自分区内一律排最后，不随 asc/desc 翻转。未知 field 静默回落默认排序，不报 400', example: '[{"field":"next_run_at","direction":"asc"}]' },
+          { name: 'sort_rules', type: 'string', description: '任务视图的排序规则，JSON 字符串数组 [{field,direction}]。field 可选 name / command / cron_expression / status / labels / subscription / created_at / last_run_at / next_run_at；direction 只认 desc，其它一律按 asc。⚠️ 置顶与状态分组【压在排序规则之上】，排序规则只在同一分区内生效：先按置顶分区（置顶的整体在前），再按状态分区（启用/排队中/运行中一组、禁用一组、其余一组），所以「按最后运行倒序」不会把置顶任务冲散、也不会把禁用任务混进启用任务中间。⚠️ 状态分区有一条【豁免】：当 sort_rules 的【第一条】规则 field = "status" 时，状态分区不生效，整份列表按 status 值原样排序（置顶分区仍然生效，不受影响）。理由是状态分区本身就是按 status 分的，再按 status 排一次等于自相矛盾——用户显式点了「按状态排序」，拿到的却是被状态分区钉死的固定组序。只看第一条是因为它才代表用户的主排序意图，第二条起是 tie-break。分区内多条规则按先后做 tie-break，全平手再回落默认排序：运行中优先 > 拖拽顺序（list_order）> 手工顺序（sort_order）> 创建时间。⚠️「运行中优先」与上面的置顶 / 状态分区【不是同一层】，别混为一谈：置顶与状态分区压在【所有】排序规则之上，而运行中优先只是默认排序链里的一环 —— 不传 sort_rules 时它把 status=2（运行中）的任务提到【本区】最前，传了 sort_rules 时只有规则全部打平才轮得到它。所以用户显式点了「名称 A→Z」，运行中不会越过他的规则插到前面。这一层只认 2（运行中），不认 0.5（排队中）——排队是几秒钟就过去的瞬时态，一并提上来只会让同一次运行多跳一次；任务跑完自动回到原位，list_order 不会被改写（拖拽顺序不受影响，PUT /api/tasks/sort 的「区」划分也不受影响）。last_run_at（最后运行）与 next_run_at（下次运行）是任务列表页两列的点击排序：next_run_at 不是数据库列，是按 cron 现算的快照，只能在内存里排；这两个字段的空值（从未运行、已禁用或非 cron 因而没有下次运行）在各自分区内一律排最后，不随 asc/desc 翻转。未知 field 静默回落默认排序，不报 400', example: '[{"field":"next_run_at","direction":"asc"}]' },
         ],
         responseExample: JSON.stringify({
           data: [{
@@ -982,13 +983,17 @@ Transfer-Encoding: chunked
         method: 'GET',
         path: '/api/envs',
         title: '获取所有环境变量',
-        description: '获取环境变量列表，支持搜索和分页；带 all=1 时一次返回全部（硬上限 5000）',
+        description: '获取环境变量列表，支持 keyword 模糊搜索与 names / groups / enabled 精确筛选（各条件之间是 AND），支持分页；带 all=1 时一次返回全部（硬上限 5000）',
         auth: 'jwt',
         queryParams: [
-          { name: 'keyword', type: 'string', description: '搜索关键字' },
-          { name: 'page', type: 'integer', description: '页码', example: '1' },
-          { name: 'page_size', type: 'integer', description: '每页数量', example: '20' },
-          { name: 'all', type: 'integer', description: '设为 1 时一次返回全部（最多 5000 条）', example: '1' },
+          { name: 'keyword', type: 'string', description: '搜索关键字：对 变量名 / 变量值 / 备注 / 分组 四个字段做大小写不敏感的模糊匹配（UPPER LIKE %值%），四个字段之间是 OR、无法限定到某一个字段。要按变量名精确匹配请改用 names', example: 'JD_COOKIE' },
+          { name: 'names', type: 'string', description: '按变量名【精确】筛选（name IN (...)），不是 keyword 那种模糊匹配——传 JD_COOKIE 不会把 JD_COOKIE_EXTRA 一起带出来。支持 names=A,B 逗号分隔（中文逗号与分号同样认），也支持重复参数 names=A&names=B，两种写法等价合并并去重；多个变量名之间是 OR，与 keyword / groups / enabled 之间是 AND。传库里不存在的名字就返回空列表，不会回落成「不筛」。可选值由 GET /api/envs/names 提供', example: 'JD_COOKIE,PT_KEY' },
+          { name: 'groups', type: 'string', description: '按分组筛选，分组是【整段精确】匹配而不是模糊匹配（传「京东」不会命中「京东备用」）。支持 groups=A,B 逗号分隔，也支持重复参数 groups=A&groups=B；多个分组之间是 OR，与其它筛选之间是 AND。一条变量可以同时属于多个分组，命中任意一个即算命中。可选值由 GET /api/envs/groups 提供', example: '京东,美团' },
+          { name: 'group', type: 'string', description: 'groups 的单数别名，语义完全一致。两者同时传时是【合并去重后一起生效】，不是互相覆盖', example: '京东' },
+          { name: 'enabled', type: 'boolean', description: '按启用状态筛选：true 只看已启用、false 只看已禁用，不传表示不筛。取值按 Go 的 strconv.ParseBool 解析（1 / t / T / true / TRUE / 0 / f / F / false / FALSE 都认），解析失败时【静默忽略】这个条件、不报 400', example: 'true' },
+          { name: 'page', type: 'integer', description: '页码，默认 1；小于 1 一律按 1 处理', example: '1' },
+          { name: 'page_size', type: 'integer', description: '每页数量，默认 20；小于 1 或大于 100 时【一律回落成 20】，不是截断到 100。带 all=1 时本参数被忽略', example: '20' },
+          { name: 'all', type: 'integer', description: '设为 1（也认 true / yes）时一次返回全部（最多 5000 条），忽略 page / page_size；keyword / names / groups / enabled 等筛选条件仍然生效', example: '1' },
         ],
         responseExample: JSON.stringify({ data: [{ id: 1, name: 'MY_TOKEN', value: 'abc123', enabled: true, remarks: '签到Token' }], total: 1 }, null, 2),
         responseFields: [
@@ -997,6 +1002,20 @@ Transfer-Encoding: chunked
           { name: 'value', type: 'string', description: '变量值' },
           { name: 'enabled', type: 'boolean', description: '是否启用' },
           { name: 'remarks', type: 'string', description: '备注' },
+        ],
+      },
+      {
+        id: 'envs-names',
+        method: 'GET',
+        path: '/api/envs/names',
+        title: '获取全部变量名',
+        description: '按变量名聚合，返回去重后的变量名与各自的条数，按 name 升序。用途是给「变量名筛选」下拉提供选项：拿到的 name 可以原样塞进 GET /api/envs 的 names 参数。⚠️ count 的口径是【全库同名条数】，刻意不跟随 keyword / groups / enabled 等筛选——它与 PUT /api/envs/by-name 冲突时 409 文案里那句「存在 N 条名为 X 的环境变量」是同一个 N，两处必须对得上；若改成筛选后的条数，同一个变量名会在下拉里和报错里显示两个不同的数字。同名多条是刻意支持的功能（一个变量名下挂多个账号），不是脏数据，所以 count > 1 很常见。空名（name 为空串）不计入；库里一条都没有时返回空数组 [] 而不是 null。鉴权与 GET /api/envs/groups 完全同组。',
+        auth: 'jwt',
+        responseExample: JSON.stringify({ data: [{ name: 'JD_COOKIE', count: 3 }, { name: 'PT_KEY', count: 1 }] }, null, 2),
+        responseFields: [
+          { name: 'data', type: 'array', description: '变量名列表，按 name 升序；库里没有变量时为空数组' },
+          { name: 'data[].name', type: 'string', description: '变量名（已去重）' },
+          { name: 'data[].count', type: 'integer', description: '全库中同名环境变量的条数，不随任何筛选变化' },
         ],
       },
       {

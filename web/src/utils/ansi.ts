@@ -33,7 +33,12 @@ const ANSI_CONTROL_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]/g
 // eslint-disable-next-line no-control-regex
 const BARE_ANSI_PATTERN = /(^|[^\x1b])\[([0-9;]+)m/g
 
-function escapeHtml(text: string): string {
+/**
+ * 把 `& < > "` 转成 HTML 实体。
+ * 除了日志渲染，`utils/markdown.ts` 也复用它 —— 那边所有来自原文的字符都必须先过这一道，
+ * 所以这份实现是全站唯一的转义口径，不要再写第二份。
+ */
+export function escapeHtml(text: string): string {
   // 日志正文里 & < > " 都很少见，先用一次廉价探测短路，
   // 命中时也只做单趟替换，避免旧实现连续四次 replace 反复全串扫描 + 分配中间字符串。
   if (!HTML_ESCAPE_TEST.test(text)) return text
