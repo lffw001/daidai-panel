@@ -93,7 +93,11 @@ Write-Host ("  release title -> {0}：{1}" -f $tagVersion, $titleMatch.Groups['s
 # 根因是 Release body 没有「源文件路径」这个上下文，`../` 无从解析。
 # 所以从 v3.2.5 起本版 notes 一律写绝对 URL。历史文件不动：它们在仓库里点是对的，
 # 只是在 Release 页面上坏，改它们等于改历史陈述。
-$relativeLinks = [regex]::Matches($releaseNoteText, '\]\((?<target>\.{1,2}/[^)]*)\)')
+# ⚠️ 先剥掉围栏代码块与行内代码再匹配：发布说明本身会**引用**这种坏写法当反面例子
+# （v3.2.5 那篇就是这么写的），包在反引号里的不是一条真链接，判红就是误报。
+$scannableNoteText = [regex]::Replace($releaseNoteText, '(?s)```.*?```', '')
+$scannableNoteText = [regex]::Replace($scannableNoteText, '`[^`\r\n]*`', '')
+$relativeLinks = [regex]::Matches($scannableNoteText, '\]\((?<target>\.{1,2}/[^)]*)\)')
 if ($relativeLinks.Count -gt 0) {
     $samples = (($relativeLinks | ForEach-Object { $_.Groups['target'].Value } | Sort-Object -Unique) | Select-Object -First 5) -join ", "
     Fail-Step "Release notes must use absolute URLs. Found relative link target(s): $samples`nA GitHub Release body has no source-file path context, so [x](../task-not-running.md) is rendered as href=`"/linzixuanzz/daidai-panel/blob/task-not-running.md`" - no ref, no directory, a guaranteed 404 (verified against the v3.2.3 release body).`nWrite https://github.com/linzixuanzz/daidai-panel/blob/main/docs/<file> instead. Historical notes are intentionally left alone."
